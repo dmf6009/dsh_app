@@ -52,7 +52,14 @@ export function contain(root: string, target: string): Containment {
   return 'inside';
 }
 
-export type EscapeKind = 'none' | 'lexical' | 'symlink' | 'root_missing';
+/**
+ * Why a path is not accessible.
+ *
+ * `lexical` and `symlink` are authorizable out-of-boundary accesses
+ * (`needsAuthorization: true`). `root_missing` and `unverifiable` are hard
+ * errors the user cannot grant their way past (`needsAuthorization: false`).
+ */
+export type EscapeKind = 'none' | 'lexical' | 'symlink' | 'root_missing' | 'unverifiable';
 
 /**
  * Key under which one authorization grant is stored.
@@ -63,6 +70,24 @@ export type EscapeKind = 'none' | 'lexical' | 'symlink' | 'root_missing';
  */
 function grantKey(normalizedPath: string): string {
   return normalizedPath;
+}
+
+/** True when a filesystem error means "this path component does not exist". */
+function isNotFound(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/**
+ * A path whose real location cannot be established: some component exists but
+ * refuses to resolve (permission wall, symlink cycle). Distinct from a path
+ * that simply does not exist yet, which is safe to resolve lexically.
+ */
+class UnverifiablePathError extends Error {
+  constructor(target: string, readonly reasonError?: unknown) {
+    super(`cannot verify the real path of ${target}`);
+    this.name = 'UnverifiablePathError';
+  }
 }
 
 /** Why a path is not accessible inside the workspace. */
@@ -148,44 +173,58 @@ export class WorkspaceBoundary {
     // The target itself or any of its ancestors may be a symlink leaving the
     // workspace; resolving through the nearest existing ancestor covers
     // not-yet-created targets behind symlinks too.
+    let realTarget: string;
+    let realRoot: string;
     try {
-      const realTarget = await this.resolveReal(resolvedPath);
-      const realRoot = await this.realpath(this.root);
-      // The REAL root is the single authority, in BOTH directions (QA-1/QA-2).
-      //   allow side: a workspace opened through a symlinked path (macOS
-      //     `/tmp`→`/private/tmp`, symlinked home or project layouts) has a
-      //     visible root that differs from its real location. Either spelling of
-      //     an in-root file — the linked one or its real canonical one — names
-      //     the same bytes inside the workspace, so both are allowed. Deciding
-      //     the allow side lexically instead made canonical paths coming from
-      //     git output or `realpath` demand per-file authorization.
-      //   deny side: links that genuinely leave the workspace are still
-      //     rejected even when the visible path looks contained.
-      // Trade-off: an outside path that is itself a link INTO the workspace is
-      // allowed, because the bytes it reaches are in-workspace. That is the
-      // stated semantics of "real root is authoritative", and is consistent with
-      // a link that leaves the root and resolves back inside it.
-      if (contain(realRoot, realTarget) === 'outside') {
-        // Denied either way — the lexical layer only picks the kind and message.
-        if (inputOutsideLexical) {
-          return this.decide(resolvedPath, 'lexical', '目标路径越出 Workspace 边界');
-        }
-        return this.decide(
-          resolvedPath,
-          'symlink',
-          contain(this.root, realTarget) === 'outside'
-            ? '符号链接指向 Workspace 外部'
-            : 'Workspace 根目录解析后不包含该路径'
-        );
-      }
+      realTarget = await this.resolveReal(resolvedPath);
+      realRoot = await this.realpath(this.root);
     } catch {
-      // Unresolvable for reasons other than symlinks (e.g. permission walls on
-      // every ancestor). Fall back to the lexical verdict: an in-root path stays
-      // allowed (existence problems are not boundary problems and are left to
-      // the caller), an out-of-root path stays denied — never fail open.
+      // The target's real location cannot be established: some component exists
+      // but refuses to resolve (permission wall, symlink cycle), or the root
+      // itself stopped resolving. Being lexically inside the root proves nothing
+      // here — an unreadable component may be a link pointing out of the
+      // workspace. Refuse, and refuse as a HARD error: `needsAuthorization:
+      // false` keeps this off the grant path, so an ordinary outside-path grant
+      // can never launder an unverifiable path into a verified-safe one.
+      //
+      // Targets that merely do not exist yet never reach here — those resolve
+      // through their nearest existing ancestor (see `resolveReal`), so creating
+      // new files inside the workspace keeps working.
+      return {
+        allowed: false,
+        reason: '无法验证目标路径的真实位置',
+        escape: 'unverifiable',
+        needsAuthorization: false,
+        resolvedPath
+      };
+    }
+
+    // The REAL root is the single authority, in BOTH directions (QA-1/QA-2).
+    //   allow side: a workspace opened through a symlinked path (macOS
+    //     `/tmp`→`/private/tmp`, symlinked home or project layouts) has a
+    //     visible root that differs from its real location. Either spelling of
+    //     an in-root file — the linked one or its real canonical one — names
+    //     the same bytes inside the workspace, so both are allowed. Deciding
+    //     the allow side lexically instead made canonical paths coming from
+    //     git output or `realpath` demand per-file authorization.
+    //   deny side: links that genuinely leave the workspace are still
+    //     rejected even when the visible path looks contained.
+    // Trade-off: an outside path that is itself a link INTO the workspace is
+    // allowed, because the bytes it reaches are in-workspace. That is the
+    // stated semantics of "real root is authoritative", and is consistent with
+    // a link that leaves the root and resolves back inside it.
+    if (contain(realRoot, realTarget) === 'outside') {
+      // Denied either way — the lexical layer only picks the kind and message.
       if (inputOutsideLexical) {
         return this.decide(resolvedPath, 'lexical', '目标路径越出 Workspace 边界');
       }
+      return this.decide(
+        resolvedPath,
+        'symlink',
+        contain(this.root, realTarget) === 'outside'
+          ? '符号链接指向 Workspace 外部'
+          : 'Workspace 根目录解析后不包含该路径'
+      );
     }
 
     return { allowed: true, resolvedPath, escape: 'none', needsAuthorization: false };
@@ -194,24 +233,45 @@ export class WorkspaceBoundary {
   /**
    * Real-path resolution that tolerates non-existent leaves: when `p` itself
    * does not exist, resolve its nearest existing ancestor and re-append the
-   * remaining segments lexically. Throws only when nothing resolves.
+   * remaining segments lexically.
+   *
+   * Re-appending is only sound for segments that genuinely DO NOT EXIST — a
+   * path component that does not exist cannot be a symlink, so no escape can
+   * hide in it. A component that exists but cannot be read (`EACCES` on a
+   * walled directory, `ELOOP` on a symlink cycle) is a different matter: it may
+   * be a link pointing out of the workspace, and lexically re-appending it
+   * would fabricate a real path that looks contained. Those throw
+   * {@link UnverifiablePathError} so the caller can fail closed.
+   *
+   * Note `fs.realpath` on a directory whose mode is 000 SUCCEEDS (the wall only
+   * blocks resolving paths *below* it), so the discrimination has to happen per
+   * failing segment, not once at the top.
    */
   private async resolveReal(p: string): Promise<string> {
     try {
       return await this.realpath(p);
-    } catch {
+    } catch (err) {
+      if (!isNotFound(err)) {
+        // `p` itself exists but is unverifiable — do not walk up and guess.
+        throw new UnverifiablePathError(p, err);
+      }
       let current = p;
       let suffix = '';
       for (;;) {
         const parent = path.dirname(current);
-        if (parent === current) throw new Error(`cannot resolve real path of ${p}`);
+        if (parent === current) throw new UnverifiablePathError(p);
         suffix = suffix === '' ? path.basename(current) : path.join(path.basename(current), suffix);
         current = parent;
         try {
           const realParent = await this.realpath(current);
           return suffix === '' ? realParent : path.join(realParent, suffix);
-        } catch {
-          /* keep walking up */
+        } catch (ancestorErr) {
+          // Only keep walking past ancestors that truly do not exist. An
+          // unreadable ancestor could be an escaping symlink; treat the whole
+          // path as unverifiable rather than assuming it stays in-root.
+          if (!isNotFound(ancestorErr)) {
+            throw new UnverifiablePathError(p, ancestorErr);
+          }
         }
       }
     }

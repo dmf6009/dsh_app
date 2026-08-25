@@ -364,28 +364,117 @@ describe('WorkspaceBoundary authorization grants', () => {
     expect((await b.check(target)).allowed).toBe(false);
   });
 
-  it('falls back to the lexical verdict when nothing resolves, without failing open', async () => {
-    // Every ancestor unreadable (permission walls): the real-root layer cannot
-    // decide, so the lexical verdict stands — in-root allowed, outside denied.
+  it('refuses paths whose real location cannot be verified, as a hard error', async () => {
+    // Nothing resolves: the real-root layer cannot decide, so there is no proof
+    // the path stays in-root. Being lexically inside must NOT be enough.
+    const eacces = Object.assign(new Error('EACCES'), { code: 'EACCES' });
     const b = new WorkspaceBoundary('/ws/root', {
       home: fakeHome,
       exists: () => true,
       realpath: async (): Promise<string> => {
-        throw new Error('EACCES');
+        throw eacces;
       }
     });
 
     const inside = await b.check('/ws/root/src/a.ts');
-    expect(inside.allowed).toBe(true);
-    expect(inside.escape).toBe('none');
+    expect(inside.allowed).toBe(false);
+    expect(inside.escape).toBe('unverifiable');
+    expect(inside.reason).toBe('无法验证目标路径的真实位置');
 
+    // Hard error, not an authorizable escape: the caller must be able to tell
+    // the two apart, and a grant must not launder it into a verified path.
+    expect(inside.needsAuthorization).toBe(false);
+    b.grant('/ws/root/src/a.ts');
+    const afterGrant = await b.check('/ws/root/src/a.ts');
+    expect(afterGrant.allowed).toBe(false);
+    expect(afterGrant.escape).toBe('unverifiable');
+
+    // An outside path is likewise refused rather than offered for authorization.
     const outside = await b.check('/elsewhere/secret.txt');
     expect(outside.allowed).toBe(false);
-    expect(outside.escape).toBe('lexical');
-    expect(outside.needsAuthorization).toBe(true);
+    expect(outside.escape).toBe('unverifiable');
+    expect(outside.needsAuthorization).toBe(false);
+  });
 
-    // An explicit grant still opens that outside path.
-    b.grant('/elsewhere/secret.txt');
-    expect((await b.check('/elsewhere/secret.txt')).allowed).toBe(true);
+  it('does not allow a path behind a permission wall that may hide a symlink escape (real fs)', async () => {
+    // The wall is the point: `realpath` on a 000 directory SUCCEEDS (it only
+    // blocks resolving below it), so a naive nearest-ancestor walk would
+    // re-append `escape/x.txt` lexically and call the result in-root — while the
+    // real `escape` symlink points out of the workspace.
+    const walledRoot = makeDir('wall/ws');
+    const walled = makeDir('wall/ws/walled');
+    const escapeTarget = makeDir('wall/outside');
+    try {
+      fs.symlinkSync(escapeTarget, path.join(walled, 'escape'), 'dir');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') return;
+      throw err;
+    }
+    // Root-owned/root-run environments ignore the wall — skip rather than assert
+    // a permission that does not apply.
+    fs.chmodSync(walled, 0o000);
+    let wallHolds = false;
+    try {
+      fs.realpathSync(path.join(walled, 'escape'));
+    } catch (err) {
+      wallHolds = (err as NodeJS.ErrnoException).code === 'EACCES';
+    }
+    try {
+      if (!wallHolds) return;
+      const b = new WorkspaceBoundary(walledRoot);
+      const result = await b.check(path.join(walled, 'escape', 'x.txt'));
+      expect(result.allowed).toBe(false);
+      expect(result.escape).toBe('unverifiable');
+      expect(result.needsAuthorization).toBe(false);
+    } finally {
+      fs.chmodSync(walled, 0o755);
+    }
+  });
+
+  it('still allows not-yet-created in-root targets, which cannot hide a symlink (real fs)', async () => {
+    // The counterpart to the case above: a component that does not exist cannot
+    // be a symlink, so resolving through the nearest existing ancestor stays
+    // sound and creating new files inside the workspace keeps working.
+    const root = makeDir('unverif-ok/ws');
+    fs.mkdirSync(path.join(root, 'existing'), { recursive: true });
+
+    const b = new WorkspaceBoundary(root);
+    const leaf = await b.check(path.join(root, 'existing', 'new-file.md'));
+    expect(leaf.allowed).toBe(true);
+    expect(leaf.escape).toBe('none');
+
+    const deep = await b.check(path.join(root, 'brand', 'new', 'tree', 'file.md'));
+    expect(deep.allowed).toBe(true);
+    expect(deep.escape).toBe('none');
+
+    // ENOTDIR path shape (a file used as a directory) is a non-existence
+    // failure too, not an unverifiable one.
+    fs.writeFileSync(path.join(root, 'a-file'), 'x\n');
+    const throughFile = await b.check(path.join(root, 'a-file', 'nested.txt'));
+    expect(throughFile.allowed).toBe(true);
+    expect(throughFile.escape).toBe('none');
+  });
+
+  it('treats an unverifiable ancestor as unverifiable even when deeper segments are missing', async () => {
+    // Injected resolver: the leaf and its parent do not exist, but the ancestor
+    // above them exists and refuses to resolve. The walk must stop at the wall
+    // instead of continuing up to a resolvable grandparent and re-appending.
+    const enoent = Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+    const eacces = Object.assign(new Error('EACCES'), { code: 'EACCES' });
+    const b = new WorkspaceBoundary('/ws/root', {
+      home: fakeHome,
+      exists: () => true,
+      realpath: async (p) => {
+        if (p === '/ws/root') return '/ws/root';
+        if (p === '/ws/root/walled') throw eacces;
+        if (p.startsWith('/ws/root/walled/')) throw enoent;
+        return p;
+      }
+    });
+
+    const result = await b.check('/ws/root/walled/missing/leaf.txt');
+    expect(result.allowed).toBe(false);
+    expect(result.escape).toBe('unverifiable');
+    expect(result.needsAuthorization).toBe(false);
   });
 });

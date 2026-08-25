@@ -135,12 +135,22 @@ export class WorkspaceBoundary {
     // not-yet-created targets behind symlinks too.
     try {
       const realTarget = await this.resolveReal(resolvedPath);
-      if (contain(this.root, realTarget) === 'outside') {
-        return this.decide(resolvedPath, 'symlink', '符号链接指向 Workspace 外部');
-      }
+      const outsideLexical = contain(this.root, realTarget) === 'outside';
       const realRoot = await this.realpath(this.root);
-      if (contain(realRoot, realTarget) === 'outside') {
-        return this.decide(resolvedPath, 'symlink', 'Workspace 根目录解析后不包含该路径');
+      const outsideReal = contain(realRoot, realTarget) === 'outside';
+      // A workspace opened through a symlinked path (macOS `/tmp`/`/var`,
+      // symlinked home or project layouts) resolves to a different prefix —
+      // that alone must not fail every access (QA-1). Deny therefore requires
+      // the real target to leave the REAL root; the lexical disagreement is
+      // only used to pick the message. The real-root layer stays authoritative,
+      // so links that genuinely leave the workspace behind the root are still
+      // rejected even when the visible path looks contained.
+      if (outsideReal) {
+        return this.decide(
+          resolvedPath,
+          'symlink',
+          outsideLexical ? '符号链接指向 Workspace 外部' : 'Workspace 根目录解析后不包含该路径'
+        );
       }
     } catch {
       // Unresolvable for reasons other than symlinks (e.g. permission walls on

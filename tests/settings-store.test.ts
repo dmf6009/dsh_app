@@ -4,7 +4,7 @@
  * key masking (S-4).
  */
 
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -133,6 +133,36 @@ describe('SettingsStore', () => {
     expect(fs.statSync(store.credentialsPath).mode & 0o777).toBe(0o600);
     expect(logs.some((l) => l.includes('600'))).toBe(true);
     expect(second.peekApiKey('deepseek')).toBeDefined(); // data survived the repair
+  });
+
+  it('creates credential temp files already restricted — no permission window (B-1)', () => {
+    const store = makeStore();
+    const spy = vi.spyOn(fs, 'writeFileSync');
+    try {
+      expect(store.saveProvider(VALID_SAVE).ok).toBe(true);
+      const tmpCalls = spy.mock.calls.filter((call) =>
+        String(call[0]).includes('.credentials.yaml.tmp-')
+      );
+      expect(tmpCalls.length).toBeGreaterThan(0);
+      for (const call of tmpCalls) {
+        // The temp file must be born at 0600, not chmod'ed after a wide write.
+        const options = call[2] as { mode?: number } | string | undefined | null;
+        expect(options).toEqual(expect.objectContaining({ mode: 0o600 }));
+      }
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.statSync(store.credentialsPath).mode & 0o777).toBe(0o600);
+  });
+
+  it('creates the settings directory private (0700) when it does not exist', () => {
+    const nested = path.join(BASE, 'deep', 'dir');
+    const store = new SettingsStore({
+      settingsPath: path.join(nested, 'settings.yaml'),
+      credentialsPath: path.join(nested, '.credentials.yaml')
+    });
+    expect(store.saveProvider(VALID_SAVE).ok).toBe(true);
+    expect(fs.statSync(nested).mode & 0o777).toBe(0o700);
   });
 
   it('persists permission mode and DSH path override', () => {

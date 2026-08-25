@@ -443,12 +443,30 @@ function parseProviders(value: unknown, warnings: string[]): ProviderConfig[] {
 }
 
 function writeYamlAtomic(filePath: string, data: unknown, mode?: number): void {
+  const targetMode = mode ?? 0o644;
   const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true });
+  // §35: the DSH config directory itself stays private to the current user.
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${filePath}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, YAML.stringify(data));
-  fs.chmodSync(tmp, mode ?? 0o644);
-  fs.renameSync(tmp, filePath);
+  try {
+    // Drop any stale leftover from a crashed run so the creation mode below
+    // governs instead of inheriting old permissions.
+    fs.rmSync(tmp, { force: true });
+    // §35/S-4: the temp file must be restricted FROM THE FIRST BYTE — creating
+    // it at the final mode closes the world-readable window between write and
+    // chmod. The trailing chmod only repairs exotic umasks (creation mode is
+    // subject to `& ~umask`).
+    fs.writeFileSync(tmp, YAML.stringify(data), { mode: targetMode });
+    fs.chmodSync(tmp, targetMode);
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw err;
+  }
 }
 
 function oct(mode: number): string {

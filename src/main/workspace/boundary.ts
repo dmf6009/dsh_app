@@ -13,6 +13,12 @@
  *      its nearest existing ancestor. The check is wired and enforced here,
  *      with the resolver injectable for tests.
  *   4. explicit user authorization grants for out-of-workspace access
+ *
+ * Containment authority: when real paths resolve, the REAL root decides both
+ * ways — a path is inside iff its real location sits under `realpath(root)`.
+ * The lexical comparison only classifies the failure (`lexical` vs `symlink`)
+ * for the message the user sees. Grants are a separate concern and are keyed on
+ * the exact path the user authorized, never on a folded form.
  */
 
 import fs from 'node:fs';
@@ -47,6 +53,17 @@ export function contain(root: string, target: string): Containment {
 }
 
 export type EscapeKind = 'none' | 'lexical' | 'symlink' | 'root_missing';
+
+/**
+ * Key under which one authorization grant is stored.
+ *
+ * Exact, case-preserving match on the normalized absolute path. This is the one
+ * place the key policy lives, so `grant`/`revoke`/`hasGrant` can never drift
+ * apart. Deliberately NOT case-folded: see {@link WorkspaceBoundary.grant}.
+ */
+function grantKey(normalizedPath: string): string {
+  return normalizedPath;
+}
 
 /** Why a path is not accessible inside the workspace. */
 export interface BoundaryCheck {
@@ -83,7 +100,7 @@ export class WorkspaceBoundary {
   private readonly home: string;
   private readonly realpath: (p: string) => Promise<string>;
   private readonly exists: (p: string) => boolean;
-  private readonly grants = new Map<string, { grantedAt: string }>();
+  private readonly grants = new Map<string, { path: string; grantedAt: string }>();
 
   constructor(root: string, options: WorkspaceBoundaryOptions = {}) {
     this.root = expandAndNormalize(root, options.home);
@@ -125,9 +142,7 @@ export class WorkspaceBoundary {
         resolvedPath
       };
     }
-    if (contain(this.root, resolvedPath) === 'outside') {
-      return this.decide(resolvedPath, 'lexical', '目标路径越出 Workspace 边界');
-    }
+    const inputOutsideLexical = contain(this.root, resolvedPath) === 'outside';
 
     // Symlink escape checkpoint (§35): resolve what the path really points at.
     // The target itself or any of its ancestors may be a symlink leaving the
@@ -135,27 +150,42 @@ export class WorkspaceBoundary {
     // not-yet-created targets behind symlinks too.
     try {
       const realTarget = await this.resolveReal(resolvedPath);
-      const outsideLexical = contain(this.root, realTarget) === 'outside';
       const realRoot = await this.realpath(this.root);
-      const outsideReal = contain(realRoot, realTarget) === 'outside';
-      // A workspace opened through a symlinked path (macOS `/tmp`/`/var`,
-      // symlinked home or project layouts) resolves to a different prefix —
-      // that alone must not fail every access (QA-1). Deny therefore requires
-      // the real target to leave the REAL root; the lexical disagreement is
-      // only used to pick the message. The real-root layer stays authoritative,
-      // so links that genuinely leave the workspace behind the root are still
-      // rejected even when the visible path looks contained.
-      if (outsideReal) {
+      // The REAL root is the single authority, in BOTH directions (QA-1/QA-2).
+      //   allow side: a workspace opened through a symlinked path (macOS
+      //     `/tmp`→`/private/tmp`, symlinked home or project layouts) has a
+      //     visible root that differs from its real location. Either spelling of
+      //     an in-root file — the linked one or its real canonical one — names
+      //     the same bytes inside the workspace, so both are allowed. Deciding
+      //     the allow side lexically instead made canonical paths coming from
+      //     git output or `realpath` demand per-file authorization.
+      //   deny side: links that genuinely leave the workspace are still
+      //     rejected even when the visible path looks contained.
+      // Trade-off: an outside path that is itself a link INTO the workspace is
+      // allowed, because the bytes it reaches are in-workspace. That is the
+      // stated semantics of "real root is authoritative", and is consistent with
+      // a link that leaves the root and resolves back inside it.
+      if (contain(realRoot, realTarget) === 'outside') {
+        // Denied either way — the lexical layer only picks the kind and message.
+        if (inputOutsideLexical) {
+          return this.decide(resolvedPath, 'lexical', '目标路径越出 Workspace 边界');
+        }
         return this.decide(
           resolvedPath,
           'symlink',
-          outsideLexical ? '符号链接指向 Workspace 外部' : 'Workspace 根目录解析后不包含该路径'
+          contain(this.root, realTarget) === 'outside'
+            ? '符号链接指向 Workspace 外部'
+            : 'Workspace 根目录解析后不包含该路径'
         );
       }
     } catch {
       // Unresolvable for reasons other than symlinks (e.g. permission walls on
-      // every ancestor). Existence problems are not boundary problems and are
-      // left to the caller (file operations issue).
+      // every ancestor). Fall back to the lexical verdict: an in-root path stays
+      // allowed (existence problems are not boundary problems and are left to
+      // the caller), an out-of-root path stays denied — never fail open.
+      if (inputOutsideLexical) {
+        return this.decide(resolvedPath, 'lexical', '目标路径越出 Workspace 边界');
+      }
     }
 
     return { allowed: true, resolvedPath, escape: 'none', needsAuthorization: false };
@@ -187,25 +217,40 @@ export class WorkspaceBoundary {
     }
   }
 
-  /** Explicit user grant for one outside path (§7.3/§35). */
+  /**
+   * Explicit user grant for one outside path (§7.3/§35).
+   *
+   * Keyed on the exact normalized path the user authorized — no case folding.
+   * Folding the key to lower case would make one grant cover a DIFFERENT file
+   * on a case-sensitive filesystem (granting `Notes/Report.TXT` would silently
+   * authorize `notes/report.txt`), which is a fail-open authorization bug. The
+   * cost of exact keys is fail-closed: on a case-insensitive volume the same
+   * file spelled differently needs its own grant.
+   */
   grant(target: string): void {
     const resolved = expandAndNormalize(target, this.home);
-    this.grants.set(resolved.toLowerCase(), { grantedAt: new Date().toISOString() });
+    this.grants.set(grantKey(resolved), {
+      path: resolved,
+      grantedAt: new Date().toISOString()
+    });
   }
 
   revoke(target: string): void {
     const resolved = expandAndNormalize(target, this.home);
-    this.grants.delete(resolved.toLowerCase());
+    this.grants.delete(grantKey(resolved));
   }
 
   hasGrant(target: string): boolean {
     const resolved = expandAndNormalize(target, this.home);
-    return this.grants.has(resolved.toLowerCase());
+    return this.grants.has(grantKey(resolved));
   }
 
-  /** All currently granted outside paths (for UI display / audit). */
+  /**
+   * All currently granted outside paths (for UI display / audit) — the actual
+   * paths as authorized, never an internal folded key.
+   */
   grantedPaths(): string[] {
-    return [...this.grants.keys()];
+    return [...this.grants.values()].map((entry) => entry.path);
   }
 
   private decide(

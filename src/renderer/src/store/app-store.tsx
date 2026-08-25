@@ -125,7 +125,8 @@ export function AppProvider({ children }: { children: ReactNode }): JSX.Element 
 
     void window.desktop.listRecentProjects().then((projects) => {
       dispatch({ type: 'recent', projects });
-      // Surface the most recently opened project as active workspace context.
+      // listRecentProjects returns pinned-first order; activating its head
+      // opens the shell on the pinned project (falling back to most recent).
       if (projects.length > 0) {
         dispatch({ type: 'workspace', path: projects[0]!.path });
       }

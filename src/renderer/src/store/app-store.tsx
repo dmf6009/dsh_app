@@ -42,18 +42,28 @@ export interface AppState {
   recent: RecentProject[];
   settings: SettingsView | null;
   dsh: DshDetection | null;
+  /**
+   * One-shot confirmation shown on the page Settings returned to (§37).
+   *
+   * Saving a Provider navigates away immediately, so a message rendered inside
+   * Settings would never be seen. The originating page carries it instead —
+   * deliberately a single string on the existing store rather than a new
+   * notification subsystem.
+   */
+  flash: string | null;
 }
 
 export type AppAction =
   | { type: 'navigate'; route: Route }
   | { type: 'open-settings' }
-  | { type: 'close-settings' }
+  | { type: 'close-settings'; flash?: string }
   | { type: 'connection'; state: ConnectionState }
   | { type: 'status'; state: ConnectionState; commandLine: string }
   | { type: 'workspace'; path: string | null }
   | { type: 'recent'; projects: RecentProject[] }
   | { type: 'settings-view'; view: SettingsView }
-  | { type: 'dsh'; detection: DshDetection };
+  | { type: 'dsh'; detection: DshDetection }
+  | { type: 'dismiss-flash' };
 
 export const initialAppState: AppState = {
   route: 'home',
@@ -63,19 +73,22 @@ export const initialAppState: AppState = {
   workspaceRoot: null,
   recent: [],
   settings: null,
-  dsh: null
+  dsh: null,
+  flash: null
 };
 
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'navigate':
-      return { ...state, route: action.route };
+      // Leaving a page drops a stale confirmation with it.
+      return { ...state, route: action.route, flash: null };
     case 'open-settings':
       return state.route === 'settings'
         ? state
-        : { ...state, route: 'settings', returnRoute: state.route };
+        : { ...state, route: 'settings', returnRoute: state.route, flash: null };
     case 'close-settings':
-      return { ...state, route: state.returnRoute };
+      // Manual 返回/gear close passes no flash and clears any previous one.
+      return { ...state, route: state.returnRoute, flash: action.flash ?? null };
     case 'connection':
       return { ...state, connection: action.state };
     case 'status':
@@ -88,6 +101,8 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, settings: action.view };
     case 'dsh':
       return { ...state, dsh: action.detection };
+    case 'dismiss-flash':
+      return { ...state, flash: null };
     default:
       return state;
   }

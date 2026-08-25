@@ -4,6 +4,11 @@
  * top-bar gear and returns to the originating page via the store's
  * `close-settings` action.
  *
+ * A successful Provider save also returns to the originating page (§37: 保存后
+ * 返回原页面) and hands the confirmation to that page via `close-settings`'s
+ * flash, since a message rendered here would be unmounted before it is read.
+ * Failed saves stay in Settings with the inline error.
+ *
  * Secret handling in the renderer: the API Key input is write-only — the
  * configured key is shown as a non-reversible mask (`apiKeyMask`) and never
  * echoed back into the field.
@@ -16,6 +21,7 @@ import {
   API_TYPE_LABELS,
   PERMISSION_MODES,
   PERMISSION_MODE_LABELS,
+  providerSaveOutcome,
   type ApiType,
   type OperationResult,
   type PermissionMode,
@@ -153,15 +159,23 @@ function ModelsTab(): JSX.Element {
       ...(form.apiKey.trim() !== '' ? { apiKey: form.apiKey.trim() } : {})
     };
     const result = await window.desktop.saveProvider(input);
-    if (result.ok) {
-      setSaveMessage({ ok: true, text: '已保存到 ~/.dsh/settings.yaml（密钥单独存放，权限 600）' });
-      setForm(EMPTY_FORM);
-      setEditing(null);
-    } else {
-      setSaveMessage({ ok: false, text: result.error ?? '保存失败' });
-    }
+    const outcome = providerSaveOutcome(result);
+
+    // Refresh the settings view BEFORE navigating: the provider list, key masks
+    // and warnings must already be current when the user comes back.
     const view = await window.desktop.getSettings();
     dispatch({ type: 'settings-view', view });
+
+    if (!outcome.close) {
+      // Failure keeps the user in Settings with the existing inline error.
+      setSaveMessage(outcome.message);
+      return;
+    }
+    setForm(EMPTY_FORM);
+    setEditing(null);
+    // Success returns to the page Settings was opened from (§37), carrying the
+    // confirmation so it stays perceivable after navigation.
+    dispatch({ type: 'close-settings', flash: outcome.flash });
   };
 
   const removeProvider = async (name: string): Promise<void> => {

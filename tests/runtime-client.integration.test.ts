@@ -1,0 +1,221 @@
+/**
+ * Runtime Client integration tests (DSHA-3 测试要求 #4):
+ * full Desktop-side closed loop over the real stub process — start→ready,
+ * run→terminal with run-id bookkeeping, cancel, crash recovery, restart.
+ */
+
+import { afterEach, describe, expect, it } from 'vitest';
+
+import type { DshProcessManager } from '../src/main/runtime/dsh-process-manager';
+import { RuntimeClient } from '../src/main/runtime/runtime-client';
+import { makeStubManager } from './helpers';
+import type { RuntimeEventFrame } from '../src/shared/protocol/types';
+
+const clients: { dispose: () => Promise<void> }[] = [];
+
+function makeClient(): { client: RuntimeClient; manager: DshProcessManager } {
+  const manager = makeStubManager();
+  const client = new RuntimeClient(manager);
+  clients.push({ dispose: async () => { await client.stop().catch(() => undefined); } });
+  return { client, manager };
+}
+
+async function until(
+  predicate: () => boolean,
+  timeoutMs = 15_000,
+  message = 'condition'
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timeout waiting for ${message}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+afterEach(async () => {
+  await Promise.all(clients.splice(0).map((c) => c.dispose()));
+});
+
+describe('RuntimeClient — lifecycle', () => {
+  it('start() resolves on the stub ready frame and flips connection state', async () => {
+    const { client } = makeClient();
+    const states: string[] = [];
+    client.on('connection-state', (s) => states.push(s));
+
+    expect(client.state).toBe('stopped');
+    await client.start();
+    expect(client.state).toBe('ready');
+    expect(states).toEqual(['starting', 'ready']);
+    expect(client.runtimeReady).toBe(true);
+    expect(client.currentSessionId).toBeTruthy();
+
+    await client.stop();
+    expect(client.state).toBe('stopped');
+  });
+
+  it('start() rejects and lands in crashed when the command cannot spawn', async () => {
+    const manager = makeStubManager({
+      command: '/no/such/binary',
+      args: []
+    });
+    const client = new RuntimeClient(manager);
+    clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
+
+    await expect(client.start()).rejects.toThrow(/failed to start|ENOENT|spawn/i);
+    expect(client.state).toBe('crashed');
+    // Recovery: pointing at the stub works again from the same client.
+    // (manager options are immutable; build a fresh one to prove restartability
+    // of the flow itself.)
+    const recovered = makeClient();
+    await recovered.client.start();
+    expect(recovered.client.state).toBe('ready');
+  }, 20_000);
+});
+
+describe('RuntimeClient — run / cancel', () => {
+  it('run() streams events to completion and clears the active run id', async () => {
+    const { client } = makeClient();
+    await client.start();
+
+    const events: RuntimeEventFrame[] = [];
+    client.on('event', (frame) => events.push(frame));
+
+    const runId = client.run('修复登录接口偶发 500', '/tmp/proj');
+    expect(runId).toBeTruthy();
+    expect(client.activeRun).toBe(runId);
+
+    await until(
+      () => events.some((f) => isTerminal(f)),
+      15_000,
+      'terminal frame'
+    );
+
+    const types = events.map((f) => f.type);
+    expect(types[0]).toBe('run_started');
+    expect(types).toContain('message_delta');
+    expect(types.at(-1)).toMatch(/^(done|run_completed)$/);
+    // Terminal frames are stamped with the originating run id even if the
+    // runtime omits it.
+    const terminal = events.find((f) => isTerminal(f))!;
+    expect(terminal.run_id).toBe(runId);
+    // Bookkeeping cleared after terminal.
+    expect(client.activeRun).toBeNull();
+  });
+
+  it('cancel() stops the active run; run_cancelled arrives as a terminal frame', async () => {
+    const { client } = makeClient();
+    await client.start();
+
+    const events: RuntimeEventFrame[] = [];
+    let sawDelta = false;
+    client.on('event', (frame) => {
+      events.push(frame);
+      if (!sawDelta && frame.type === 'message_delta') {
+        sawDelta = true;
+        expect(client.cancel()).toBe(true); // cancels the active run
+      }
+    });
+
+    client.run('再跑一次，这次中途取消', '/tmp/proj');
+    await until(() => events.some((f) => f.type === 'run_cancelled'), 15_000, 'run_cancelled');
+
+    const cancelledIdx = events.findIndex((f) => f.type === 'run_cancelled');
+    expect(cancelledIdx).toBeGreaterThan(0);
+    expect(events.slice(cancelledIdx + 1)).toEqual([]); // nothing after terminal
+    expect(events[cancelledIdx]!.run_id).toBeTruthy();
+    expect(client.activeRun).toBeNull();
+  });
+
+  it('cancel() without an active run returns false instead of sending garbage', async () => {
+    const { client } = makeClient();
+    await client.start();
+    expect(client.cancel()).toBe(false);
+  });
+
+  it('rejects run() before the runtime exists', () => {
+    const { client } = makeClient();
+    expect(() => client.run('hello', '/tmp')).toThrow(/runtime is idle/);
+  });
+});
+
+describe('RuntimeClient — crash & restart semantics', () => {
+  it('marks crashed when the runtime dies unexpectedly mid-session', async () => {
+    const { client, manager } = makeClient();
+    await client.start();
+    const states: string[] = [];
+    client.on('connection-state', (s) => states.push(s));
+
+    const pid = manager.pid!;
+    process.kill(pid, 'SIGKILL');
+
+    await until(() => client.state === 'crashed', 10_000, 'crashed state');
+    expect(states).toEqual(['crashed']);
+  });
+
+  it('restart() brings the runtime back to ready after a crash', async () => {
+    const { client, manager } = makeClient();
+    await client.start();
+    const firstPid = manager.pid!;
+
+    process.kill(firstPid, 'SIGKILL');
+    await until(() => client.state === 'crashed', 10_000, 'crashed');
+
+    await client.restart();
+    expect(client.state).toBe('ready');
+    expect(manager.pid).not.toBe(firstPid);
+
+    // The restarted runtime serves runs again.
+    const events: RuntimeEventFrame[] = [];
+    client.on('event', (f) => events.push(f));
+    client.run('post-restart run', '/tmp/proj');
+    await until(() => events.some(isTerminal), 15_000, 'post-restart terminal');
+  }, 25_000);
+
+  it('intentional stop() does NOT flip the connection state to crashed', async () => {
+    const { client } = makeClient();
+    await client.start();
+    const states: string[] = [];
+    client.on('connection-state', (s) => states.push(s));
+
+    await client.stop();
+    await new Promise((r) => setTimeout(r, 100)); // allow any stray exit event
+    expect(client.state).toBe('stopped');
+    expect(states.filter((s) => s === 'crashed')).toEqual([]);
+  });
+});
+
+describe('RuntimeClient — stderr + protocol violations fan-out', () => {
+  it('forwards stderr diagnostics from the child', async () => {
+    const { client, manager } = makeClient();
+    const chunks: string[] = [];
+    client.on('stderr', (t) => chunks.push(t));
+    await client.start();
+    // The stub only writes diagnostics on protocol violations; provoke one.
+    manager.send({ v: 1, type: 'definitely-unsupported' });
+    await until(() => chunks.join('').includes('[stub]'), 10_000, 'stderr output');
+    expect(chunks.join('')).toContain('[stub]');
+  });
+
+  it('emits protocol-violation when the child writes undecodable lines', async () => {
+    const noisy = makeStubManager({
+      args: ['-e', [
+        `console.log('{oops');`,          // malformed JSON line
+        `console.log(JSON.stringify({v:1,type:'ready'}));`,
+        `setInterval(() => {}, 1000);`
+      ].join('\n')]
+    });
+    const client = new RuntimeClient(noisy);
+    clients.push({ dispose: async () => { await client.stop().catch(() => undefined); } });
+
+    const violations: unknown[] = [];
+    client.on('protocol-violation', (v) => violations.push(v));
+
+    await client.start(); // resolves on the valid ready line
+    await until(() => violations.length >= 1, 10_000, 'protocol violation');
+    expect((violations[0] as { reason: string }).reason).toBe('json_parse_error');
+  }, 20_000);
+});
+
+function isTerminal(frame: RuntimeEventFrame): boolean {
+  return ['done', 'run_completed', 'run_cancelled'].includes(frame.type);
+}

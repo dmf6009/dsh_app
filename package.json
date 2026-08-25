@@ -1,0 +1,40 @@
+{
+  "name": "dsh-desktop",
+  "productName": "DSH Desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Desktop — a local-first, model-agnostic desktop coding agent built on DeepSeek Harness (Phase 0 runtime prototype)",
+  "license": "UNLICENSED",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:renderer": "vite build",
+    "build": "npm run build:main && npm run build:renderer",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit && tsc -p tsconfig.tests.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "start": "electron .",
+    "dev:renderer": "vite",
+    "stub": "node scripts/stub-runtime.mjs",
+    "smoke:protocol": "node scripts/smoke-protocol.mjs",
+    "smoke:dsh": "node scripts/smoke-dsh-desktop.mjs",
+    "smoke:app": "node scripts/smoke-electron.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.2.1",
+    "eslint": "^9.17.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.2",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  }
+}

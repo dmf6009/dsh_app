@@ -70,6 +70,21 @@ export default function App(): ReactElement {
 
       {/* Keep-alive pages: mounted once, toggled with `hidden`. */}
       <main className="page-host">
+        {state.flash && state.route !== 'settings' && (
+          // Confirmation handed over by Settings on save-and-return (§37): shown
+          // on the originating page, dismissible, and cleared by any navigation.
+          <div className="flash" role="status">
+            <span>{state.flash}</span>
+            <button
+              type="button"
+              className="flash-close"
+              aria-label="关闭提示"
+              onClick={() => dispatch({ type: 'dismiss-flash' })}
+            >
+              ×
+            </button>
+          </div>
+        )}
         <div hidden={state.route !== 'home'}>
           <HomePage />
         </div>

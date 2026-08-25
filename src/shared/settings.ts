@@ -82,3 +82,26 @@ export interface OperationResult {
 export interface ModelsRefreshResult extends OperationResult {
   models?: string[];
 }
+
+/** Confirmation shown on the page Settings returns to after a successful save. */
+export const PROVIDER_SAVED_FLASH =
+  'Provider 已保存到 ~/.dsh/settings.yaml（密钥单独存放，权限 600）';
+
+/**
+ * What the Settings page should do after a provider save attempt (§37: 保存后
+ * 返回原页面).
+ *
+ * Kept as a pure function so the navigation contract is testable without a DOM:
+ * success returns to the originating page and carries the confirmation with it,
+ * failure stays put and shows the inline error.
+ */
+export type ProviderSaveOutcome =
+  | { close: true; flash: string }
+  | { close: false; message: { ok: false; text: string } };
+
+export function providerSaveOutcome(result: OperationResult): ProviderSaveOutcome {
+  if (result.ok) {
+    return { close: true, flash: PROVIDER_SAVED_FLASH };
+  }
+  return { close: false, message: { ok: false, text: result.error ?? '保存失败' } };
+}

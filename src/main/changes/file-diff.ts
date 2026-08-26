@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 
 import type { FileDiffResult } from '../../shared/changes';
+import { guardRead } from './boundary';
 import {
   MAX_DIFF_BYTES,
   defaultGitRunner,
@@ -48,8 +49,11 @@ export async function buildFileDiff(
   const rel = normalizeRel(path_);
 
   // Worktree side (modified content). Missing file ⇒ deleted or not yet real.
+  // Guard the read with a canonical boundary check so a symlink inside the
+  // workspace cannot pull in content from outside (P0).
   let modifiedBuf: Buffer | null = null;
   try {
+    await guardRead(root, abs);
     modifiedBuf = fs.readFileSync(abs);
   } catch {
     modifiedBuf = null;

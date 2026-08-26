@@ -16,7 +16,7 @@ import {
   normalizeEventPath
 } from '../src/main/changes/change-record-service';
 import type { RuntimeEventFrame } from '../src/shared/protocol/types';
-import type { StatusEntry } from '../src/main/changes/git-readonly';
+import { defaultGitRunner, type GitRunner, type StatusEntry } from '../src/main/changes/git-readonly';
 import type { ChangeRecord } from '../src/shared/changes';
 
 let root = '';
@@ -113,7 +113,7 @@ describe('event aggregation', () => {
     const s = svc();
     expect(s.onRuntimeEvent(fileChanged('src/login.py'), root)).toBe(false);
     expect(s.onRuntimeEvent(fileChanged('src/login.py', 'deleted'), root)).toBe(false);
-    expect(s.eventRecordCount).toBe(1);
+    expect(s.eventRecordCount(root)).toBe(1);
   });
 
   it('never creates records from file_read events (AC-06 interpretation)', async () => {
@@ -121,8 +121,8 @@ describe('event aggregation', () => {
     s.onRuntimeEvent({ v: 1, type: 'run_started', run_id: 'r1' }, root);
     s.onRuntimeEvent({ v: 1, type: 'file_read', path: 'README.md' }, root);
     s.onRuntimeEvent({ v: 1, type: 'file_read', path: 'src/only-read.ts' }, root);
-    expect(s.eventRecordCount).toBe(0);
-    expect(s.readLedger).toContain('src/only-read.ts');
+    expect(s.eventRecordCount(root)).toBe(0);
+    expect(s.readLedger(root)).toContain('src/only-read.ts');
 
     const snap = await s.reconcile(root);
     expect(snap.records).toHaveLength(0); // repo is clean; read ≠ changed
@@ -305,5 +305,104 @@ describe('revertFile', () => {
     const res = await svc().revertFile(root, 'deep/nested/leaf.txt');
     expect(res.ok).toBe(true);
     expect(fs.readFileSync(path.join(root, 'deep/nested/leaf.txt'), 'utf8')).toBe('content\n');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* P1: per-root isolation                                              */
+/* ------------------------------------------------------------------ */
+
+describe('root isolation (P1 review fix)', () => {
+  it('A→B switch: records, read ledger and cache never leak across roots', async () => {
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-B-'));
+    try {
+      const s = svc();
+      s.onRuntimeEvent(fileChanged('a-file.ts', 'added'), root);
+      s.onRuntimeEvent({ v: 1, type: 'file_read', path: 'a-read.ts' }, root);
+      await s.reconcile(root);
+      expect(s.readLedger(root)).toContain('a-read.ts');
+
+      // B sees none of A's state.
+      expect(s.eventRecordCount(rootB)).toBe(0);
+      expect(s.readLedger(rootB)).not.toContain('a-read.ts');
+      const snapB = await s.reconcile(rootB);
+      expect(snapB.root).toBe(rootB);
+      expect(snapB.records).toHaveLength(0);
+      expect(snapB.generatedAt).toBeGreaterThan(0);
+
+      // A keeps its own data intact.
+      expect(s.eventRecordCount(root)).toBe(1);
+      const snapA = await s.reconcile(root);
+      expect(snapA.records.map((r) => r.path)).toContain('a-file.ts');
+    } finally {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    }
+  });
+
+  it('peekSnapshot returns the right root’s cache (not any old one)', async () => {
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-B-'));
+    try {
+      const s = svc();
+      s.onRuntimeEvent(fileChanged('in-A.txt', 'added'), root);
+      await s.reconcile(root);
+
+      // Before B ever reconciles, B peeks empty.
+      expect(s.peekSnapshot(rootB).records).toHaveLength(0);
+      expect(s.peekSnapshot(rootB).root).toBe(rootB);
+      // A still has its cached record.
+      expect(s.peekSnapshot(root).records.map((r) => r.path)).toContain('in-A.txt');
+    } finally {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    }
+  });
+
+  it('concurrent reconcile: another root in-flight never feeds B a stale A snapshot', async () => {
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-B-'));
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      let blockedA = false;
+      const runGit: GitRunner = (r, args, opts) => {
+        if (r === root && !blockedA) {
+          blockedA = true; // hold A’s reconcile in-flight
+          return gate.then(() => defaultGitRunner(r, args, opts));
+        }
+        return defaultGitRunner(r, args, opts);
+      };
+      const s = new ChangeRecordService({ runGit });
+      s.onRuntimeEvent(fileChanged('only-in-A.txt', 'added'), root);
+
+      const pA = s.reconcile(root); // in-flight, blocked on the gate
+      // B reconciles independently while A is still running.
+      const snapB = await s.reconcile(rootB);
+      expect(snapB.root).toBe(rootB);
+      expect(snapB.records.map((r) => r.path)).not.toContain('only-in-A.txt');
+
+      release!();
+      const snapA = await pA;
+      expect(snapA.root).toBe(root);
+      expect(snapA.records.map((r) => r.path)).toContain('only-in-A.txt');
+    } finally {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    }
+  });
+
+  it('same-name added record in A does NOT let Revert delete B’s file (P1)', async () => {
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-B-')); // non-git
+    try {
+      fs.writeFileSync(path.join(rootB, 'notes.txt'), "B's own data\n");
+      const s = svc();
+      // A (a git repo) added a file named notes.txt.
+      s.onRuntimeEvent(fileChanged('notes.txt', 'added'), root);
+
+      const res = await s.revertFile(rootB, 'notes.txt');
+      // B has no 'added' record of its own — must refuse, never delete B's file.
+      expect(res.ok).toBe(false);
+      expect(fs.readFileSync(path.join(rootB, 'notes.txt'), 'utf8')).toBe("B's own data\n");
+    } finally {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    }
   });
 });

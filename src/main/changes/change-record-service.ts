@@ -29,6 +29,7 @@ import type {
   RevertFileResult
 } from '../../shared/changes';
 import type { RuntimeEventFrame } from '../../shared/protocol/types';
+import { guardWrite, verifyAfterWrite } from './boundary';
 import {
   currentBranch,
   defaultGitRunner,
@@ -96,15 +97,26 @@ export function normalizeEventPath(root: string | null, rawPath: string): string
   return cleaned;
 }
 
+/** Canonical partition key for a workspace root (P1: per-root isolation). */
+function canonicalRootKey(root: string | null): string {
+  // path.resolve collapses aliases to one normalized absolute spelling. This
+  // partitions event records, the read ledger, the cache and in-flight
+  // reconciles per workspace, so switching A→B never leaks A's state into B.
+  return root ? path.resolve(root) : '<none>';
+}
+
+/** All mutable state bound to ONE workspace root. */
+interface RootPartition {
+  eventRecords: Map<string, ChangeRecord>;
+  readPaths: Set<string>;
+  cachedSnapshot: ChangesSnapshot | null;
+}
+
 export class ChangeRecordService {
-  /** Event-driven records keyed by normalized relative path. */
-  private readonly eventRecords = new Map<string, ChangeRecord>();
-  /** Paths the agent merely READ this session (never shown as changes). */
-  private readonly readPaths = new Set<string>();
-  /** Cached merged view + branch facts for the active root. */
-  private cachedSnapshot: ChangesSnapshot | null = null;
-  private cachedRoot: string | null = null;
-  private reconciling: Promise<ChangesSnapshot> | null = null;
+  /** Per-root partitions keyed by {@link canonicalRootKey}. */
+  private readonly partitions = new Map<string, RootPartition>();
+  /** Per-root in-flight reconciles (never return another root's snapshot). */
+  private readonly inflight = new Map<string, Promise<ChangesSnapshot>>();
 
   constructor(
     private readonly deps: {
@@ -112,6 +124,16 @@ export class ChangeRecordService {
       now?: () => Date;
     } = {}
   ) {}
+
+  private partitionFor(root: string | null): RootPartition {
+    const key = canonicalRootKey(root);
+    let p = this.partitions.get(key);
+    if (!p) {
+      p = { eventRecords: new Map(), readPaths: new Set(), cachedSnapshot: null };
+      this.partitions.set(key, p);
+    }
+    return p;
+  }
 
   /* ---------------- event ingestion ---------------- */
 
@@ -125,7 +147,7 @@ export class ChangeRecordService {
         return false;
       case 'file_read':
         if (typeof frame.path === 'string' && frame.path.trim() !== '') {
-          this.readPaths.add(normalizeEventPath(root, frame.path));
+          this.partitionFor(root).readPaths.add(normalizeEventPath(root, frame.path));
         }
         return false;
       case 'file_changed': {
@@ -133,13 +155,14 @@ export class ChangeRecordService {
         const p = normalizeEventPath(root, frame.path);
         const kind =
           frame.change === 'added' || frame.change === 'deleted' ? frame.change : 'modified';
-        const existing = this.eventRecords.get(p);
+        const records = this.partitionFor(root).eventRecords;
+        const existing = records.get(p);
         const nowIso = this.now().toISOString();
         if (existing) {
           // Same path again: refresh kind/timestamp, KEEP original position.
-          this.eventRecords.set(p, { ...existing, kind, source: 'event', lastSeenAt: nowIso });
+          records.set(p, { ...existing, kind, source: 'event', lastSeenAt: nowIso });
         } else {
-          this.eventRecords.set(p, {
+          records.set(p, {
             path: p,
             kind,
             source: 'event',
@@ -159,34 +182,42 @@ export class ChangeRecordService {
       }
   }
 
-  /** Paths observed via file_read (diagnostics; never rendered as changes). */
-  get readLedger(): readonly string[] {
-    return [...this.readPaths];
+  /** Paths read in the given workspace (never rendered as changes). */
+  readLedger(root: string | null): readonly string[] {
+    return [...this.partitionFor(root).readPaths];
   }
 
-  get eventRecordCount(): number {
-    return this.eventRecords.size;
+  eventRecordCount(root: string | null): number {
+    return this.partitionFor(root).eventRecords.size;
   }
 
   /* ---------------- reconciliation ---------------- */
 
   /**
-   * Rebuild the merged snapshot for `root`. Safe to call concurrently —
-   * concurrent callers share one in-flight reconciliation.
+   * Rebuild the merged snapshot for `root`. Safe to call concurrently — for
+   * the SAME root callers share one in-flight reconciliation; a reconcile
+   * running for another root never feeds back into this one (P1).
    */
   async reconcile(root: string | null): Promise<ChangesSnapshot> {
-    if (this.reconciling) return this.cachedSnapshot ?? emptySnapshot(root);
-    this.reconciling = this.doReconcile(root).catch(() => {
-      return this.cachedSnapshot ?? emptySnapshot(root);
+    const key = canonicalRootKey(root);
+    const existing = this.inflight.get(key);
+    if (existing) return existing;
+    const partition = this.partitionFor(root);
+    const task = this.doReconcile(root, partition).catch(() => {
+      return partition.cachedSnapshot ?? emptySnapshot(root);
     });
+    this.inflight.set(key, task);
     try {
-      return await this.reconciling;
+      return await task;
     } finally {
-      this.reconciling = null;
+      if (this.inflight.get(key) === task) this.inflight.delete(key);
     }
   }
 
-  private async doReconcile(root: string | null): Promise<ChangesSnapshot> {
+  private async doReconcile(
+    root: string | null,
+    partition: RootPartition
+  ): Promise<ChangesSnapshot> {
     const run = this.deps.runGit ?? defaultGitRunner;
     let branch: string | null = null;
     let detached = false;
@@ -203,7 +234,7 @@ export class ChangeRecordService {
     }
     const nowIso = this.now().toISOString();
     const records = mergeRecords({
-      eventRecords: [...this.eventRecords.values()],
+      eventRecords: [...partition.eventRecords.values()],
       gitEntries: entries,
       nowIso
     });
@@ -215,21 +246,20 @@ export class ChangeRecordService {
       records,
       generatedAt: this.now().getTime()
     };
-    this.cachedSnapshot = snapshot;
-    this.cachedRoot = root;
+    partition.cachedSnapshot = snapshot;
     return snapshot;
   }
 
-  /** Latest known snapshot; cheap, never spawns git. */
+  /** Latest known snapshot for `root`; cheap, never spawns git. */
   peekSnapshot(root: string | null): ChangesSnapshot {
-    if (this.cachedSnapshot && this.cachedRoot === root) return this.cachedSnapshot;
-    return emptySnapshot(root);
+    const cached = this.partitionFor(root).cachedSnapshot;
+    return cached ?? emptySnapshot(root);
   }
 
-  private invalidateCacheFor(_root: string | null): void {
+  private invalidateCacheFor(root: string | null): void {
     // Event upserts change the merged view; drop the cache so the next
     // peek/reconcile rebuilds it. Branch facts stay best-effort.
-    this.cachedSnapshot = null;
+    this.partitionFor(root).cachedSnapshot = null;
   }
 
   /* ---------------- revert (S-5) ---------------- */
@@ -244,17 +274,19 @@ export class ChangeRecordService {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
     const rel = normalizeRel(relPath);
+    const records = this.partitionFor(root).eventRecords;
 
     if (!(await isGitWorkTree(root, run))) {
       // Non-git workspace: we can only remove files the runtime ADDED.
-      const record = this.eventRecords.get(rel);
+      const record = records.get(rel);
       if (record?.kind === 'added') {
         try {
+          await guardWrite(root, abs);
           if (fs.existsSync(abs)) fs.unlinkSync(abs);
         } catch (err) {
           return { ok: false, error: `删除文件失败：${describe(err)}` };
         }
-        this.forgetRecord(rel);
+        this.forgetRecord(root, rel);
         return { ok: true, action: 'deleted-file' };
       }
       return {
@@ -267,7 +299,7 @@ export class ChangeRecordService {
     const entry = entries.find((e) => e.path === rel);
     if (!entry) {
       // Nothing differs from HEAD anymore → reverting again is a no-op.
-      this.forgetRecord(rel);
+      this.forgetRecord(root, rel);
       return { ok: true, noop: true };
     }
 
@@ -280,11 +312,12 @@ export class ChangeRecordService {
     if (untracked || ((additionish || deletionish) && !(await hasHeadBlob(root, rel, run)))) {
       // File unknown to HEAD: discarding the change means deleting it.
       try {
+        await guardWrite(root, abs);
         if (fs.existsSync(abs)) fs.unlinkSync(abs);
       } catch (err) {
         return { ok: false, error: `删除文件失败：${describe(err)}` };
       }
-      this.forgetRecord(rel);
+      this.forgetRecord(root, rel);
       return this.withResidual(await this.stillDirty(root, rel, run), 'deleted-file');
     }
 
@@ -296,18 +329,23 @@ export class ChangeRecordService {
       return { ok: false, error: '无法从 Git 读取改动前内容（HEAD 与索引中均无此文件）' };
     }
     try {
+      // Canonical guard before touching the tree (P0): reject out-of-bound or
+      // file-symlink targets, then mkdir + write. verifyAfterWrite re-checks the
+      // canonical location afterwards to fail closed on a check↔use swap.
+      await guardWrite(root, abs);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
       fs.writeFileSync(abs, bytes);
+      await verifyAfterWrite(root, abs);
     } catch (err) {
       return { ok: false, error: `写回文件失败：${describe(err)}` };
     }
-    this.forgetRecord(rel);
+    this.forgetRecord(root, rel);
     const action = deletionish ? 'recreated-file' : 'restored-content';
     return this.withResidual(await this.stillDirty(root, rel, run), action);
   }
 
-  private forgetRecord(rel: string): void {
-    this.eventRecords.delete(rel);
+  private forgetRecord(root: string | null, rel: string): void {
+    this.partitionFor(root).eventRecords.delete(rel);
   }
 
   private async stillDirty(root: string, rel: string, run: GitRunner): Promise<boolean> {

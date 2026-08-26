@@ -1,0 +1,196 @@
+{
+  "generatedAt": "2026-08-26T05:50:39.375Z",
+  "commit": "5ccc287e6871b3b917919d09fc44c80ff2f05cc5",
+  "driver": "qa-evidence/qa-cdp-probe.mjs (CDP trusted-input independent probe)",
+  "shots": {
+    "A1-drawer-open-700": "qa-evidence/probe-A1-drawer-open-700.png",
+    "B0-before-crossing-700": "qa-evidence/probe-B0-before-crossing-700.png",
+    "B1-crossed-wide-1280": "qa-evidence/probe-B1-crossed-wide-1280.png",
+    "C0-approval-500": "qa-evidence/probe-C0-approval-500.png",
+    "C4-after-tabs-500": "qa-evidence/probe-C4-after-tabs-500.png",
+    "C5-after-esc-500": "qa-evidence/probe-C5-after-esc-500.png",
+    "D1-modal-over-drawer-700": "qa-evidence/probe-D1-modal-over-drawer-700.png"
+  },
+  "passed": 19,
+  "failedCount": 0,
+  "results": [
+    {
+      "id": "boot",
+      "desc": "app booted normally, runtime ready, workspace visible",
+      "pass": true,
+      "detail": null
+    },
+    {
+      "id": "A0",
+      "desc": "resized to 700×500, narrow layout, idle",
+      "pass": true,
+      "detail": {
+        "innerW": 700,
+        "innerH": 500,
+        "toggles": 2
+      }
+    },
+    {
+      "id": "A1",
+      "desc": "trusted click opens sessions drawer (backdrop shown)",
+      "pass": true,
+      "detail": {
+        "aria": "true",
+        "backdrop": true
+      }
+    },
+    {
+      "id": "A2",
+      "desc": "backdrop click closes drawer, aria-expanded=false",
+      "pass": true,
+      "detail": {
+        "aria": "false"
+      }
+    },
+    {
+      "id": "A3",
+      "desc": "changes drawer: trusted Esc closes, focus returns to toggle",
+      "pass": true,
+      "detail": {
+        "openedWithFocusInside": true,
+        "closedNow": true
+      }
+    },
+    {
+      "id": "B0",
+      "desc": "sessions drawer reopened before crossing breakpoint",
+      "pass": true,
+      "detail": {}
+    },
+    {
+      "id": "B1",
+      "desc": "crossed up to 1280×800 while open: NO residue (no backdrop/drawer/toggles, three columns visible)",
+      "pass": true,
+      "detail": {
+        "backdrop": false,
+        "drawerOpen": false,
+        "toggles": 0,
+        "threeCol": true
+      }
+    },
+    {
+      "id": "B2",
+      "desc": "crossed back down to 700×500: clean narrow state, no stale drawer/backdrop",
+      "pass": true,
+      "detail": {
+        "toggles": 2,
+        "aria": "false",
+        "composer": {
+          "x": 0,
+          "y": 427,
+          "w": 648,
+          "h": 73,
+          "fullyInViewport": true
+        }
+      }
+    },
+    {
+      "id": "C0",
+      "desc": "approval modal open at 500×400: no page overflow, command scrolls internally & inside viewport",
+      "pass": true,
+      "detail": {
+        "cmd": {
+          "overflowY": "auto",
+          "scrollsInternally": true,
+          "contentH": 118,
+          "boxH": 83,
+          "withinViewport": true
+        },
+        "scrollOverflow": false
+      }
+    },
+    {
+      "id": "C1",
+      "desc": "reject button fully visible at 500×400",
+      "pass": true,
+      "detail": {
+        "x": 272,
+        "y": 324,
+        "w": 72,
+        "h": 36,
+        "fullyInViewport": true
+      }
+    },
+    {
+      "id": "C2",
+      "desc": "composer NOT pushed out of viewport behind modal",
+      "pass": true,
+      "detail": {
+        "x": 0,
+        "y": 327,
+        "w": 500,
+        "h": 73,
+        "fullyInViewport": true
+      }
+    },
+    {
+      "id": "C3",
+      "desc": "initial focus sits on 拒绝 (safe default)",
+      "pass": true,
+      "detail": {}
+    },
+    {
+      "id": "C4",
+      "desc": "focus trap holds: 6×Tab never escapes the modal",
+      "pass": true,
+      "detail": {
+        "stillInsideAfterEachTab": true
+      }
+    },
+    {
+      "id": "C5",
+      "desc": "trusted Escape ≙ reject-once: modal gone, run settles back to 发送",
+      "pass": true,
+      "detail": {
+        "btn": "发送"
+      }
+    },
+    {
+      "id": "D0",
+      "desc": "mid-run: sessions drawer opened while run is live",
+      "pass": true,
+      "detail": {
+        "drawerOpen": true,
+        "btn": "停止"
+      }
+    },
+    {
+      "id": "D1",
+      "desc": "approval modal coexists with open drawer beneath",
+      "pass": true,
+      "detail": {
+        "modalOpen": true,
+        "drawerOpen": true
+      }
+    },
+    {
+      "id": "D2",
+      "desc": "Esc #1 rejects the MODAL only — drawer stays open (listener stood down)",
+      "pass": true,
+      "detail": {
+        "modalOpen": false,
+        "drawerStillOpen": true
+      }
+    },
+    {
+      "id": "D3",
+      "desc": "Esc #2 then closes the drawer (focus back on toggle)",
+      "pass": true,
+      "detail": {
+        "drawerOpen": false,
+        "focusOnToggle": true
+      }
+    },
+    {
+      "id": "D4",
+      "desc": "second run also settled after Esc-reject",
+      "pass": true,
+      "detail": null
+    }
+  ]
+}

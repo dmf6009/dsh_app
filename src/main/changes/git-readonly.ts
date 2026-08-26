@@ -200,7 +200,7 @@ export function parseStatusZ(stdout: string): StatusEntry[] {
     const match = /^(.{2}) (.*)$/s.exec(raw);
     if (!match) continue;
     const code = match[1]!;
-    let filePath = match[2]!;
+    const filePath = match[2]!;
     const x = code[0]!;
     const y = code[1]!;
     if (x === '?' || y === '?') {
@@ -314,7 +314,7 @@ function capDiff(text: string): UnifiedDiffResult {
 async function synthesizeAddDiff(
   root: string,
   relPath: string,
-  run: GitRunner = defaultGitRunner
+  _run: GitRunner = defaultGitRunner
 ): Promise<UnifiedDiffResult | null> {
   const abs = safeResolve(root, relPath);
   let stat: fs.Stats;

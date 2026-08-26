@@ -1804,3 +1804,314 @@ code {
 .btn-danger:hover:not(:disabled) {
   background: #93261b;
 }
+
+/* ==================== DSHA-6: Changes / Diff layer ==================== */
+
+/* ---- right column: head with branch pill + clickable rows ---- */
+
+.changes-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.branch-pill {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--info);
+  background: var(--accent-weak);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 8px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.branch-pill.branch-detached {
+  color: var(--warning);
+  background: var(--warning-bg);
+}
+
+.change-btn {
+  width: 100%;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.change-btn:hover:not(:disabled) {
+  background: var(--accent-weak);
+  border-color: var(--accent);
+}
+
+.change-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.change-selected,
+.change-selected:hover:not(:disabled) {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+  background: var(--accent-weak);
+}
+
+.change-src {
+  margin-left: auto;
+  flex: none;
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
+/* ---- pinned run summary bar (「N 个文件变更 · View Diff」) ---- */
+
+.changes-summary-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding: 8px 10px;
+  background: var(--panel);
+  border-top: 1px solid var(--border-strong);
+}
+
+.changes-summary-text {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.changes-error {
+  margin-top: 8px;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-radius: var(--radius, 8px);
+}
+
+.col-changes {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* ---- diff page layout ---- */
+
+.diff-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) 1fr;
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+}
+
+.diff-files {
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.diff-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.diff-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 6px;
+}
+
+.diff-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.diff-path {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.hunk-pos {
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 72px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.diff-monaco-host {
+  flex: 1;
+  min-height: 320px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius, 8px);
+  overflow: hidden;
+}
+
+.diff-status {
+  padding: 10px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius, 8px);
+  color: var(--muted);
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.diff-error-card {
+  color: var(--danger);
+  background: var(--danger-bg);
+  border-style: solid;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.diff-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.diff-progress-bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--accent);
+  min-width: 40px;
+  max-width: 240px;
+  transition: width 0.15s ease;
+}
+
+.diff-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 16px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius, 8px);
+  text-align: center;
+}
+
+.feedback {
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius, 8px);
+  font-size: 12px;
+}
+
+.feedback-ok {
+  color: var(--success);
+  background: var(--success-bg);
+}
+
+.feedback-warn {
+  color: var(--warning);
+  background: var(--warning-bg);
+}
+
+.feedback-info {
+  color: var(--info);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+
+.feedback-error {
+  color: var(--danger);
+  background: var(--danger-bg);
+}
+
+/* ---- two-step destructive confirm dialog (S-5) ---- */
+
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(16, 24, 40, 0.44);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+}
+
+.confirm-dialog {
+  width: min(480px, calc(100vw - 32px));
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(16, 24, 40, 0.24);
+  padding: 16px;
+  outline: none;
+}
+
+.confirm-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.confirm-body {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.confirm-body code {
+  font-family: var(--mono);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  word-break: break-all;
+}
+
+.confirm-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.confirm-warning {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-radius: var(--radius, 8px);
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}

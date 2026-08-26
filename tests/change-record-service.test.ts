@@ -17,6 +17,7 @@ import {
 } from '../src/main/changes/change-record-service';
 import type { RuntimeEventFrame } from '../src/shared/protocol/types';
 import type { StatusEntry } from '../src/main/changes/git-readonly';
+import type { ChangeRecord } from '../src/shared/changes';
 
 let root = '';
 
@@ -60,7 +61,7 @@ describe('mergeRecords', () => {
     kind: 'added' | 'modified' | 'deleted',
     firstSeenAt = '2024-12-31T00:00:00.000Z'
   ): ChangeRecordLike => ({ path, kind, source: 'event', firstSeenAt, lastSeenAt: firstSeenAt });
-  type ChangeRecordLike = import('../src/shared/changes').ChangeRecord;
+  type ChangeRecordLike = ChangeRecord;
 
   it('keeps event arrival order and lets git override shared paths', () => {
     const eventRecords = [ev('b.ts', 'modified'), ev('a.ts', 'added')];

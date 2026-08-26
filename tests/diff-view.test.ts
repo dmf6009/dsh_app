@@ -60,7 +60,7 @@ describe('parseUnifiedDiff', () => {
     expect(diffStats(parseUnifiedDiff(SAMPLE))).toEqual({ added: 3, removed: 2 });
   });
 
-  it('keeps "\ No newline at end of file" markers inside hunks', () => {
+  it('keeps backslash no-newline markers inside hunks', () => {
     const parsed = parseUnifiedDiff('@@ -1 +1 @@\n-old\\n no nl\n+new\n\\ No newline at end of file');
     // Marker attaches to the new side; parser must not choke on it.
     expect(parsed.hunks[0]!.lines.some((l) => l.startsWith('\\'))).toBe(true);

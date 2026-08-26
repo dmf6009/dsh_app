@@ -1,403 +1,581 @@
 /**
- * Workspace page (§37): three-column skeleton — Sessions | Conversation |
- * Changes. Only the conversation column is live in P1-A; message-stream
- * rendering stays at its Phase 0 level and Sessions/Changes are structural
- * placeholders for later stages.
+ * Workspace page (issue DSHA-5): production three-column layout.
+ *
+ *   Left   — Sessions list (in-memory this stage; persistence lands later)
+ *   Middle — Conversation rendering the §9 seven forms + composer with the
+ *            running lock and an always-reachable Stop (AC-11)
+ *   Right  — Changes container fed by file_changed events (real diff view is
+ *            P1-C scope)
+ *
+ * Also hosts the app-level Approval modal (§12/§13) and the §32 crash /
+ * startup-failure recovery banners (Restart Runtime / Resume Session).
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import type { ConnectionState } from '../../../shared/desktop-api';
+import type { ConnectionState, RuntimeStatus } from '../../../shared/desktop-api';
+import type {
+  ApprovalRequestPayload,
+} from '../../../shared/approval-protocol';
 import type { RuntimeEventFrame } from '../../../shared/protocol/types';
-import { Button } from '../components/ui';
-import { useApp } from '../store/app-store';
+import { ApprovalModal } from '../components/ApprovalModal';
+import { Button, Spinner } from '../components/ui';
+import {
+  INITIAL_MODEL,
+  reduceChat,
+  type AssistantItem,
+  type ChatItem,
+  type ChatModel,
+  type FileChangedItem,
+  type FileReadItem,
+  type PlanItem,
+  type SubagentItem,
+  type SummaryItem,
+  type ToolCardItem,
+  type UserItem
+} from '../chat/model';
 
-/* ------------------------------------------------------------------ */
-/* Chat model (moved verbatim from Phase 0 App.tsx)                    */
-/* ------------------------------------------------------------------ */
+const LEVEL_CLASS: Record<string, string> = { L0: 'lvl-l0', L1: 'lvl-l1', L2: 'lvl-l2' };
 
-type ToolStatus = 'running' | 'ok' | 'failed' | 'cancelled';
-type Tone = 'info' | 'error' | 'stop';
+const CHANGE_LABEL: Record<string, string> = {
+  added: 'A',
+  modified: 'M',
+  deleted: 'D'
+};
 
-interface UserItem {
-  kind: 'user';
+const STATE_LABEL: Record<ConnectionState, string> = {
+  stopped: '未连接',
+  starting: '启动中…',
+  ready: '已就绪',
+  crashed: '已崩溃'
+};
+
+interface SessionEntry {
   id: string;
-  text: string;
+  title: string;
+  active: boolean;
 }
-interface AssistantItem {
-  kind: 'assistant';
-  id: string;
-  text: string;
-  streaming: boolean;
-}
-interface ToolItem {
-  kind: 'tool';
-  id: string;
-  toolCallId?: string;
-  tool: string;
-  command?: string;
-  output: string;
-  status: ToolStatus;
-}
-interface NoticeItem {
-  kind: 'notice';
-  id: string;
-  tone: Tone;
-  text: string;
-}
-type ChatItem = UserItem | AssistantItem | ToolItem | NoticeItem;
-
-let seq = 0;
-function nextId(prefix: string): string {
-  seq += 1;
-  return `${prefix}-${seq}`;
-}
-
-/** Apply one protocol event to the chat transcript. */
-function reduce(items: ChatItem[], frame: RuntimeEventFrame): { items: ChatItem[]; endedRun: boolean } {
-  switch (frame.type) {
-    case 'ready':
-      return { items: [...items, notice('info', 'Runtime 已就绪')], endedRun: false };
-
-    case 'run_started': {
-      // Start a fresh assistant bubble for this run.
-      return {
-        items: [...items, { kind: 'assistant', id: nextId('asst'), text: '', streaming: true }],
-        endedRun: false
-      };
-    }
-
-    case 'message_delta': {
-      const next = [...items];
-      const idx = lastStreamingAssistantIndex(next);
-      const part = frame.content ?? '';
-      if (idx === -1) {
-        next.push({ kind: 'assistant', id: nextId('asst'), text: part, streaming: true });
-      } else {
-        const current = next[idx] as AssistantItem;
-        next[idx] = { ...current, text: current.text + part };
-      }
-      return { items: next, endedRun: false };
-    }
-
-    case 'message_completed': {
-      const next = [...items];
-      const idx = lastStreamingAssistantIndex(next);
-      if (idx !== -1) {
-        const current = next[idx] as AssistantItem;
-        next[idx] = {
-          ...current,
-          text: typeof frame.content === 'string' ? frame.content : current.text,
-          streaming: false
-        };
-      }
-      return { items: next, endedRun: false };
-    }
-
-    case 'plan': {
-      const body = Array.isArray(frame.steps)
-        ? frame.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')
-        : (frame.content ?? '');
-      return { items: [...items, notice('info', `Plan\n${body}`)], endedRun: false };
-    }
-
-    case 'tool_started':
-      return {
-        items: [
-          ...items,
-          {
-            kind: 'tool',
-            id: nextId('tool'),
-            toolCallId: frame.tool_call_id,
-            tool: frame.tool,
-            command: typeof frame.command === 'string' ? frame.command : undefined,
-            output: '',
-            status: 'running'
-          }
-        ],
-        endedRun: false
-      };
-
-    case 'tool_output': {
-      const next = [...items];
-      const idx = findToolIndex(next, frame.tool_call_id);
-      if (idx !== -1) {
-        const tool = next[idx] as ToolItem;
-        next[idx] = { ...tool, output: tool.output + (frame.content ?? '') + '\n' };
-      }
-      return { items: next, endedRun: false };
-    }
-
-    case 'tool_completed': {
-      const next = [...items];
-      const idx = findToolIndex(next, frame.tool_call_id);
-      if (idx !== -1) {
-        const tool = next[idx] as ToolItem;
-        const status: ToolStatus =
-          frame.status === 'failed'
-            ? 'failed'
-            : frame.status === 'cancelled'
-              ? 'cancelled'
-              : 'ok';
-        next[idx] = { ...tool, status };
-      }
-      return { items: next, endedRun: false };
-    }
-
-    case 'file_read':
-    case 'file_changed': {
-      const verb = frame.type === 'file_read' ? '读取' : '变更';
-      const change = 'change' in frame && typeof frame.change === 'string' ? ` (${frame.change})` : '';
-      return {
-        items: [...items, notice('info', `${verb}文件 ${frame.path}${change}`)],
-        endedRun: false
-      };
-    }
-
-    case 'error': {
-      const recoverable = frame.recoverable === true;
-      const code = frame.code ? ` [${frame.code}]` : '';
-      return {
-        items: [...items, notice('error', `${frame.message}${code}`)],
-        endedRun: !recoverable
-      };
-    }
-
-    case 'done':
-    case 'run_completed': {
-      const summary =
-        typeof frame.summary === 'string'
-          ? frame.summary
-          : typeof frame.content === 'string'
-            ? frame.content
-            : undefined;
-      const next = [...items];
-      const idx = lastStreamingAssistantIndex(next);
-      if (idx !== -1 && summary && summary.length > 0) {
-        // The final summary supersedes streamed deltas once complete.
-        const current = next[idx] as AssistantItem;
-        next[idx] = { ...current, text: current.text || summary, streaming: false };
-      } else if (idx !== -1) {
-        const current = next[idx] as AssistantItem;
-        next[idx] = { ...current, streaming: false };
-      }
-      return { items: next, endedRun: true };
-    }
-
-    case 'run_cancelled':
-      return {
-        items: [...items, notice('stop', '已停止当前任务')],
-        endedRun: true
-      };
-
-    default:
-      // approval_required / approval_response etc. are out of P1-A scope.
-      return { items, endedRun: false };
-  }
-}
-
-function notice(tone: Tone, text: string): NoticeItem {
-  return { kind: 'notice', id: nextId('notice'), tone, text };
-}
-
-function lastStreamingAssistantIndex(items: ChatItem[]): number {
-  for (let i = items.length - 1; i >= 0; i -= 1) {
-    const item = items[i]!;
-    if (item.kind === 'assistant' && item.streaming) return i;
-    if (item.kind === 'user') break; // a newer turn started
-  }
-  return -1;
-}
-
-function findToolIndex(items: ChatItem[], toolCallId: string | undefined): number {
-  for (let i = items.length - 1; i >= 0; i -= 1) {
-    const item = items[i]!;
-    if (item.kind !== 'tool') continue;
-    if (toolCallId === undefined) return i;
-    if (item.toolCallId === toolCallId) return i;
-  }
-  return -1;
-}
-
-/* ------------------------------------------------------------------ */
-/* Component                                                           */
-/* ------------------------------------------------------------------ */
 
 export default function WorkspacePage(): JSX.Element {
-  const { state } = useApp();
-  const [items, setItems] = useState<ChatItem[]>([]);
+  const [model, setModel] = useState<ChatModel>(INITIAL_MODEL);
   const [input, setInput] = useState('');
-  const [running, setRunning] = useState(false);
   const [connection, setConnection] = useState<ConnectionState>('stopped');
+  const [status, setStatus] = useState<RuntimeStatus | null>(null);
+  const [approval, setApproval] = useState<ApprovalRequestPayload | null>(null);
+  /** Review fix 3: retryable send-failure banner while the modal stays open. */
+  const [approvalSendError, setApprovalSendError] = useState<string | null>(null);
+  /**
+   * Second-review fix: push notice for auto-decision delivery failures.
+   * Dismissible; also cleared by the next approval event or user action.
+   */
+  const [approvalNotice, setApprovalNotice] = useState<string | null>(null);
+  const [modelChoice, setModelChoice] = useState<string>('');
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [sessions, setSessions] = useState<SessionEntry[]>([
+    { id: 'local', title: '本地会话', active: true }
+  ]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const modelRef = useRef<ChatModel>(INITIAL_MODEL);
+  modelRef.current = model;
+
+  const dispatch = useCallback((action: Parameters<typeof reduceChat>[1]): void => {
+    setModel((prev) => reduceChat(prev, action));
+  }, []);
+
+  /* ---- subscriptions ------------------------------------------------ */
 
   useEffect(() => {
-    const offEvent = window.desktop.onEvent((frame) => {
-      setItems((prev) => {
-        const { items: next, endedRun } = reduce(prev, frame);
-        if (endedRun) setRunning(false);
-        return next;
-      });
+    const offEvent = window.desktop.onEvent((frame: RuntimeEventFrame) => {
+      dispatch({ type: 'event', frame });
     });
     const offState = window.desktop.onConnectionState((next) => {
       setConnection(next);
-      if (next === 'crashed') setRunning(false);
+      void window.desktop.getStatus().then(setStatus).catch(() => undefined);
+    });
+    const offApproval = window.desktop.onApprovalRequest((payload) => {
+      setApprovalSendError(null);
+      setApproval(payload);
+      dispatch({ type: 'approval-opened', payload });
+    });
+    const offResolved = window.desktop.onApprovalResolved(() => {
+      setApprovalSendError(null);
+      setApproval(null);
+      setApprovalNotice(null);
+    });
+    const offApprovalNotice = window.desktop.onApprovalNotice((notice) => {
+      setApprovalNotice(notice.message);
     });
 
-    void window.desktop.getStatus().then((status) => setConnection(status.state));
+    void window.desktop.getStatus().then((initial) => {
+      setStatus(initial);
+      setConnection(initial.state);
+      if (initial.sessionId !== null && initial.sessionId !== '') {
+        setSessions((prev) =>
+          prev.some((s) => s.id === initial.sessionId)
+            ? prev.map((s) => ({ ...s, active: s.id === initial.sessionId }))
+            : [...prev.map((s) => ({ ...s, active: false })), {
+                id: initial.sessionId!,
+                title: `会话 ${initial.sessionId!.slice(0, 8)}`,
+                active: true
+              }]
+        );
+      }
+    });
+    // Model choices come from configured providers; selection is cosmetic
+    // until P1-C wires it into run requests.
+    void window.desktop.getSettings().then((view) => {
+      const names = Array.from(
+        new Set(view.providers.flatMap((p) => p.models ?? []))
+      );
+      setAvailableModels(names);
+      setModelChoice((current) => current || names[0] || '');
+    }).catch(() => undefined);
 
     return () => {
       offEvent();
       offState();
+      offApproval();
+      offResolved();
+      offApprovalNotice();
     };
-  }, []);
+  }, [dispatch]);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [items]);
+  }, [model.items]);
 
-  const submit = useCallback(async () => {
+  /* ---- actions ------------------------------------------------------ */
+
+  const running = model.phase !== 'idle';
+  const canSend = connection === 'ready' && !running && input.trim() !== '';
+
+  const submit = useCallback(async (): Promise<void> => {
     const text = input.trim();
-    if (!text || running || connection !== 'ready') return;
+    if (!canSend) return;
     setInput('');
-    setItems((prev) => [...prev, { kind: 'user', id: nextId('user'), text }]);
-    setRunning(true);
+    dispatch({ type: 'send', text });
     const result = await window.desktop.sendMessage(text);
     if (!result.ok) {
-      setRunning(false);
-      setItems((prev) => [
+      // No run actually started — release the lock and surface the error.
+      setModel((prev) => ({
         ...prev,
-        notice('error', `发送失败：${result.error ?? 'unknown error'}`)
-      ]);
+        phase: 'idle',
+        items: [
+          ...prev.items,
+          {
+            kind: 'notice',
+            id: `senderr-${Date.now()}`,
+            tone: 'error' as const,
+            text: `发送失败：${result.error ?? 'unknown error'}`
+          }
+        ]
+      }));
     }
-  }, [input, running, connection]);
+  }, [input, canSend, dispatch]);
 
   const stop = useCallback(async (): Promise<void> => {
+    if (modelRef.current.phase === 'idle') return;
+    dispatch({ type: 'cancel-requested' });
     const result = await window.desktop.cancelRun();
     if (!result.ok) {
-      setRunning(false);
-      setItems((prev) => [
-        ...prev,
-        notice('error', `停止失败：${result.error ?? 'no active run'}`)
-      ]);
+      dispatch({ type: 'cancel-failed', error: result.error ?? 'no active run' });
     }
+    // Unlock happens only when run_cancelled arrives (AC-11).
+  }, [dispatch]);
+
+  const respondApproval = useCallback(
+    async (requestId: string, decision: 'allow' | 'reject', scope: 'once' | 'session'): Promise<void> => {
+      setApprovalSendError(null);
+      setApprovalNotice(null);
+      const result = await window.desktop.respondApproval(requestId, { decision, scope });
+      if (result.ok || result.error === 'no_pending_request') {
+        // Delivered (or already settled elsewhere — safe default stands).
+        setApproval(null);
+        return;
+      }
+      // Review fix 3: runtime unreachable — keep the modal open and surface
+      // the retryable error instead of pretending the answer was delivered.
+      setApprovalSendError(
+        result.error === 'runtime_unreachable'
+          ? '发送到运行时失败，请重试'
+          : (result.error ?? '发送失败，请重试')
+      );
+    },
+    []
+  );
+
+  const recoverRestart = useCallback((): void => {
+    void window.desktop.restartRuntime().then(setStatus).catch(() => undefined);
   }, []);
 
-  const canSend = connection === 'ready' && !running;
+  const recoverResume = useCallback((): void => {
+    void window.desktop.startRuntime().then(setStatus).catch(() => undefined);
+  }, []);
+
+  const statePillClass =
+    connection === 'ready'
+      ? 'pill pill-ok'
+      : connection === 'crashed'
+        ? 'pill pill-error'
+        : connection === 'starting'
+          ? 'pill pill-warn'
+          : 'pill pill-idle';
 
   return (
     <div className="page page-workspace">
+      {/* ---------------- Left: sessions ---------------- */}
       <aside className="col col-sessions" aria-label="Sessions">
         <h2 className="panel-title">Sessions</h2>
-        <p className="empty-hint">会话列表将在后续阶段提供（当前单会话）。</p>
+        <ul className="session-list">
+          {sessions.map((s) => (
+            <li key={s.id} className={s.active ? 'session active' : 'session'}>
+              <span className="session-dot" aria-hidden="true" />
+              <span className="session-title">{s.title}</span>
+              {s.active && <span className="session-badge">当前</span>}
+            </li>
+          ))}
+        </ul>
+        <p className="empty-hint">会话持久化将在后续阶段提供（当前为内存列表）。</p>
       </aside>
 
+      {/* ---------------- Middle: conversation ---------------- */}
       <section className="col col-chat" aria-label="Conversation">
-        <div className="chat" ref={scrollRef}>
-          {items.length === 0 && (
-            <div className="empty">
-              <p>
-                当前 Workspace：
-                <code>{state.workspaceRoot ?? '未打开项目（回退到默认目录）'}</code>
-              </p>
-              <p>输入任务并发送，验证 Electron ↔ JSONL ↔ DSH 最小闭环。</p>
-              <p className="hint">流式回复、Tool 输出与 Stop 取消均通过 Runtime Protocol v1 驱动。</p>
-            </div>
+        <header className="chat-header">
+          <span className={statePillClass}>
+            <span className="pill-dot" aria-hidden="true" />
+            {STATE_LABEL[connection]}
+          </span>
+          <label className="model-select-label">
+            模型
+            <select
+              className="model-select"
+              value={modelChoice}
+              disabled={running}
+              onChange={(e) => setModelChoice(e.target.value)}
+              aria-label="模型选择器（运行中锁定）"
+            >
+              {availableModels.length === 0 && <option value="">默认模型</option>}
+              {availableModels.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {running && (
+            <span className="run-lock-hint">
+              <Spinner label="运行中" /> 运行中 · 选择器与发送已锁定
+            </span>
           )}
-          {items.map((item) => (
-            <ChatRow key={item.id} item={item} />
-          ))}
-        </div>
+        </header>
+
+        {connection === 'crashed' && (
+          <div className="recovery-banner recovery-crash" role="alert">
+            <div>
+              <strong>Runtime 已崩溃</strong>
+              {status?.crash != null && (
+                <code className="crash-detail">
+                  exit={String(status.crash.exitCode ?? '—')} signal={status.crash.signal ?? '—'}
+                </code>
+              )}
+            </div>
+            <div className="recovery-actions">
+              <Button size="sm" variant="primary" onClick={recoverRestart}>
+                重启 Runtime
+              </Button>
+              <Button size="sm" variant="secondary" onClick={recoverResume}>
+                恢复会话
+              </Button>
+            </div>
+          </div>
+        )}
+        {connection === 'stopped' && status?.lastError != null && status.lastError !== '' && (
+          <div className="recovery-banner recovery-startup" role="alert">
+            <div>
+              <strong>Runtime 启动失败</strong>
+              <pre className="startup-stderr">{status.lastError}</pre>
+            </div>
+            <Button size="sm" variant="primary" onClick={recoverResume}>
+              重试启动
+            </Button>
+          </div>
+        )}
+
+        <ChatList items={model.items} scrollRef={scrollRef} />
 
         <footer className="composer">
-          {!canSend && (
-            <div className="composer-hint">
-              {running
-                ? '任务运行中——可点击 Stop 真正取消。'
-                : connection === 'ready'
-                  ? ''
-                  : 'Runtime 未就绪，暂不能发送任务。'}
-            </div>
-          )}
           <textarea
             className="composer-input"
             value={input}
-            placeholder="描述一个任务，例如：修复登录接口偶发 500 的问题"
+            placeholder={
+              connection === 'ready'
+                ? running
+                  ? '任务运行中，请等待完成或点击停止…'
+                  : '描述你要完成的任务…'
+                : '先在首页启动 Runtime…'
+            }
+            disabled={connection !== 'ready' || running}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+              if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 void submit();
               }
             }}
-            disabled={running || connection !== 'ready'}
+            aria-label="消息输入框"
           />
           {running ? (
-            <Button variant="danger" onClick={() => void stop()}>
-              Stop
+            <Button
+              variant="danger"
+              onClick={() => void stop()}
+              disabled={false /* Stop must stay reachable while waiting for run_cancelled */}
+              loading={model.phase === 'awaiting_cancel'}
+              aria-label="停止当前任务"
+            >
+              {model.phase === 'awaiting_cancel' ? '停止中…' : '停止'}
             </Button>
           ) : (
-            <Button
-              variant="primary"
-              onClick={() => void submit()}
-              disabled={!canSend || input.trim() === ''}
-            >
+            <Button variant="primary" onClick={() => void submit()} disabled={!canSend}>
               发送
             </Button>
           )}
         </footer>
       </section>
 
+      {/* ---------------- Right: changes ---------------- */}
       <aside className="col col-changes" aria-label="Changes">
         <h2 className="panel-title">Changes</h2>
-        <p className="empty-hint">工作区文件变更将在 Diff 阶段接入。</p>
+        {model.changes.length === 0 ? (
+          <p className="empty-hint">本次会话还没有文件变更。变更由 file_changed 事件驱动，真实 Diff 视图见后续阶段。</p>
+        ) : (
+          <ul className="changes-list">
+            {model.changes.map((c) => (
+              <li key={c.id} className={`change change-${c.change}`}>
+                <span className={`change-kind kind-${c.change}`}>{CHANGE_LABEL[c.change]}</span>
+                <code className="change-path">{c.path}</code>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="changes-note">变更列表按事件顺序排列；点击条目查看 Diff 的能力由 P1-C 提供。</p>
       </aside>
+
+      {approvalNotice !== null && (
+        <div className="oob-banner approval-notice-banner" role="alert">
+          <span>✕ {approvalNotice}</span>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => setApprovalNotice(null)}
+          >
+            知道了
+          </button>
+        </div>
+      )}
+      <ApprovalModal
+        payload={approval}
+        sendError={approvalSendError}
+        onRespond={(id, decision, scope) => void respondApproval(id, decision, scope)}
+      />
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Chat rendering                                                      */
+/* ------------------------------------------------------------------ */
+
+function ChatList({
+  items,
+  scrollRef
+}: {
+  items: ChatItem[];
+  scrollRef: React.RefObject<HTMLDivElement>;
+}): JSX.Element {
+  return (
+    <div className="chat" ref={scrollRef}>
+      {items.length === 0 && (
+        <div className="empty">
+          <p>开始一段对话。Runtime 会以流式返回结果，工具调用、计划、文件读写和子任务都会在这里展示。</p>
+        </div>
+      )}
+      {items.map((item) => (
+        <ChatRow key={item.id} item={item} />
+      ))}
     </div>
   );
 }
 
 function ChatRow({ item }: { item: ChatItem }): JSX.Element {
-  if (item.kind === 'user') {
-    return (
-      <div className="row row-user">
-        <div className="bubble bubble-user">{item.text}</div>
-      </div>
-    );
-  }
-  if (item.kind === 'assistant') {
-    return (
-      <div className="row row-assistant">
-        <div className={`bubble bubble-assistant${item.streaming ? ' streaming' : ''}`}>
-          {item.text}
-          {item.streaming && <span className="cursor">▍</span>}
+  switch (item.kind) {
+    case 'user':
+      return <UserBubble item={item} />;
+    case 'assistant':
+      return <AssistantBubble item={item} />;
+    case 'plan':
+      return <PlanCard item={item} />;
+    case 'tool':
+      return item.form === 'terminal' ? <TerminalViewer item={item} /> : <ToolCard item={item} />;
+    case 'file_read':
+      return <FileReadRow item={item} />;
+    case 'file_changed':
+      return <FileChangedRow item={item} />;
+    case 'subagent':
+      return <SubagentCard item={item} />;
+    case 'summary':
+      return <SummaryCard item={item} />;
+    case 'notice':
+      return (
+        <div className={`notice notice-${item.tone}`} role={item.tone === 'error' ? 'alert' : undefined}>
+          <span>{item.text}</span>
         </div>
-      </div>
-    );
+      );
   }
-  if (item.kind === 'tool') {
-    const statusLabel =
-      item.status === 'running'
-        ? '运行中…'
-        : item.status === 'ok'
-          ? '✓ 完成'
-          : item.status === 'failed'
-            ? '✗ 失败'
-            : '已取消';
-    return (
-      <details className="tool-card" open={item.status === 'running'}>
-        <summary>
-          <span className="tool-name">Tool · {item.tool}</span>
-          {item.command && <code className="tool-command">{item.command}</code>}
-          <span className={`tool-status tool-status-${item.status}`}>{statusLabel}</span>
-        </summary>
-        {item.output && <pre className="tool-output">{item.output}</pre>}
-      </details>
-    );
-  }
+}
+
+function UserBubble({ item }: { item: UserItem }): JSX.Element {
   return (
-    <div className={`notice notice-${item.tone}`}>
-      <span>{item.text}</span>
+    <div className="msg msg-user">
+      <p>{item.text}</p>
+    </div>
+  );
+}
+
+function AssistantBubble({ item }: { item: AssistantItem }): JSX.Element {
+  return (
+    <div className="msg msg-assistant">
+      <p>
+        {item.text}
+        {item.streaming && (
+          <span className="stream-cursor" aria-hidden="true">
+            ▌
+          </span>
+        )}
+      </p>
+    </div>
+  );
+}
+
+function PlanCard({ item }: { item: PlanItem }): JSX.Element {
+  return (
+    <details className="plan-card" open>
+      <summary>📋 执行计划（{item.steps.length} 步）</summary>
+      <ol className="plan-steps">
+        {item.steps.map((step, i) => (
+          <li key={i}>{step}</li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+function RiskBadge({ level }: { level: string }): JSX.Element {
+  return (
+    <span className={`risk-badge ${LEVEL_CLASS[level] ?? 'lvl-l1'}`}>
+      {level === 'L0' ? 'L0 只读' : level === 'L1' ? 'L1 常规' : level === 'L2' ? 'L2 危险' : level}
+    </span>
+  );
+}
+
+/** Five elements: tool name · command · L badge · status · output. */
+function ToolCard({ item }: { item: ToolCardItem }): JSX.Element {
+  const statusLabel =
+    item.status === 'running'
+      ? '运行中…'
+      : item.status === 'ok'
+        ? '✓ 完成'
+        : item.status === 'failed'
+          ? '✗ 失败'
+          : '已取消';
+  return (
+    <details className="tool-card" open={item.status === 'running'}>
+      <summary>
+        <span className="tool-name">🛠 {item.tool}</span>
+        <RiskBadge level={item.level} />
+        <span className={`tool-status tool-status-${item.status}`}>{statusLabel}</span>
+      </summary>
+      {item.command !== undefined && item.command.trim() !== '' && (
+        <pre className="tool-command">{item.command}</pre>
+      )}
+      <div className="tool-basis">{item.basis}</div>
+      {item.output.trim() !== '' && <pre className="tool-output">{item.output}</pre>}
+    </details>
+  );
+}
+
+/** Embedded Terminal Output Viewer for shell tool calls. */
+function TerminalViewer({ item }: { item: ToolCardItem }): JSX.Element {
+  return (
+    <div className={`terminal-viewer terminal-${item.status}`} data-testid="terminal-viewer">
+      <div className="terminal-head">
+        <span className="terminal-title">$ shell</span>
+        <RiskBadge level={item.level} />
+        <span className={`tool-status tool-status-${item.status}`}>
+          {item.status === 'running' ? '运行中…' : item.status === 'ok' ? '✓ 完成' : item.status === 'failed' ? '✗ 失败' : '已取消'}
+        </span>
+      </div>
+      <pre className="terminal-body">
+        {item.command !== undefined && `${item.command}\n`}
+        {item.output}
+        {item.status === 'running' && <span className="stream-cursor">▌</span>}
+      </pre>
+    </div>
+  );
+}
+
+function FileReadRow({ item }: { item: FileReadItem }): JSX.Element {
+  return (
+    <div className="file-row file-read">
+      <span aria-hidden="true">📖</span>
+      <span className="file-verb">读取</span>
+      <code className="file-path">{item.path}</code>
+      {item.sizeBytes !== undefined && (
+        <span className="file-size">{(item.sizeBytes / 1024).toFixed(1)} KB</span>
+      )}
+    </div>
+  );
+}
+
+function FileChangedRow({ item }: { item: FileChangedItem }): JSX.Element {
+  return (
+    <div className="file-row file-change">
+      <span className={`change-kind kind-${item.change}`}>{CHANGE_LABEL[item.change]}</span>
+      <span className="file-verb">
+        {item.change === 'added' ? '新增' : item.change === 'deleted' ? '删除' : '修改'}
+      </span>
+      <code className="file-path">{item.path}</code>
+    </div>
+  );
+}
+
+function SubagentCard({ item }: { item: SubagentItem }): JSX.Element {
+  const statusLabel =
+    item.status === 'running'
+      ? '运行中…'
+      : item.status === 'ok'
+        ? '✓ 完成'
+        : item.status === 'failed'
+          ? '✗ 失败'
+          : '已取消';
+  return (
+    <details className="subagent-card" open={item.status === 'running'} data-testid="subagent-card">
+      <summary>
+        <span className="subagent-name">🤖 子任务 · {item.label}</span>
+        <span className={`tool-status tool-status-${item.status}`}>{statusLabel}</span>
+      </summary>
+      {item.output.trim() !== '' && <pre className="subagent-output">{item.output}</pre>}
+      {item.summary !== undefined && <p className="subagent-summary">{item.summary}</p>}
+      <p className="subagent-placeholder">子任务完整视图将在 P1-D 接入。</p>
+    </details>
+  );
+}
+
+function SummaryCard({ item }: { item: SummaryItem }): JSX.Element {
+  return (
+    <div className="summary-card" data-testid="summary-card">
+      <span className="summary-title">任务摘要</span>
+      <p>{item.text}</p>
     </div>
   );
 }

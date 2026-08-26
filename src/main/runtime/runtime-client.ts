@@ -15,8 +15,10 @@ import { EventEmitter } from 'node:events';
 import type { DshProcessManager } from './dsh-process-manager';
 import {
   isTerminalEventType,
+  makeApprovalResponse,
   makeCancelCommand,
   makeRunCommand,
+  type ApprovalResponseCommandFrame,
   type CancelCommandFrame,
   type RunCommandFrame,
   type RuntimeEventFrame
@@ -24,8 +26,18 @@ import {
 
 export type RuntimeConnectionState = 'stopped' | 'starting' | 'ready' | 'crashed';
 
+/** What the user sees when the runtime dies unexpectedly (§32). */
+export interface RuntimeCrashInfo {
+  code: number | null;
+  signal: string | null;
+  /** Raw stderr tail at crash time; redact before displaying. */
+  stderrTail: string;
+}
+
 export interface StartOptions {
   sessionId?: string;
+  /** Ready-frame wait budget (tests); default 15s. */
+  readyTimeoutMs?: number;
 }
 
 export interface RuntimeClientEvents {
@@ -46,7 +58,7 @@ export declare interface RuntimeClient {
   ): boolean;
 }
 
-const READY_TIMEOUT_MS = 15_000;
+const DEFAULT_READY_TIMEOUT_MS = 15_000;
 
 export class RuntimeClient extends EventEmitter {
   private connectionState: RuntimeConnectionState = 'stopped';
@@ -54,11 +66,36 @@ export class RuntimeClient extends EventEmitter {
   /** True while an intentional stop() is in flight, so the resulting exit is
    * not mistaken for a runtime crash. */
   private stopping = false;
+  /**
+   * True while an intentional restart() is in flight. The old child exits
+   * during a restart; that exit must keep the "running" semantics (Phase 0
+   * memo ②) instead of flashing `crashed` before the replacement is ready.
+   */
+  private restarting = false;
+  private crashInfo: RuntimeCrashInfo | null = null;
+  /** Diagnostics from the most recent failed start/restart handshake. */
+  private startupError: string | null = null;
+  /**
+   * True while recovering from a failed ready handshake: the cleanup stop()
+   * below kills the child and its exit event must NOT flip the state to
+   * `crashed` — the failure already landed in a recoverable state.
+   */
+  private handshakeFailed = false;
+  /**
+   * True once the CURRENT handshake's child has actually been spawned.
+   * During a restart the OLD child's teardown exit is expected and must be
+   * ignored, but once the replacement process is live an exit-before-ready
+   * is a REAL crash of the new child and must keep `crashed` semantics +
+   * crash snapshot (review fix: they were being downgraded to `stopped`).
+   */
+  private handshakeChildLive = false;
   private readonly sessionId: string;
+  private readonly readyTimeoutMs: number;
 
   constructor(private readonly manager: DshProcessManager, options: StartOptions = {}) {
     super();
     this.sessionId = options.sessionId ?? randomUUID();
+    this.readyTimeoutMs = options.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
     this.wireManager();
   }
 
@@ -78,17 +115,42 @@ export class RuntimeClient extends EventEmitter {
     return this.connectionState === 'ready';
   }
 
-  /** Spawn the runtime process and wait for its `ready` frame. */
+  /** Details of the most recent crash, or null while the runtime is healthy.
+   * Cleared once a replacement process reports ready. */
+  get lastCrash(): RuntimeCrashInfo | null {
+    return this.connectionState === 'crashed' ? this.crashInfo : null;
+  }
+
+  /** Diagnostic from the most recent failed start/restart ready handshake
+   * (timeout, exit-before-ready, spawn error). Null after a successful
+   * start. Surfaced on the §32 startup-failure banner. */
+  get lastStartupError(): string | null {
+    return this.startupError;
+  }
+
+  /**
+   * Spawn the runtime process and wait for its `ready` frame.
+   *
+   * The FULL handshake is failure-wrapped: a spawn error, an exit before
+   * `ready`, or a `ready` timeout all land the client in a RECOVERABLE
+   * state (never stuck in `starting`), stop/clean up any child — including
+   * one that is alive but not speaking protocol — and keep diagnostics.
+   */
   async start(): Promise<void> {
     if (this.connectionState === 'ready' || this.connectionState === 'starting') return;
+    this.handshakeFailed = false;
+    this.startupError = null;
+    if (this.connectionState !== 'crashed') this.crashInfo = null;
+    this.handshakeChildLive = false;
     this.setConnectionState('starting');
     try {
       await this.manager.start();
+      this.handshakeChildLive = true;
+      await this.waitForReady();
     } catch (err) {
-      this.setConnectionState('crashed');
+      await this.recoverFromHandshakeFailure(err);
       throw err;
     }
-    await this.waitForReady();
   }
 
   async stop(): Promise<void> {
@@ -103,10 +165,53 @@ export class RuntimeClient extends EventEmitter {
     this.setConnectionState('stopped');
   }
 
+  /**
+   * Restart the runtime process. Session state lives in the renderer and is
+   * preserved across restarts — only the transport resets. The full ready
+   * handshake is failure-wrapped exactly like start().
+   */
   async restart(): Promise<void> {
-    await this.manager.restart();
+    // Mark restarting BEFORE touching the manager so the old child's exit
+    // event cannot flip us to `crashed` mid-restart (no crash flash).
+    this.restarting = true;
+    this.handshakeFailed = false;
+    this.handshakeChildLive = false;
+    this.startupError = null;
     this.setConnectionState('starting');
-    await this.waitForReady();
+    try {
+      await this.manager.restart();
+      // Replacement child is spawned: from here its exit is a real crash,
+      // not the expected teardown of the old one.
+      this.handshakeChildLive = true;
+      await this.waitForReady();
+    } catch (err) {
+      await this.recoverFromHandshakeFailure(err);
+      throw err;
+    } finally {
+      this.restarting = false;
+    }
+  }
+
+  /**
+   * Shared recovery path for a failed ready handshake: stop/clean up any
+   * child (alive-but-not-ready included), keep diagnostics, and land in a
+   * recoverable connection state — `stopped` for a silent/timeout failure,
+   * `crashed` when the child already exited on its own.
+   */
+  private async recoverFromHandshakeFailure(err: unknown): Promise<void> {
+    this.startupError = err instanceof Error ? err.message : String(err);
+    // Suppress the crash flip from the cleanup exit event.
+    this.handshakeFailed = true;
+    try {
+      await this.manager.stop();
+    } catch {
+      /* best-effort cleanup */
+    }
+    if (this.connectionState === 'starting') {
+      // No exit event moved us to `crashed` (child was alive but not ready):
+      // land in the clean, retryable state instead.
+      this.setConnectionState('stopped');
+    }
   }
 
   /** Send a `run` command; resolves with the generated run id. */
@@ -132,6 +237,18 @@ export class RuntimeClient extends EventEmitter {
     return this.manager.send(command);
   }
 
+  /**
+   * Answer an `approval_required` event. Returns false when the runtime
+   * cannot receive commands right now (caller decides how to surface it).
+   */
+  respondApproval(input: {
+    approvalId: string;
+    decision: 'allow' | 'reject';
+    scope: ApprovalResponseCommandFrame['scope'];
+  }): boolean {
+    return this.manager.send(makeApprovalResponse(input));
+  }
+
   /* ---------------------------------------------------------------- */
 
   private wireManager(): void {
@@ -139,16 +256,35 @@ export class RuntimeClient extends EventEmitter {
     this.manager.on('decode-error', (info) => this.emit('protocol-violation', info));
     this.manager.on('stderr', (text) => this.emit('stderr', text));
     this.manager.on('exit', () => {
-      if (!this.stopping && this.connectionState !== 'crashed' && this.connectionState !== 'stopped') {
+      // Intentional stops and cleanup after a failed ready handshake keep
+      // the connection semantics instead of reporting a crash.
+      if (this.stopping || this.handshakeFailed) return;
+      // Mid-restart: ONLY the old child's teardown exit is expected. Once
+      // the replacement child is live (`handshakeChildLive`), an
+      // exit-before-ready is a genuine crash of the new process.
+      if (this.restarting && !this.handshakeChildLive) return;
+      if (this.connectionState !== 'crashed' && this.connectionState !== 'stopped') {
+        this.captureCrash();
         this.setConnectionState('crashed');
       }
     });
+  }
+
+  /** Snapshot exit details + stderr tail for the §32 crash surface. */
+  private captureCrash(): void {
+    const exit = this.manager.exitInfo;
+    this.crashInfo = {
+      code: exit?.code ?? null,
+      signal: exit?.signal ?? null,
+      stderrTail: this.manager.recentStderr
+    };
   }
 
   private onFrame(raw: unknown): void {
     const frame = raw as RuntimeEventFrame;
     switch (frame.type) {
       case 'ready': {
+        this.crashInfo = null;
         this.setConnectionState('ready');
         break;
       }
@@ -180,8 +316,8 @@ export class RuntimeClient extends EventEmitter {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
-        reject(new Error(`runtime did not become ready within ${READY_TIMEOUT_MS}ms`));
-      }, READY_TIMEOUT_MS);
+        reject(new Error(`runtime did not become ready within ${this.readyTimeoutMs}ms`));
+      }, this.readyTimeoutMs);
       timer.unref();
 
       const onFrame = (raw: unknown): void => {

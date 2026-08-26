@@ -53,7 +53,7 @@ describe('RuntimeClient — lifecycle', () => {
     expect(client.state).toBe('stopped');
   });
 
-  it('start() rejects and lands in crashed when the command cannot spawn', async () => {
+  it('start() rejects with a recoverable state + diagnostics when the command cannot spawn', async () => {
     const manager = makeStubManager({
       command: '/no/such/binary',
       args: []
@@ -62,13 +62,90 @@ describe('RuntimeClient — lifecycle', () => {
     clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
 
     await expect(client.start()).rejects.toThrow(/failed to start|ENOENT|spawn/i);
-    expect(client.state).toBe('crashed');
-    // Recovery: pointing at the stub works again from the same client.
+    // Review fix 2: never stuck in `starting`; lands in the clean retryable
+    // state with the diagnostic preserved for the startup-failure banner.
+    expect(client.state).toBe('stopped');
+    expect(client.lastStartupError).toMatch(/failed to start|ENOENT|spawn/i);
+    // Retry is not blocked by a stale `starting` guard.
+    await expect(client.start()).rejects.toThrow(/failed to start|ENOENT|spawn/i);
+    expect(client.state).toBe('stopped');
+    // Recovery: pointing at the stub works again from the same client shape.
     // (manager options are immutable; build a fresh one to prove restartability
     // of the flow itself.)
     const recovered = makeClient();
     await recovered.client.start();
     expect(recovered.client.state).toBe('ready');
+    expect(recovered.client.lastStartupError).toBeNull();
+  }, 20_000);
+
+  // Review fix 2 (生命周期阻断): process alive but NEVER ready — start() must
+  // reject on the ready timeout, stop the surviving child, land in a
+  // recoverable state and keep diagnostics; retry must be possible.
+  it('start() recovers when the process stays alive but never becomes ready', async () => {
+    const manager = makeStubManager({ env: { STUB_SILENT: '1' } });
+    const client = new RuntimeClient(manager, { readyTimeoutMs: 600 });
+    clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
+
+    await expect(client.start()).rejects.toThrow(/did not become ready within 600ms/);
+    expect(client.state).toBe('stopped'); // recoverable, NOT stuck in starting
+    expect(client.lastStartupError).toMatch(/did not become ready/);
+    // The surviving-but-not-ready child was cleaned up.
+    await until(() => manager.currentState === 'idle', 5_000, 'silent child reaped');
+
+    // Retry path: a new attempt actually spawns again (not blocked by the
+    // old `starting` guard) and fails cleanly the same way.
+    await expect(client.start()).rejects.toThrow(/did not become ready within 600ms/);
+    expect(client.state).toBe('stopped');
+  }, 20_000);
+
+  // Review fix 2: exit BEFORE ready — rejects fast, keeps crash semantics
+  // (the child really died) and stays retryable instead of wedging start().
+  // Second-review fix (阻断项 1): during restart(), an exit of the NEW child
+  // before ready is a REAL crash — it must keep `crashed` semantics with the
+  // crash snapshot intact, never downgrade to `stopped`.
+  it('restart() keeps crash semantics when the replacement child exits before ready', async () => {
+    const manager = makeStubManager({ env: { STUB_EXIT_BEFORE_READY: '1' } });
+    const client = new RuntimeClient(manager, { readyTimeoutMs: 8_000 });
+    clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
+    const states: string[] = [];
+    client.on('connection-state', (st) => states.push(st));
+
+    // First start fails (exit-before-ready → crashed).
+    await expect(client.start()).rejects.toThrow(/exited before becoming ready/);
+    expect(client.state).toBe('crashed');
+
+    // Restart attempt: the replacement child really exits → genuine crash,
+    // NOT a `stopped` downgrade, WITH crash diagnostics preserved.
+    await expect(client.restart()).rejects.toThrow(/exited before becoming ready/);
+    await until(() => client.state === 'crashed', 5_000, 'restart lands in crashed');
+    expect(client.lastStartupError).toMatch(/exited before becoming ready/);
+    const crash = client.lastCrash;
+    expect(crash).not.toBeNull();
+    expect(crash?.code).toBe(7); // stub exits with process.exit(7)
+    expect(manager.exitInfo?.code).toBe(7);
+
+    // Retry can still be initiated afterwards (not wedged in starting).
+    await expect(client.restart()).rejects.toThrow(/exited before becoming ready/);
+    expect(states.filter((st) => st === 'starting')).toHaveLength(3);
+    expect(states).not.toContain('stopped');
+  }, 20_000);
+
+  it('start() is retryable after the runtime exits before becoming ready', async () => {
+    const manager = makeStubManager({ env: { STUB_EXIT_BEFORE_READY: '1' } });
+    const client = new RuntimeClient(manager, { readyTimeoutMs: 8_000 });
+    clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
+
+    await expect(client.start()).rejects.toThrow(/exited before becoming ready/);
+    expect(['crashed', 'stopped']).toContain(client.state); // recoverable either way
+    expect(client.lastStartupError).toMatch(/exited before becoming ready/);
+    await until(
+      () => manager.currentState === 'exited' || manager.currentState === 'idle',
+      5_000,
+      'dead child reaped'
+    );
+
+    // Retry attempts a fresh spawn rather than being rejected by lifecycle guards.
+    await expect(client.start()).rejects.toThrow(/exited before becoming ready/);
   }, 20_000);
 });
 
@@ -182,6 +259,75 @@ describe('RuntimeClient — crash & restart semantics', () => {
     expect(client.state).toBe('stopped');
     expect(states.filter((s) => s === 'crashed')).toEqual([]);
   });
+
+  // Phase 0 memo ②: restarting from the READY state replaces the child; the
+  // old child's exit must never flash `crashed` before the new one is ready.
+  it('restart() from ready goes straight back to ready without a crash flash', async () => {
+    const { client, manager } = makeClient();
+    await client.start();
+    const sessionBefore = client.currentSessionId;
+    const states: string[] = [];
+    client.on('connection-state', (s) => states.push(s));
+    const oldPid = manager.pid!;
+
+    await client.restart();
+
+    expect(manager.pid).not.toBe(oldPid);
+    expect(manager.pid).toBeGreaterThan(0);
+    await until(() => client.state === 'ready', 10_000, 'ready after restart');
+    expect(states.filter((s) => s === 'crashed')).toEqual([]);
+    expect(states[states.length - 1]).toBe('ready');
+    // Session identity is preserved across restart — only the transport resets.
+    expect(client.currentSessionId).toBe(sessionBefore);
+
+    // The replacement child is fully functional.
+    const events: RuntimeEventFrame[] = [];
+    client.on('event', (f) => events.push(f));
+    client.run('after clean restart', '/tmp/proj');
+    await until(() => events.some(isTerminal), 15_000, 'post-restart terminal');
+  }, 25_000);
+});
+
+describe('RuntimeClient — resident cancel (stub stays alive)', () => {
+  // Back-compat + AC-11 support: with STUB_RESIDENT_CANCEL=1 the stub keeps
+  // running after run_cancelled. The client must resolve cancel() on the
+  // TERMINAL FRAME (not on process exit), stay ready and keep the session.
+  it('cancel() resolves on run_cancelled while the runtime remains resident', async () => {
+    const manager = makeStubManager({ env: { STUB_RESIDENT_CANCEL: '1' } });
+    const client = new RuntimeClient(manager);
+    clients.push({ dispose: async () => { await client.stop().catch(() => undefined); } });
+    await client.start();
+
+    const events: RuntimeEventFrame[] = [];
+    client.on('event', (f) => events.push(f));
+    void client.run('resident cancel probe', '/tmp/proj');
+
+    await until(
+      () => events.some((f) => f.type === 'run_started'),
+      15_000,
+      'run_started'
+    );
+    expect(client.cancel()).toBe(true);
+
+    await until(
+      () => events.some((f) => f.type === 'run_cancelled'),
+      15_000,
+      'run_cancelled'
+    );
+    expect(client.activeRun).toBeNull();
+
+    // Resident: give the stub a moment to exit if it were going to.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(client.state).toBe('ready');           // not crashed / stopped
+    expect(manager.currentState).toBe('running'); // child still alive
+    expect(client.currentSessionId).toBeTruthy(); // session preserved
+
+    // The same resident runtime accepts another run afterwards.
+    const second: RuntimeEventFrame[] = [];
+    client.on('event', (f) => second.push(f));
+    void client.run('second run on resident stub', '/tmp/proj');
+    await until(() => second.some(isTerminal), 15_000, 'second terminal');
+  }, 30_000);
 });
 
 describe('RuntimeClient — stderr + protocol violations fan-out', () => {

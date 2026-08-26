@@ -6,8 +6,15 @@
 
 import { contextBridge, ipcRenderer } from 'electron';
 
-import type { ConnectionState, DesktopApi, RuntimeStatus } from '../shared/desktop-api';
-import type { RuntimeEventFrame } from '../shared/protocol/types';
+import type {
+  ApprovalDeliveryNotice,
+  ApprovalResolution,
+  ConnectionState,
+  DesktopApi,
+  RuntimeStatus
+} from '../shared/desktop-api';
+import type { ApprovalRequestPayload } from '../shared/approval-protocol';
+import type { ProtocolViolationInfo, RuntimeEventFrame } from '../shared/protocol/types';
 import type {
   ModelsRefreshResult,
   OperationResult,
@@ -37,6 +44,23 @@ const api: DesktopApi = {
     subscribe<RuntimeEventFrame>('runtime:event', listener),
   onConnectionState: (listener: (state: ConnectionState) => void): (() => void) =>
     subscribe<ConnectionState>('runtime:connection-state', listener),
+
+  respondApproval: (
+    requestId: string,
+    reply: { decision: 'allow' | 'reject'; scope: 'once' | 'session' }
+  ): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('approval:respond', requestId, reply),
+  onApprovalRequest: (listener: (payload: ApprovalRequestPayload) => void): (() => void) =>
+    subscribe<ApprovalRequestPayload>('runtime:approval-request', listener),
+  onApprovalResolved: (listener: (resolution: ApprovalResolution) => void): (() => void) =>
+    subscribe<ApprovalResolution>('runtime:approval-resolved', listener),
+  onApprovalNotice: (listener: (notice: ApprovalDeliveryNotice) => void): (() => void) =>
+    subscribe<ApprovalDeliveryNotice>('runtime:approval-notice', listener),
+
+  getRuntimeLogTail: (category?: 'stdout' | 'stderr' | 'event' | 'tool' | 'model'): Promise<string> =>
+    ipcRenderer.invoke('runtime:get-log-tail', category),
+  onProtocolViolation: (listener: (info: ProtocolViolationInfo) => void): (() => void) =>
+    subscribe<ProtocolViolationInfo>('runtime:protocol-violation', listener),
 
   openProject: (): Promise<OpenProjectResult> => ipcRenderer.invoke('workspace:open-project'),
   openProjectAt: (path: string): Promise<OpenProjectResult> =>

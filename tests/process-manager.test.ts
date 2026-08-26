@@ -253,15 +253,44 @@ describe('DshProcessManager — crash handling & restart', () => {
 });
 
 describe('DshProcessManager — decode diagnostics pass-through', () => {
-  it('reports decode errors from garbage stdout without dying', async () => {
-    const manager = track(makeStubManager());
+  // Memo ③: a REAL child writes undecodable bytes followed by a valid frame;
+  // the manager must surface both diagnostics and keep decoding the stream.
+  it('reports decode errors from real garbage stdout without dying', async () => {
+    const manager = track(makeStubManager({ env: { STUB_GARBAGE_STDOUT: '1' } }));
     const sink = collect(manager, (frames) => frames.some((f) => f.type === 'ready'));
     await manager.start();
-    // Write raw garbage into the child's stdin? No — garbage must come FROM
-    // stdout to exercise decode-error. Instead assert the wiring exists:
-    expect(manager.listenerCount('decode-error')).toBeGreaterThan(0);
-    await sink.done;
+    await sink.done; // the valid ready frame decoded despite the garbage
+
+    // Diagnostics for BOTH malformed chunks surfaced with previews.
+    await vi.waitFor(
+      () => {
+        if (sink.errors.length < 2) throw new Error(`errors=${JSON.stringify(sink.errors)}`);
+      },
+      { timeout: 8000 }
+    );
+    expect(sink.errors.map((e) => e.preview ?? '')).toEqual([
+      expect.stringContaining('this is not json'),
+      expect.stringContaining('"type": "run_')
+    ]);
+    for (const err of sink.errors) {
+      expect(err.reason).toMatch(/json|decode|parse/i);
+    }
+
+    // The valid ready frame after the garbage still decoded.
+    const readyFrame = sink.frames.find((f) => f.type === 'ready');
+    expect(readyFrame).toMatchObject({ profile: 'desktop-stub' });
+
+    // The manager survived: it still accepts and completes a run.
+    const runSink = collect(manager, (frames) => frames.some((f) => f.type === 'done'));
+    expect(manager.send(makeRunCommand({
+      run_id: 'after-garbage',
+      session_id: 'pm-session',
+      workspace: process.cwd(),
+      message: 'still alive'
+    }))).toBe(true);
+    await runSink.done;
+
     await manager.stop();
-    expect(sink.errors).toEqual([]);
-  });
+    expect(sink.exits.every((e) => e.expected)).toBe(true);
+  }, 30_000);
 });

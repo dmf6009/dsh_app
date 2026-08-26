@@ -3,7 +3,8 @@
  * contextBridge as `window.desktop`.
  */
 
-import type { RuntimeEventFrame } from './protocol/types';
+import type { RuntimeEventFrame, ProtocolViolationInfo } from './protocol/types';
+import type { ApprovalRequestPayload, ApprovalOutcome } from './approval-protocol';
 import type {
   ModelsRefreshResult,
   OperationResult,
@@ -15,12 +16,40 @@ import type { OpenProjectResult, PathCheckResult, RecentProject } from './worksp
 
 export type ConnectionState = 'stopped' | 'starting' | 'ready' | 'crashed';
 
+/** What the last abnormal child exit looked like (§32 crash recovery). */
+export interface RuntimeCrashSnapshot {
+  exitCode: number | null;
+  signal: string | null;
+}
+
 export interface RuntimeStatus {
   state: ConnectionState;
   sessionId: string | null;
   activeRunId: string | null;
   /** Human-readable description of the child command being run. */
   commandLine: string;
+  /** Present only while state === 'crashed'. */
+  crash: RuntimeCrashSnapshot | null;
+  /** Last protocol/runtime error line worth showing (already redacted). */
+  lastError: string | null;
+}
+
+/** Result of a completed approval round (pushed back to the renderer). */
+export interface ApprovalResolution {
+  approvalId: string;
+  outcome: ApprovalOutcome;
+  viaModal: boolean;
+}
+
+/**
+ * Pushed when an approval decision could not be delivered to the runtime
+ * (second review fix). The affected request is escalated to a pending
+ * prompt — this notice makes the failure itself visible.
+ */
+export interface ApprovalDeliveryNotice {
+  approvalId: string;
+  reason: string;
+  message: string;
 }
 
 /** Result of probing for a DSH installation (§32/§38 startup chain). */
@@ -42,6 +71,24 @@ export interface DesktopApi {
   cancelRun(): Promise<{ ok: boolean; error?: string }>;
   onEvent(listener: (frame: RuntimeEventFrame) => void): () => void;
   onConnectionState(listener: (state: ConnectionState) => void): () => void;
+
+  /* ---- Approval (DSHA-5 §12/§13) ---- */
+  /** Renderer answered the approval modal (close ≙ reject). */
+  respondApproval(
+    requestId: string,
+    reply: { decision: 'allow' | 'reject'; scope: 'once' | 'session' }
+  ): Promise<{ ok: boolean; error?: string }>;
+  /** Push channel for pending approval prompts. */
+  onApprovalRequest(listener: (payload: ApprovalRequestPayload) => void): () => void;
+  onApprovalResolved(listener: (resolution: ApprovalResolution) => void): () => void;
+  /** Push channel for approval delivery failures (retryable). */
+  onApprovalNotice(listener: (notice: ApprovalDeliveryNotice) => void): () => void;
+
+  /* ---- Runtime Logs (§33) ---- */
+  /** Tail of the redacted runtime log, optionally filtered by category. */
+  getRuntimeLogTail(category?: 'stdout' | 'stderr' | 'event' | 'tool' | 'model'): Promise<string>;
+  /** Malformed-frame diagnostics from the ordered bus. */
+  onProtocolViolation(listener: (info: ProtocolViolationInfo) => void): () => void;
 
   /* ---- Home / workspace (§7) ---- */
   /** Opens the native directory picker, then activates + records the project. */

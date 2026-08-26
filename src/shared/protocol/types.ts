@@ -4,13 +4,8 @@
  * One JSON object per line over the DSH child process stdio (JSONL, §20).
  * `v` is always 1 in this phase.
  *
- * Event names cover the full set required by the requirements doc §21;
- * Phase 0 implements only the minimal closed loop:
- *   commands:  run / cancel
- *   events:    message_delta, message_completed, tool_started, tool_output,
- *              tool_completed, done, error, run_cancelled
- * The remaining event types are declared here so later phases can adopt them
- * without breaking the wire format.
+ * Event names cover the full set required by the requirements doc §21.
+ * Desktop → DSH commands: run / cancel / approval_response (P1-B).
  */
 
 export const PROTOCOL_VERSION = 1 as const;
@@ -78,7 +73,31 @@ export interface CancelCommandFrame {
   run_id?: string;
 }
 
-export type CommandFrame = RunCommandFrame | CancelCommandFrame;
+/**
+ * Desktop → DSH reply to an `approval_required` event (§12/§21). The runtime
+ * blocks the flagged operation until this frame arrives.
+ *
+ * - `decision: 'allow'` lets the operation proceed once or for the rest of
+ *   the session depending on `scope`.
+ * - `decision: 'reject'` aborts the operation; the runtime answers with a
+ *   terminal frame so the run state stays well-defined.
+ */
+export interface ApprovalResponseCommandFrame {
+  v: typeof PROTOCOL_VERSION;
+  type: 'approval_response';
+  /** Echoes the `approval_id` of the request being answered. */
+  approval_id: string;
+  decision: 'allow' | 'reject';
+  /**
+   * How far the grant extends:
+   * - `once`   — only this operation (「Allow Once」)
+   * - `session`— identical operations for the rest of the session (「Allow」)
+   * - `auto`   — granted by the local rule matrix without showing a modal
+   */
+  scope: 'once' | 'session' | 'auto';
+}
+
+export type CommandFrame = RunCommandFrame | CancelCommandFrame | ApprovalResponseCommandFrame;
 
 export function makeRunCommand(
   input: Pick<RunCommandFrame, 'run_id' | 'session_id' | 'workspace' | 'message'>
@@ -96,6 +115,24 @@ function run_id_or_default(runId?: string): CancelCommandFrame {
     : { v: PROTOCOL_VERSION, type: 'cancel', run_id: runId };
 }
 
+export function makeApprovalResponse(input: {
+  approvalId: string;
+  decision: 'allow' | 'reject';
+  scope: ApprovalResponseCommandFrame['scope'];
+}): ApprovalResponseCommandFrame {
+  return {
+    v: PROTOCOL_VERSION,
+    type: 'approval_response',
+    approval_id: input.approvalId,
+    decision: input.decision,
+    scope: input.scope
+  };
+}
+
+/** Risk levels from the requirements doc §13. */
+export const RISK_LEVELS = ['L0', 'L1', 'L2'] as const;
+export type RiskLevel = (typeof RISK_LEVELS)[number];
+
 /* ------------------------------------------------------------------ */
 /* DSH → Desktop event frames                                          */
 /* ------------------------------------------------------------------ */
@@ -105,6 +142,11 @@ interface EventBase {
   type: RuntimeEventType;
   run_id?: string;
   session_id?: string;
+  /**
+   * Optional idempotency id: when the runtime attaches one, the Desktop
+   * event bus drops duplicate deliveries of the same logical event (AC-08).
+   */
+  event_id?: string;
 }
 
 export interface ReadyEventFrame extends EventBase {
@@ -184,6 +226,8 @@ export interface ApprovalRequiredEventFrame extends EventBase {
   risk_level?: 'L0' | 'L1' | 'L2';
   summary?: string;
   command?: string;
+  /** Workspace-relative or absolute paths the operation will touch. */
+  paths?: string[];
 }
 
 export interface ApprovalResponseEventFrame extends EventBase {
@@ -257,4 +301,15 @@ export function isProtocolEnvelope(value: unknown): value is { v: number; type: 
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const frame = value as Record<string, unknown>;
   return frame['v'] === PROTOCOL_VERSION && typeof frame['type'] === 'string';
+}
+
+/**
+ * Diagnostic describing one protocol violation detected on the stream
+ * (malformed JSON, bad envelope, unknown type…). Violations travel as data
+ * on the ordered bus instead of breaking the pipeline (DSHA-5, AC-08).
+ */
+export interface ProtocolViolationInfo {
+  reason: string;
+  detail?: string;
+  preview?: string;
 }

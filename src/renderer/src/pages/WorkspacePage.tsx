@@ -21,6 +21,9 @@ import type { RuntimeEventFrame } from '../../../shared/protocol/types';
 import { ApprovalModal } from '../components/ApprovalModal';
 import { useMediaQuery } from '../hooks/use-media-query';
 import { Button, Spinner } from '../components/ui';
+import { useApp } from '../store/app-store';
+import { useChanges } from '../changes/changes-store';
+import { badgeTitle, changedFiles, showRunSummary, summaryLabel } from '../changes/model';
 import {
   INITIAL_MODEL,
   reduceChat,
@@ -78,6 +81,23 @@ export default function WorkspacePage(): JSX.Element {
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<ChatModel>(INITIAL_MODEL);
   modelRef.current = model;
+
+  /* ---- aggregated Changes (DSHA-6) ------------------------------------ */
+
+  const { dispatch: appDispatch } = useApp();
+  const changes = useChanges();
+  const runActive = model.phase !== 'idle';
+  const changedFileList = changedFiles(changes.snapshot);
+  const branchLabel = changes.snapshot?.gitAvailable
+    ? `⎇ ${changes.snapshot.branch ?? '未知分支'}${changes.snapshot.detached ? ' (detached)' : ''}`
+    : null;
+  const openDiff = useCallback(
+    (path: string) => {
+      changes.select(path);
+      appDispatch({ type: 'navigate', route: 'diff' });
+    },
+    [changes, appDispatch]
+  );
 
   const dispatch = useCallback((action: Parameters<typeof reduceChat>[1]): void => {
     setModel((prev) => reduceChat(prev, action));
@@ -443,7 +463,7 @@ export default function WorkspacePage(): JSX.Element {
         </footer>
       </section>
 
-      {/* ---------------- Right: changes ---------------- */}
+      {/* ---------------- Right: changes (DSHA-6) ---------------- */}
       <aside
         ref={changesPanelRef}
         id="changes-panel"
@@ -451,20 +471,62 @@ export default function WorkspacePage(): JSX.Element {
         className={`col col-changes${drawer === 'changes' ? ' drawer-open' : ''}`}
         aria-label="Changes"
       >
-        <h2 className="panel-title">Changes</h2>
-        {model.changes.length === 0 ? (
-          <p className="empty-hint">本次会话还没有文件变更。变更由 file_changed 事件驱动，真实 Diff 视图见后续阶段。</p>
+        <div className="changes-head">
+          <h2 className="panel-title">Changes</h2>
+          {/* Read-only current branch display (F7) */}
+          {branchLabel !== null && (
+            <span
+              className={`branch-pill${changes.snapshot?.detached ? ' branch-detached' : ''}`}
+              title={changes.snapshot?.detached ? 'HEAD 已分离（只读显示）' : '当前分支（只读显示）'}
+            >
+              {branchLabel}
+            </span>
+          )}
+        </div>
+        {changedFileList.length === 0 ? (
+          <p className="empty-hint">
+            本次会话还没有文件变更。变更由 file_changed 事件与 Git 状态对账生成，点击条目即可查看 Unified Diff。
+          </p>
         ) : (
-          <ul className="changes-list">
-            {model.changes.map((c) => (
-              <li key={c.id} className={`change change-${c.change}`}>
-                <span className={`change-kind kind-${c.change}`}>{CHANGE_LABEL[c.change]}</span>
-                <code className="change-path">{c.path}</code>
-              </li>
-            ))}
+          <ul className="changes-list" aria-label="变更文件列表">
+            {changedFileList.map((c) => {
+              const selected = c.path === changes.selectedPath;
+              return (
+                <li key={`${c.source}:${c.path}`} className="change-row">
+                  <button
+                    type="button"
+                    className={`change change-btn change-${c.kind}${selected ? ' change-selected' : ''}`}
+                    onClick={() => openDiff(c.path)}
+                    title={`${badgeTitle(c.kind)} · ${c.path}（点击查看 Diff）`}
+                    aria-current={selected ? 'true' : undefined}
+                  >
+                    <span
+                      className={`change-kind kind-${c.kind}`}
+                      aria-label={badgeTitle(c.kind)}
+                      role="img"
+                    >
+                      {CHANGE_LABEL[c.kind] ?? 'M'}
+                    </span>
+                    <code className="change-path">{c.path}</code>
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
-        <p className="changes-note">变更列表按事件顺序排列；点击条目查看 Diff 的能力由 P1-C 提供。</p>
+        {showRunSummary(runActive, changes.snapshot) && (
+          <div className="changes-summary-bar" role="status">
+            <span className="changes-summary-text">{summaryLabel(changedFileList.length)}</span>
+            <Button variant="secondary" onClick={() => appDispatch({ type: 'navigate', route: 'diff' })}>
+              View Diff
+            </Button>
+          </div>
+        )}
+        {changes.revertError !== null && (
+          <p className="changes-error" role="alert">
+            恢复失败：{changes.revertError}
+          </p>
+        )}
       </aside>
 
       {narrow && drawer !== null && (

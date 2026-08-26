@@ -506,6 +506,13 @@ process.stdin.on('error', () => process.exit(1));
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
 
+// Test hook (memo ③): emit undecodable garbage BEFORE the valid ready frame
+// so integration tests can prove decode diagnostics pass through and the
+// stream keeps working afterwards.
+if (process.env.STUB_GARBAGE_STDOUT === '1') {
+  process.stdout.write('this is not json at all\n{"v": 1, "type": "run_\n');
+}
+
 emit({
   type: 'ready',
   profile: 'desktop-stub',

@@ -182,6 +182,75 @@ describe('RuntimeClient — crash & restart semantics', () => {
     expect(client.state).toBe('stopped');
     expect(states.filter((s) => s === 'crashed')).toEqual([]);
   });
+
+  // Phase 0 memo ②: restarting from the READY state replaces the child; the
+  // old child's exit must never flash `crashed` before the new one is ready.
+  it('restart() from ready goes straight back to ready without a crash flash', async () => {
+    const { client, manager } = makeClient();
+    await client.start();
+    const sessionBefore = client.currentSessionId;
+    const states: string[] = [];
+    client.on('connection-state', (s) => states.push(s));
+    const oldPid = manager.pid!;
+
+    await client.restart();
+
+    expect(manager.pid).not.toBe(oldPid);
+    expect(manager.pid).toBeGreaterThan(0);
+    await until(() => client.state === 'ready', 10_000, 'ready after restart');
+    expect(states.filter((s) => s === 'crashed')).toEqual([]);
+    expect(states[states.length - 1]).toBe('ready');
+    // Session identity is preserved across restart — only the transport resets.
+    expect(client.currentSessionId).toBe(sessionBefore);
+
+    // The replacement child is fully functional.
+    const events: RuntimeEventFrame[] = [];
+    client.on('event', (f) => events.push(f));
+    client.run('after clean restart', '/tmp/proj');
+    await until(() => events.some(isTerminal), 15_000, 'post-restart terminal');
+  }, 25_000);
+});
+
+describe('RuntimeClient — resident cancel (stub stays alive)', () => {
+  // Back-compat + AC-11 support: with STUB_RESIDENT_CANCEL=1 the stub keeps
+  // running after run_cancelled. The client must resolve cancel() on the
+  // TERMINAL FRAME (not on process exit), stay ready and keep the session.
+  it('cancel() resolves on run_cancelled while the runtime remains resident', async () => {
+    const manager = makeStubManager({ env: { STUB_RESIDENT_CANCEL: '1' } });
+    const client = new RuntimeClient(manager);
+    clients.push({ dispose: async () => { await client.stop().catch(() => undefined); } });
+    await client.start();
+
+    const events: RuntimeEventFrame[] = [];
+    client.on('event', (f) => events.push(f));
+    void client.run('resident cancel probe', '/tmp/proj');
+
+    await until(
+      () => events.some((f) => f.type === 'run_started'),
+      15_000,
+      'run_started'
+    );
+    expect(client.cancel()).toBe(true);
+
+    await until(
+      () => events.some((f) => f.type === 'run_cancelled'),
+      15_000,
+      'run_cancelled'
+    );
+    expect(client.activeRun).toBeNull();
+
+    // Resident: give the stub a moment to exit if it were going to.
+    await new Promise((r) => setTimeout(r, 400));
+    expect(client.state).toBe('ready');           // not crashed / stopped
+    expect(manager.currentState).toBe('running'); // child still alive
+    expect(client.currentSessionId).toBeTruthy(); // session preserved
+
+    // The same resident runtime accepts another run afterwards.
+    const second: RuntimeEventFrame[] = [];
+    client.on('event', (f) => second.push(f));
+    void client.run('second run on resident stub', '/tmp/proj');
+    await until(() => second.some(isTerminal), 15_000, 'second terminal');
+  }, 30_000);
 });
 
 describe('RuntimeClient — stderr + protocol violations fan-out', () => {

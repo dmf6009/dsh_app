@@ -4,12 +4,12 @@
  *
  * Boots the BUILT renderer in Electron with a stub `window.desktop`
  * (./preload.cjs), navigates to the Diff page, and for each scenario captures
- * a screenshot + element-bounds JSON and runs HARD assertions. ANY unmet
- * acceptance requirement is reported per-scene with the field/values and the
- * process exits non-zero (no false-green).
+ * a screenshot + element-bounds JSON and runs HARD assertions from
+ * ./assertions.mjs. ANY unmet acceptance requirement is reported per-scene
+ * with the field/values and the process exits non-zero (no false-green).
  *
  * Coverage matrix (each at 500x400, 700x500, 1280x800):
- *   normal, binary, empty, Revert Stage-1, Revert Stage-2, Revert busy+guard,
+ *   normal, binary, empty, Revert Stage-1, Stage-2, Revert busy+guard,
  *   Revert cancel → focus restore.
  *
  * Headless-only evidence (Xvfb): does NOT substitute for a real-desktop
@@ -79,27 +79,16 @@ const CLICK_BACKDROP = `(() => { document.querySelector('.confirm-backdrop')?.cl
 const CANCEL_DIALOG = `(() => { [...document.querySelectorAll('.confirm-actions button')].find(b => (b.textContent||'').includes('取消'))?.click(); return true; })()`;
 const NAV_DIFF = `(() => { [...document.querySelectorAll('.nav-btn')].find(b => (b.textContent||'').includes('Diff'))?.click(); return true; })()`;
 
+const ACTION_LABELS = ['↑ 上一个', '↓ 下一个', '恢复此文件…'];
+
 let win = null;
+let A = null; // ./assertions.mjs (loaded async)
 const allFailures = [];
 
 function pushFailures(scene, list) {
   for (const f of list) {
     allFailures.push(`[${scene}] ${f}`);
   }
-}
-
-function overlapCheck(btns) {
-  const out = [];
-  for (let i = 0; i < btns.length; i += 1) {
-    for (let j = i + 1; j < btns.length; j += 1) {
-      const a = btns[i];
-      const b = btns[j];
-      const intersect =
-        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
-      if (intersect) out.push(`${a.text || a.x} ↔ ${b.text || b.x}`);
-    }
-  }
-  return out;
 }
 
 async function shoot(scene) {
@@ -137,114 +126,76 @@ async function shoot(scene) {
   }
 }
 
-/* ---- assertion presets ---- */
-const noHScroll = (b) =>
-  b.noPageHScroll === true ? [] : [`noPageHScroll=false (page=${b.pageScrollWidth} client=${b.pageClientWidth})`];
-const toolbarVisible = (b) => (b.toolbar ? [] : ['toolbar not visible']);
-const noOverlap = (b) => {
-  const ov = overlapCheck(b.actionBtns);
-  return ov.length ? [`action buttons overlap: ${ov.join(', ')}`] : [];
-};
-
-const V = [
-  { w: 500, h: 400, tag: '500' },
-  { w: 700, h: 500, tag: '700' },
-  { w: 1280, h: 800, tag: '1280' }
-];
-
-const scenes = [];
-for (const { w, h, tag } of V) {
-  scenes.push(
-    {
-      label: `diff-normal-${tag}`,
-      w,
-      h,
-      state: { mode: 'normal' },
-      actions: [SELECT_FIRST],
-      expect: (b) => [...noHScroll(b), ...toolbarVisible(b), ...noOverlap(b)]
-    },
-    {
-      label: `diff-binary-${tag}`,
-      w,
-      h,
-      state: { mode: 'normal' },
-      actions: [SELECT_BINARY],
-      expect: (b) => [
-        ...noHScroll(b),
-        ...toolbarVisible(b),
-        ...(b.diffStatus ? [] : ['binary placeholder (.diff-status) not shown'])
-      ]
-    },
-    {
-      label: `diff-empty-${tag}`,
-      w,
-      h,
-      state: { mode: 'empty' },
-      expect: (b) => [...noHScroll(b), ...(b.empty ? [] : ['empty state not visible'])]
-    },
-    {
-      label: `revert-stage1-${tag}`,
-      w,
-      h,
-      state: { mode: 'normal' },
-      actions: [SELECT_FIRST, OPEN_REVERT],
-      expect: (b) => [
-        ...noHScroll(b),
-        ...toolbarVisible(b),
-        ...(b.dialogOpen ? [] : ['dialog not open']),
-        ...(b.activeIsCancel ? [] : ['Stage-1 focus not on cancel (active=' + (b.activeText || 'none') + ')'])
-      ]
-    },
-    {
-      label: `revert-stage2-${tag}`,
-      w,
-      h,
-      state: { mode: 'normal' },
-      actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2],
-      expect: (b) => [
-        ...noHScroll(b),
-        ...toolbarVisible(b),
-        ...(b.dialogOpen ? [] : ['dialog not open']),
-        ...(b.activeIsCancel ? ['Stage-2 focus still on cancel'] : []),
-        ...(b.activeText === '确认丢弃我的修改' ? [] : ['Stage-2 focus not on confirm (active=' + (b.activeText || 'none') + ')'])
-      ]
-    },
-    {
-      label: `revert-busy-guard-${tag}`,
-      w,
-      h,
-      state: { mode: 'normal', busyDelayMs: 4000 },
-      actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2, GO_CONFIRM, ESCAPE_TRY, CLICK_BACKDROP],
-      wait: 400,
-      expect: (b) => [
-        ...noHScroll(b),
-        ...toolbarVisible(b),
-        ...(b.dialogOpen ? [] : ['busy: dialog was dismissed by Esc/backdrop']),
-        ...(b.dialogBusy ? [] : ['busy: aria-busy not set']),
-        ...(b.confirmDisabled === true ? [] : ['busy: confirm button not disabled']),
-        ...(b.hasSpinner ? [] : ['busy: no spinner shown'])
-      ]
-    },
-    {
-      label: `revert-cancel-restore-${tag}`,
-      w,
-      h,
-      state: { mode: 'normal' },
-      actions: [SELECT_FIRST, OPEN_REVERT, CANCEL_DIALOG],
-      wait: 300,
-      expect: (b) => [
-        ...noHScroll(b),
-        ...toolbarVisible(b),
-        ...(b.dialogOpen ? ['cancel: dialog still open'] : []),
-        ...(b.activeText === '恢复此文件…' ? [] : ['focus not restored to trigger (active=' + (b.activeText || 'none') + ')'])
-      ]
-    }
-  );
-}
-
 app.disableHardwareAcceleration();
 
 app.whenReady().then(async () => {
+  A = await import('./assertions.mjs');
+
+  // Per-scene assertion builders (toolbar + action-bar checks apply to every
+  // scene that shows the diff toolbar: normal, binary and all Revert states).
+  const toolbarChecks = (b) => [...A.noHScrollErrors(b), ...A.toolbarErrors(b), ...A.actionsBarErrors(b, ACTION_LABELS)];
+
+  const V = [
+    { w: 500, h: 400, tag: '500' },
+    { w: 700, h: 500, tag: '700' },
+    { w: 1280, h: 800, tag: '1280' }
+  ];
+
+  const scenes = [];
+  for (const { w, h, tag } of V) {
+    scenes.push(
+      {
+        label: `diff-normal-${tag}`, w, h, state: { mode: 'normal' }, actions: [SELECT_FIRST],
+        expect: toolbarChecks
+      },
+      {
+        label: `diff-binary-${tag}`, w, h, state: { mode: 'normal' }, actions: [SELECT_BINARY],
+        expect: (b) => [...toolbarChecks(b), ...(b.diffStatus ? [] : ['binary placeholder (.diff-status) not shown'])]
+      },
+      {
+        label: `diff-empty-${tag}`, w, h, state: { mode: 'empty' },
+        expect: (b) => [...A.noHScrollErrors(b), ...(b.empty ? [] : ['empty state not visible'])]
+      },
+      {
+        label: `revert-stage1-${tag}`, w, h, state: { mode: 'normal' }, actions: [SELECT_FIRST, OPEN_REVERT],
+        expect: (b) => [
+          ...toolbarChecks(b),
+          ...(b.dialogOpen ? [] : ['dialog not open']),
+          ...(b.activeIsCancel ? [] : ['Stage-1 focus not on cancel (active=' + (b.activeText || 'none') + ')'])
+        ]
+      },
+      {
+        label: `revert-stage2-${tag}`, w, h, state: { mode: 'normal' }, actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2],
+        expect: (b) => [
+          ...toolbarChecks(b),
+          ...(b.dialogOpen ? [] : ['dialog not open']),
+          ...(b.activeIsCancel ? ['Stage-2 focus still on cancel'] : []),
+          ...(b.activeText === '确认丢弃我的修改' ? [] : ['Stage-2 focus not on confirm (active=' + (b.activeText || 'none') + ')'])
+        ]
+      },
+      {
+        label: `revert-busy-guard-${tag}`, w, h, state: { mode: 'normal', busyDelayMs: 4000 },
+        actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2, GO_CONFIRM, ESCAPE_TRY, CLICK_BACKDROP], wait: 400,
+        expect: (b) => [
+          ...toolbarChecks(b),
+          ...(b.dialogOpen ? [] : ['busy: dialog was dismissed by Esc/backdrop']),
+          ...(b.dialogBusy ? [] : ['busy: aria-busy not set']),
+          ...(b.confirmDisabled === true ? [] : ['busy: confirm button not disabled']),
+          ...(b.hasSpinner ? [] : ['busy: no spinner shown'])
+        ]
+      },
+      {
+        label: `revert-cancel-restore-${tag}`, w, h, state: { mode: 'normal' },
+        actions: [SELECT_FIRST, OPEN_REVERT, CANCEL_DIALOG], wait: 300,
+        expect: (b) => [
+          ...toolbarChecks(b),
+          ...(b.dialogOpen ? ['cancel: dialog still open'] : []),
+          ...(b.activeText === '恢复此文件…' ? [] : ['focus not restored to trigger (active=' + (b.activeText || 'none') + ')'])
+        ]
+      }
+    );
+  }
+
   fs.mkdirSync(OUT, { recursive: true });
   win = new BrowserWindow({
     width: 1280,

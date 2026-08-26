@@ -39,10 +39,18 @@ xvfb-run -a npm run capture:diff   # exit 0 only if every assertion passes
 - **All**: `noPageHScroll === true` (page-level horizontal scroll forbidden;
   Monaco scrolls only inside its `overflow:hidden` host), recorded via
   `pageScrollWidth`/`clientWidth`.
-- **normal / binary / revert**: toolbar visible; all `.diff-actions` button
-  rects pairwise non-overlapping.
+The predicate logic lives in `scripts/capture/assertions.mjs` (pure, ESM) and
+is unit-tested by `tests/capture-gate.test.ts` so the gate cannot false-green:
+
+- **All**: `noPageHScroll === true` (page-level horizontal scroll forbidden;
+  Monaco scrolls only inside its `overflow:hidden` host), recorded via
+  `pageScrollWidth`/`clientWidth`.
+- **Toolbar scenes (normal / binary / every Revert state)**: the `.diff-toolbar`
+  rect exists AND `visible === true` with non-zero size and is inside the
+  viewport; the `.diff-actions` bar has **exactly 3** expected buttons, each
+  non-zero-sized and in-viewport, and all pairs are non-overlapping.
 - **binary**: binary placeholder (`.diff-status`) shown.
-- **empty**: empty state (`.diff-empty`) shown.
+- **empty**: empty state (`.diff-empty`) shown; no toolbar/action-bar required.
 - **revert-stage1**: dialog open AND `activeIsCancel === true` (focus on 取消).
 - **revert-stage2**: dialog open, focus NOT on cancel, active text is the
   confirm label.
@@ -52,12 +60,20 @@ xvfb-run -a npm run capture:diff   # exit 0 only if every assertion passes
 - **revert-cancel-restore**: after cancel — dialog closed and focus restored to
   the trigger button (`activeText === "恢复此文件…"`).
 
-`.bounds.json` also records every `.diff-actions` button rect for the
-non-overlap assertion and the viewport size.
+`tests/capture-gate.test.ts` proves the gate FAILS on the real regressions:
+zero-size toolbar, missing/zero-size action buttons, overlapping button pairs,
+out-of-viewport buttons, and page horizontal scroll — not merely an injected
+constant-false condition.
+
+`.bounds.json` records every `.diff-actions` button rect for the non-overlap
+assertion plus the viewport size.
 
 ## Regression tests
 
 - `tests/dialog-focus.test.ts` (11): focus-trap Tab/Shift+Tab cycling with hard
   wrap, stage-1 safe-action initial focus selection, busy-close gating, and the
   focusable-selector contract — pure node, no DOM.
+- `tests/capture-gate.test.ts` (11): the assertion predicates must FAIL on
+  zero-size toolbar, missing/zero-size buttons, overlapping pairs, out-of-view
+  and page-horizontal-scroll — proves the gate is not false-green.
 - Existing suites unchanged and still green (see full run below).

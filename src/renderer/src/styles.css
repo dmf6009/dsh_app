@@ -2115,3 +2115,109 @@ code {
   gap: 8px;
   margin-top: 14px;
 }
+
+/* ==================== DSHA-6 P1-2: Diff responsive + no page h-scroll ==================== */
+
+/* Page-level horizontal overflow is forbidden; Monaco's own content scrolls
+   inside .diff-monaco-host (overflow:hidden), never the page. */
+.page-diff {
+  overflow-x: hidden;
+}
+
+.diff-layout {
+  min-width: 0;
+}
+
+.diff-files {
+  min-width: 0;
+}
+
+.diff-toolbar {
+  min-width: 0;
+}
+
+/* ≤960px: stack Changed Files above the viewer (上下布局). Controls stay
+   visible: the toolbar sits above the editor and wraps, and the page still
+   scrolls vertically if content exceeds the viewport. */
+@media (max-width: 960px) {
+  .diff-layout {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .diff-files {
+    max-height: 32vh;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius, 8px);
+    padding: 8px;
+  }
+
+  .diff-files .panel-title {
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+
+  .diff-view {
+    min-height: 0;
+  }
+
+  .diff-monaco-host {
+    min-height: 300px;
+  }
+}
+
+/* Very narrow: tighten the toolbar so Prev/Next/Revert never overlap and
+   remain reachable (wrap + full-width actions). */
+@media (max-width: 600px) {
+  .diff-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .diff-path {
+    max-width: 100%;
+  }
+
+  .diff-actions {
+    justify-content: stretch;
+  }
+
+  .diff-actions .btn {
+    flex: 1 1 auto;
+  }
+
+  .hunk-pos {
+    min-width: 0;
+    flex: none;
+  }
+
+  .diff-monaco-host {
+    min-height: 260px;
+  }
+
+  .diff-head {
+    flex-wrap: wrap;
+  }
+}
+
+/* Global: keep the top bar from widening the document on narrow viewports —
+   the last item (gear) previously overflowed past the right edge, producing a
+   page-level horizontal scroll that the Diff acceptance forbids. */
+@media (max-width: 960px) {
+  .topbar {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .nav {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .nav-btn,
+  .gear-btn {
+    padding: 5px 10px;
+  }
+}

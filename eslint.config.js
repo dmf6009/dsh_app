@@ -3,7 +3,7 @@ import tseslint from 'typescript-eslint';
 import reactHooks from 'eslint-plugin-react-hooks';
 
 export default tseslint.config(
-  { ignores: ['dist/', 'node_modules/', '*.config.*'] },
+  { ignores: ['dist/', 'node_modules/', '*.config.*', 'scripts/capture/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -31,7 +31,7 @@ export default tseslint.config(
     rules: reactHooks.configs.recommended.rules
   },
   {
-    files: ['scripts/**/*.mjs', '**/*.test.ts'],
+    files: ['scripts/**/*.mjs', 'scripts/**/*.cjs', '**/*.test.ts'],
     languageOptions: {
       globals: {
         console: 'readonly',
@@ -41,7 +41,13 @@ export default tseslint.config(
         clearTimeout: 'readonly',
         setInterval: 'readonly',
         clearInterval: 'readonly',
-        URL: 'readonly'
+        URL: 'readonly',
+        require: 'readonly',
+        __dirname: 'readonly',
+        __filename: 'readonly',
+        module: 'readonly',
+        exports: 'readonly',
+        global: 'readonly'
       }
     }
   }

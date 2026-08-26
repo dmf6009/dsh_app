@@ -1,16 +1,28 @@
 /**
  * Two-step confirmation dialog for DESTRUCTIVE actions (S-5 裁定②).
  *
- * Stage 1 explains what will happen; stage 2 repeats the consequence and
- * requires an explicit danger-button press. Esc / 取消 abort at any stage,
- * focus starts on the safe action and lands on the danger button only at
- * stage 2. This is UI gating only — actual execution stays subject to the
- * L2 approval level.
+ * Accessibility contract (DSHA-6 P1-1 review fix):
+ *  - Stage 1 initial focus lands on the SAFE action (取消), never the
+ *    destructive one; Stage 2 moves focus to the danger confirm button.
+ *  - Tab / Shift+Tab are trapped inside the dialog (hard wrap-around).
+ *  - On close, focus is restored to the element that opened the dialog.
+ *  - While `busy`, the dialog is not dismissible (Esc, backdrop click) and
+ *    the confirm button is disabled + shows a spinner until the result.
+ *    The 取消/继续/confirm buttons keep their disabled/busy states.
+ *
+ * This is UI gating only — actual execution stays subject to the L2 approval
+ * level.
  */
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 
 import { Button, Spinner } from './ui';
+import {
+  collectFocusables,
+  cycleFocusIndex,
+  ignoreCloseWhileBusy,
+  pickInitialFocus
+} from './dialog-focus';
 
 export interface ConfirmDialogProps {
   open: boolean;
@@ -40,40 +52,80 @@ export function ConfirmDialog({
   onCancel
 }: ConfirmDialogProps): JSX.Element | null {
   const [stage, setStage] = useState<1 | 2>(1);
-  const stage2Ref = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+  const prevOpenRef = useRef(open);
 
+  /* ---- reset to stage 1 and park the trigger for focus restore ---- */
   useEffect(() => {
-    if (open) setStage(1);
+    if (open) {
+      setStage(1);
+      if (!prevOpenRef.current) {
+        restoreFocusRef.current = document.activeElement as HTMLElement | null;
+      }
+    } else if (prevOpenRef.current) {
+      restoreFocusRef.current?.focus?.();
+      restoreFocusRef.current = null;
+    }
+    prevOpenRef.current = open;
   }, [open]);
 
+  /* ---- initial focus: stage 1 → cancel (safe), stage 2 → confirm ---- */
   useEffect(() => {
-    if (open && stage === 2) stage2Ref.current?.focus();
-    else if (open && stage === 1) dialogRef.current?.focus();
+    if (!open) return;
+    if (stage === 2) {
+      confirmRef.current?.focus();
+    } else {
+      const preferred = cancelRef.current;
+      const list = dialogRef.current ? collectFocusables(dialogRef.current) : [];
+      pickInitialFocus(list, preferred)?.focus();
+    }
   }, [open, stage]);
 
+  /* ---- focus trap + Esc (gated by busy) ---- */
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Tab') {
+        const dialog = dialogRef.current;
+        if (dialog == null) return;
+        const els = collectFocusables(dialog);
+        if (els.length === 0) {
+          e.preventDefault();
+          return;
+        }
+        const current = document.activeElement as HTMLElement | null;
+        const idx = els.indexOf(current as never);
+        const next = cycleFocusIndex(els.length, idx, e.shiftKey);
+        if (next >= 0 && els[next]) {
+          els[next]?.focus();
+          e.preventDefault();
+        }
+        return;
+      }
       if (e.key === 'Escape') {
         e.stopPropagation();
+        if (ignoreCloseWhileBusy(busy)) return; // busy ⇒ not dismissible
         onCancel();
       }
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [open, onCancel]);
+  }, [open, busy, onCancel]);
 
   if (!open) return null;
 
   return (
-    <div className="confirm-backdrop" onClick={onCancel}>
+    <div className="confirm-backdrop" onClick={busy ? undefined : onCancel}>
       <div
         ref={dialogRef}
         className="confirm-dialog"
         role="alertdialog"
         aria-modal="true"
         aria-label={title}
+        aria-busy={busy || undefined}
         tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
       >
@@ -85,16 +137,23 @@ export function ConfirmDialog({
           </p>
         )}
         <div className="confirm-actions">
-          <Button variant="secondary" onClick={onCancel} disabled={busy}>
+          <button
+            ref={cancelRef}
+            type="button"
+            className="btn btn-secondary"
+            disabled={busy}
+            data-dialog-cancel=""
+            onClick={onCancel}
+          >
             {cancelLabel}
-          </Button>
+          </button>
           {stage === 1 ? (
             <Button variant="danger" onClick={() => setStage(2)}>
               {stage2Label}
             </Button>
           ) : (
             <button
-              ref={stage2Ref}
+              ref={confirmRef}
               type="button"
               className="btn btn-danger"
               disabled={busy}

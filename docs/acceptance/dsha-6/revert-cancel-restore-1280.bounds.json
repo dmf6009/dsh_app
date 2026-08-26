@@ -1,0 +1,63 @@
+{
+  "viewport": {
+    "w": 1280,
+    "h": 800
+  },
+  "noPageHScroll": true,
+  "pageScrollWidth": 1280,
+  "pageClientWidth": 1280,
+  "bodyScrollWidth": 1280,
+  "toolbar": {
+    "x": 332,
+    "y": 107,
+    "w": 460,
+    "h": 28,
+    "visible": true
+  },
+  "fileList": {
+    "x": 20,
+    "y": 107,
+    "w": 300,
+    "h": 673,
+    "visible": true
+  },
+  "monacoHost": {
+    "x": 332,
+    "y": 141,
+    "w": 460,
+    "h": 639,
+    "visible": true
+  },
+  "empty": null,
+  "dialog": null,
+  "actionBtns": [
+    {
+      "text": "↑ 上一个",
+      "x": 473,
+      "y": 107,
+      "w": 67,
+      "h": 28
+    },
+    {
+      "text": "↓ 下一个",
+      "x": 624,
+      "y": 107,
+      "w": 67,
+      "h": 28
+    },
+    {
+      "text": "恢复此文件…",
+      "x": 698,
+      "y": 107,
+      "w": 94,
+      "h": 28
+    }
+  ],
+  "activeText": "恢复此文件…",
+  "activeClass": "btn btn-danger btn-sm",
+  "activeIsCancel": false,
+  "dialogOpen": false,
+  "dialogBusy": false,
+  "confirmDisabled": null,
+  "hasSpinner": false
+}

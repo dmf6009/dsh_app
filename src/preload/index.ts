@@ -14,6 +14,7 @@ import type {
   RuntimeStatus
 } from '../shared/desktop-api';
 import type { ApprovalRequestPayload } from '../shared/approval-protocol';
+import type { ChangesSnapshot, FileDiffResult, RevertFileResult } from '../shared/changes';
 import type { ProtocolViolationInfo, RuntimeEventFrame } from '../shared/protocol/types';
 import type {
   ModelsRefreshResult,
@@ -61,6 +62,14 @@ const api: DesktopApi = {
     ipcRenderer.invoke('runtime:get-log-tail', category),
   onProtocolViolation: (listener: (info: ProtocolViolationInfo) => void): (() => void) =>
     subscribe<ProtocolViolationInfo>('runtime:protocol-violation', listener),
+
+  getChangesSnapshot: (): Promise<ChangesSnapshot> => ipcRenderer.invoke('changes:get-snapshot'),
+  getFileDiff: (path: string): Promise<FileDiffResult> =>
+    ipcRenderer.invoke('changes:get-file-diff', path),
+  revertFile: (path: string): Promise<{ result: RevertFileResult; snapshot: ChangesSnapshot }> =>
+    ipcRenderer.invoke('changes:revert-file', path),
+  onChangesSnapshot: (listener: (snapshot: ChangesSnapshot) => void): (() => void) =>
+    subscribe<ChangesSnapshot>('changes:snapshot', listener),
 
   openProject: (): Promise<OpenProjectResult> => ipcRenderer.invoke('workspace:open-project'),
   openProjectAt: (path: string): Promise<OpenProjectResult> =>

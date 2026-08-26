@@ -7,6 +7,7 @@
 import type { ReactElement } from 'react';
 
 import { ROUTE_TITLES, useApp, type Route } from './store/app-store';
+import { ChangesProvider } from './changes/changes-store';
 import HomePage from './pages/HomePage';
 import WorkspacePage from './pages/WorkspacePage';
 import DiffPage from './pages/DiffPage';
@@ -70,6 +71,7 @@ export default function App(): ReactElement {
 
       {/* Keep-alive pages: mounted once, toggled with `hidden`. */}
       <main className="page-host">
+        <ChangesProvider>
         {state.flash && state.route !== 'settings' && (
           // Confirmation handed over by Settings on save-and-return (§37): shown
           // on the originating page, dismissible, and cleared by any navigation.
@@ -97,6 +99,7 @@ export default function App(): ReactElement {
         <div hidden={state.route !== 'settings'}>
           <SettingsPage />
         </div>
+        </ChangesProvider>
       </main>
     </div>
   );

@@ -5,6 +5,7 @@
 
 import type { RuntimeEventFrame, ProtocolViolationInfo } from './protocol/types';
 import type { ApprovalRequestPayload, ApprovalOutcome } from './approval-protocol';
+import type { ChangesSnapshot, FileDiffResult, RevertFileResult } from './changes';
 import type {
   ModelsRefreshResult,
   OperationResult,
@@ -89,6 +90,19 @@ export interface DesktopApi {
   getRuntimeLogTail(category?: 'stdout' | 'stderr' | 'event' | 'tool' | 'model'): Promise<string>;
   /** Malformed-frame diagnostics from the ordered bus. */
   onProtocolViolation(listener: (info: ProtocolViolationInfo) => void): () => void;
+
+  /* ---- Changes / Diff (DSHA-6, F3/F7/AC-09/S-5) ---- */
+  /** Aggregated change records + read-only git facts for the active root. */
+  getChangesSnapshot(): Promise<ChangesSnapshot>;
+  /** Original/modified text pair + unified diff for one file (read-only). */
+  getFileDiff(path: string): Promise<FileDiffResult>;
+  /**
+   * DESTRUCTIVE (S-5): restore one file to its pre-change content. The UI
+   * must double-confirm first; execution itself stays an L2-gated action.
+   */
+  revertFile(path: string): Promise<{ result: RevertFileResult; snapshot: ChangesSnapshot }>;
+  /** Push channel fired after every reconciliation. */
+  onChangesSnapshot(listener: (snapshot: ChangesSnapshot) => void): () => void;
 
   /* ---- Home / workspace (§7) ---- */
   /** Opens the native directory picker, then activates + records the project. */

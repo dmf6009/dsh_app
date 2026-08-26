@@ -1,0 +1,486 @@
+/**
+ * Change Record service tests (DSHA-6): aggregation/reconciliation policy and
+ * S-5 revert semantics against REAL temp git repositories.
+ */
+
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import {
+  ChangeRecordService,
+  mergeRecords,
+  normalizeEventPath
+} from '../src/main/changes/change-record-service';
+import type { RuntimeEventFrame } from '../src/shared/protocol/types';
+import { defaultGitRunner, type GitRunner, type StatusEntry } from '../src/main/changes/git-readonly';
+import type { ChangeRecord } from '../src/shared/changes';
+
+let root = '';
+
+/** True when the platform allows creating symlinks (Linux/macOS; some CI). */
+const HAS_SYMLINKS = (() => {
+  try {
+    const t = path.join(os.tmpdir(), `dsh-crs-sym-${process.pid}`);
+    fs.writeFileSync(t, '');
+    const l = `${t}-l`;
+    fs.symlinkSync(t, l);
+    fs.unlinkSync(l);
+    fs.unlinkSync(t);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+function git(args: string[]): void {
+  execFileSync('git', args, { cwd: root });
+}
+
+function write(rel: string, content: string): void {
+  const abs = path.join(root, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, content);
+}
+
+function svc(): ChangeRecordService {
+  return new ChangeRecordService();
+}
+
+function fileChanged(p: string, change: 'added' | 'modified' | 'deleted' = 'modified'): RuntimeEventFrame {
+  return { v: 1, type: 'file_changed', path: p, change };
+}
+
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-'));
+  git(['init', '--initial-branch=main']);
+  git(['config', 'user.email', 't@t']);
+  git(['config', 'user.name', 't']);
+});
+
+afterEach(() => {
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+/* ------------------------------------------------------------------ */
+/* Pure merge policy                                                   */
+/* ------------------------------------------------------------------ */
+
+describe('mergeRecords', () => {
+  const nowIso = '2025-01-01T00:00:00.000Z';
+  const ev = (
+    path: string,
+    kind: 'added' | 'modified' | 'deleted',
+    firstSeenAt = '2024-12-31T00:00:00.000Z'
+  ): ChangeRecordLike => ({ path, kind, source: 'event', firstSeenAt, lastSeenAt: firstSeenAt });
+  type ChangeRecordLike = ChangeRecord;
+
+  it('keeps event arrival order and lets git override shared paths', () => {
+    const eventRecords = [ev('b.ts', 'modified'), ev('a.ts', 'added')];
+    const gitEntries: StatusEntry[] = [
+      { path: 'b.ts', kind: 'deleted', code: ' D' },
+      { path: 'z.ts', kind: 'modified', code: 'M ' }
+    ];
+    const merged = mergeRecords({ eventRecords, gitEntries, nowIso });
+    expect(merged.map((r) => r.path)).toEqual(['b.ts', 'a.ts', 'z.ts']);
+    expect(merged[0]).toMatchObject({ kind: 'deleted', source: 'git' });
+    expect(merged[1]).toMatchObject({ source: 'event' }); // untouched
+    expect(merged[2]).toMatchObject({ source: 'git', firstSeenAt: nowIso });
+  });
+
+  it('appends multiple git-only paths in ascending order deterministically', () => {
+    const merged = mergeRecords({
+      eventRecords: [],
+      gitEntries: [
+        { path: 'c.ts', kind: 'added', code: '??' },
+        { path: 'a/b.ts', kind: 'added', code: '??' },
+        { path: 'a.ts', kind: 'modified', code: 'M ' }
+      ],
+      nowIso
+    });
+    expect(merged.map((r) => r.path)).toEqual(['a.ts', 'a/b.ts', 'c.ts']);
+  });
+
+  it('does not mutate caller-owned inputs', () => {
+    const eventRecords = [ev('x.ts', 'added')];
+    mergeRecords({ eventRecords, gitEntries: [{ path: 'x.ts', kind: 'deleted', code: 'D ' }], nowIso });
+    expect(eventRecords[0]!.kind).toBe('added');
+  });
+});
+
+describe('normalizeEventPath', () => {
+  it('relativizes absolute paths inside the root and keeps others as-is', () => {
+    expect(normalizeEventPath(root, path.join(root, 'src/a.py'))).toBe('src/a.py');
+    expect(normalizeEventPath(root, './src/b.py')).toBe('src/b.py');
+    expect(normalizeEventPath(null, '/etc/passwd')).toBe('/etc/passwd');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Event aggregation                                                   */
+/* ------------------------------------------------------------------ */
+
+describe('event aggregation', () => {
+  it('upserts repeated file_changed events into ONE record per path', () => {
+    const s = svc();
+    expect(s.onRuntimeEvent(fileChanged('src/login.py'), root)).toBe(false);
+    expect(s.onRuntimeEvent(fileChanged('src/login.py', 'deleted'), root)).toBe(false);
+    expect(s.eventRecordCount(root)).toBe(1);
+  });
+
+  it('never creates records from file_read events (AC-06 interpretation)', async () => {
+    const s = svc();
+    s.onRuntimeEvent({ v: 1, type: 'run_started', run_id: 'r1' }, root);
+    s.onRuntimeEvent({ v: 1, type: 'file_read', path: 'README.md' }, root);
+    s.onRuntimeEvent({ v: 1, type: 'file_read', path: 'src/only-read.ts' }, root);
+    expect(s.eventRecordCount(root)).toBe(0);
+    expect(s.readLedger(root)).toContain('src/only-read.ts');
+
+    const snap = await s.reconcile(root);
+    expect(snap.records).toHaveLength(0); // repo is clean; read ≠ changed
+  });
+
+  it('flags terminal frames so callers know to reconcile with git', () => {
+    const s = svc();
+    for (const type of ['run_completed', 'done', 'run_cancelled'] as const) {
+      expect(s.onRuntimeEvent({ v: 1, type } as RuntimeEventFrame, root)).toBe(true);
+    }
+    expect(s.onRuntimeEvent({ v: 1, type: 'message_delta', content: 'x' }, root)).toBe(false);
+  });
+
+  it('reconciles event-only records with real git status (git authoritative)', async () => {
+    write('tracked.txt', 'v1\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'c1']);
+
+    const s = svc();
+    // Event claims an edit that also really happened:
+    write('tracked.txt', 'v2\n');
+    s.onRuntimeEvent(fileChanged('tracked.txt'), root);
+    // Event for a file git cannot see (e.g. written then removed externally,
+    // or runtime-side virtual change) — must survive reconciliation:
+    s.onRuntimeEvent(fileChanged('.dsh-scratch/virtual.md', 'added'), root);
+
+    const snap = await s.reconcile(root);
+    const byPath = new Map(snap.records.map((r) => [r.path, r]));
+    expect(byPath.get('tracked.txt')?.source).toBe('git');
+    expect(byPath.get('tracked.txt')?.kind).toBe('modified');
+    expect(byPath.get('.dsh-scratch/virtual.md')?.source).toBe('event');
+    expect(snap.branch).toBe('main');
+    expect(snap.gitAvailable).toBe(true);
+  });
+
+  it('catches up changes made OUTSIDE the desktop (git-only rows appear)', async () => {
+    write('external.txt', 'x\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'c1']);
+
+    const s = svc(); // no events at all — pure external edit
+    write('external.txt', 'y\n');
+    const snap = await s.reconcile(root);
+    expect(snap.records.map((r) => [r.path, r.kind])).toContainEqual(['external.txt', 'modified']);
+  });
+
+  it('reports non-git roots without crashing and keeps event rows', async () => {
+    const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-nogit-'));
+    try {
+      const s = svc();
+      s.onRuntimeEvent(fileChanged('notes.txt', 'added'), plain);
+      const snap = await s.reconcile(plain);
+      expect(snap.gitAvailable).toBe(false);
+      expect(snap.branch).toBeNull();
+      expect(snap.records.map((r) => r.path)).toEqual(['notes.txt']);
+    } finally {
+      fs.rmSync(plain, { recursive: true, force: true });
+    }
+  });
+
+  it('peekSnapshot returns cached data without spawning git', async () => {
+    const s = svc();
+    const before = s.peekSnapshot(root);
+    expect(before.records).toHaveLength(0);
+    await s.reconcile(root);
+    expect(s.peekSnapshot(root).generatedAt).toBeGreaterThan(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Revert (S-5)                                                        */
+/* ------------------------------------------------------------------ */
+
+describe('revertFile', () => {
+  it('restores a modified tracked file byte-for-byte from HEAD', async () => {
+    write('app.py', 'orig\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'c1']);
+    write('app.py', 'changed by agent\nline2\n');
+
+    const res = await svc().revertFile(root, 'app.py');
+    expect(res.ok).toBe(true);
+    expect(res.action).toBe('restored-content');
+    expect(fs.readFileSync(path.join(root, 'app.py'), 'utf8')).toBe('orig\n');
+  });
+
+  it('recreates a deleted tracked file from HEAD', async () => {
+    write('gone.py', 'keep me\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'c1']);
+    fs.rmSync(path.join(root, 'gone.py'));
+
+    const res = await svc().revertFile(root, 'gone.py');
+    expect(res.ok).toBe(true);
+    expect(res.action).toBe('recreated-file');
+    expect(fs.readFileSync(path.join(root, 'gone.py'), 'utf8')).toBe('keep me\n');
+  });
+
+  it('deletes untracked files added during the session', async () => {
+    write('scratch/new.py', 'print(1)\n');
+    const res = await svc().revertFile(root, 'scratch/new.py');
+    expect(res.ok).toBe(true);
+    expect(res.action).toBe('deleted-file');
+    expect(fs.existsSync(path.join(root, 'scratch/new.py'))).toBe(false);
+  });
+
+  it('is idempotent: second revert of a clean path reports noop (S-5 裁定③)', async () => {
+    write('m.txt', 'one\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'c1']);
+    write('m.txt', 'two\n');
+
+    const s = svc();
+    const first = await s.revertFile(root, 'm.txt');
+    expect(first.ok).toBe(true);
+    const second = await s.revertFile(root, 'm.txt');
+    expect(second.ok).toBe(true);
+    expect(second.noop).toBe(true);
+  });
+
+  it('flags staged residual instead of pretending full success', async () => {
+    write('s.txt', 'base\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'c1']);
+    write('s.txt', 'staged edit\n');
+    git(['add', 's.txt']); // staged only — index cannot be touched
+
+    const res = await svc().revertFile(root, 's.txt');
+    expect(res.ok).toBe(true);
+    expect(res.residual).toBe(true);
+    // Worktree content IS restored to HEAD…
+    expect(fs.readFileSync(path.join(root, 's.txt'), 'utf8')).toBe('base\n');
+    // …but the index still carries the staged delta.
+    const staged = execFileSync('git', ['diff', '--cached', '--name-only'], { cwd: root }).toString();
+    expect(staged).toContain('s.txt');
+  });
+
+  it('rejects path escapes before touching anything', async () => {
+    write('../outside.txt', 'nope\n');
+    const outsideAbs = path.resolve(root, '../outside.txt');
+    try {
+      const res = await svc().revertFile(root, '../outside.txt');
+      expect(res.ok).toBe(false);
+      expect(res.error).toMatch(/工作区之外/);
+      expect(fs.existsSync(outsideAbs)).toBe(true); // untouched
+    } finally {
+      fs.rmSync(outsideAbs, { force: true });
+    }
+  });
+
+  it('fails with a clear error in non-git roots unless file was session-added', async () => {
+    const plain = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-nogit-rv-'));
+    try {
+      fs.writeFileSync(path.join(plain, 'pre-existing.txt'), 'data\n');
+
+      const s = svc();
+      const bad = await s.revertFile(plain, 'pre-existing.txt');
+      expect(bad.ok).toBe(false);
+      expect(bad.error).toMatch(/不是 Git 仓库/);
+
+      s.onRuntimeEvent(fileChanged('made-by-agent.txt', 'added'), plain);
+      const good = await s.revertFile(plain, 'made-by-agent.txt');
+      expect(good.ok).toBe(true);
+    } finally {
+      fs.rmSync(plain, { recursive: true, force: true });
+    }
+  });
+
+  it('returns an error when no workspace root is open', async () => {
+    const res = await svc().revertFile(null, 'anything.txt');
+    expect(res.ok).toBe(false);
+  });
+
+  it('handles nested paths whose parent dirs were deleted', async () => {
+    write('deep/nested/leaf.txt', 'content\n');
+    git(['add', '.']);
+    git(['commit', '-m', 'c1']);
+    fs.rmSync(path.join(root, 'deep'), { recursive: true });
+
+    const res = await svc().revertFile(root, 'deep/nested/leaf.txt');
+    expect(res.ok).toBe(true);
+    expect(fs.readFileSync(path.join(root, 'deep/nested/leaf.txt'), 'utf8')).toBe('content\n');
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* P1: per-root isolation                                              */
+/* ------------------------------------------------------------------ */
+
+describe('root isolation (P1 review fix)', () => {
+  it('A→B switch: records, read ledger and cache never leak across roots', async () => {
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-B-'));
+    try {
+      const s = svc();
+      s.onRuntimeEvent(fileChanged('a-file.ts', 'added'), root);
+      s.onRuntimeEvent({ v: 1, type: 'file_read', path: 'a-read.ts' }, root);
+      await s.reconcile(root);
+      expect(s.readLedger(root)).toContain('a-read.ts');
+
+      // B sees none of A's state.
+      expect(s.eventRecordCount(rootB)).toBe(0);
+      expect(s.readLedger(rootB)).not.toContain('a-read.ts');
+      const snapB = await s.reconcile(rootB);
+      expect(snapB.root).toBe(rootB);
+      expect(snapB.records).toHaveLength(0);
+      expect(snapB.generatedAt).toBeGreaterThan(0);
+
+      // A keeps its own data intact.
+      expect(s.eventRecordCount(root)).toBe(1);
+      const snapA = await s.reconcile(root);
+      expect(snapA.records.map((r) => r.path)).toContain('a-file.ts');
+    } finally {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    }
+  });
+
+  it('peekSnapshot returns the right root’s cache (not any old one)', async () => {
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-B-'));
+    try {
+      const s = svc();
+      s.onRuntimeEvent(fileChanged('in-A.txt', 'added'), root);
+      await s.reconcile(root);
+
+      // Before B ever reconciles, B peeks empty.
+      expect(s.peekSnapshot(rootB).records).toHaveLength(0);
+      expect(s.peekSnapshot(rootB).root).toBe(rootB);
+      // A still has its cached record.
+      expect(s.peekSnapshot(root).records.map((r) => r.path)).toContain('in-A.txt');
+    } finally {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    }
+  });
+
+  it('concurrent reconcile: another root in-flight never feeds B a stale A snapshot', async () => {
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-B-'));
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      let blockedA = false;
+      const runGit: GitRunner = (r, args, opts) => {
+        if (r === root && !blockedA) {
+          blockedA = true; // hold A’s reconcile in-flight
+          return gate.then(() => defaultGitRunner(r, args, opts));
+        }
+        return defaultGitRunner(r, args, opts);
+      };
+      const s = new ChangeRecordService({ runGit });
+      s.onRuntimeEvent(fileChanged('only-in-A.txt', 'added'), root);
+
+      const pA = s.reconcile(root); // in-flight, blocked on the gate
+      // B reconciles independently while A is still running.
+      const snapB = await s.reconcile(rootB);
+      expect(snapB.root).toBe(rootB);
+      expect(snapB.records.map((r) => r.path)).not.toContain('only-in-A.txt');
+
+      release!();
+      const snapA = await pA;
+      expect(snapA.root).toBe(root);
+      expect(snapA.records.map((r) => r.path)).toContain('only-in-A.txt');
+    } finally {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    }
+  });
+
+  it('same-name added record in A does NOT let Revert delete B’s file (P1)', async () => {
+    const rootB = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-crs-B-')); // non-git
+    try {
+      fs.writeFileSync(path.join(rootB, 'notes.txt'), "B's own data\n");
+      const s = svc();
+      // A (a git repo) added a file named notes.txt.
+      s.onRuntimeEvent(fileChanged('notes.txt', 'added'), root);
+
+      const res = await s.revertFile(rootB, 'notes.txt');
+      // B has no 'added' record of its own — must refuse, never delete B's file.
+      expect(res.ok).toBe(false);
+      expect(fs.readFileSync(path.join(rootB, 'notes.txt'), 'utf8')).toBe("B's own data\n");
+    } finally {
+      fs.rmSync(rootB, { recursive: true, force: true });
+    }
+  });
+
+  it('symlink root and real root of the SAME workspace share one partition (canonical key)', async () => {
+    if (!HAS_SYMLINKS) return;
+    const linkRoot = path.join(os.tmpdir(), `dsh-crs-canon-${process.pid}`);
+    fs.rmSync(linkRoot, { force: true });
+    fs.symlinkSync(root, linkRoot);
+    try {
+      const s = svc();
+      // Event via the symlink spelling, read via the real spelling.
+      s.onRuntimeEvent(fileChanged('shared.txt', 'modified'), linkRoot);
+      s.onRuntimeEvent({ v: 1, type: 'file_read', path: 'shared-read.ts' }, root);
+
+      // Same physical workspace ⇒ same partition (records + ledger shared).
+      expect(s.eventRecordCount(linkRoot)).toBe(1);
+      expect(s.eventRecordCount(root)).toBe(1);
+      expect(s.readLedger(root)).toContain('shared-read.ts');
+      expect(s.readLedger(linkRoot)).toContain('shared-read.ts');
+
+      // Cache shared: reconcile via one spelling, peek via the other.
+      await s.reconcile(linkRoot);
+      const cachedViaReal = s.peekSnapshot(root);
+      expect(cachedViaReal.records.map((r) => r.path)).toContain('shared.txt');
+      // Reconcile via the real spelling returns the same partition's records.
+      const again = await s.reconcile(root);
+      expect(again.records.map((r) => r.path)).toContain('shared.txt');
+    } finally {
+      fs.rmSync(linkRoot, { force: true });
+    }
+  });
+
+  it('same physical workspace: in-flight reconcile is shared across spellings', async () => {
+    if (!HAS_SYMLINKS) return;
+    const linkRoot = path.join(os.tmpdir(), `dsh-crs-inflight-${process.pid}`);
+    fs.rmSync(linkRoot, { force: true });
+    fs.symlinkSync(root, linkRoot);
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      let blocked = false;
+      const runGit: GitRunner = (r, args, opts) => {
+        if (!blocked) {
+          blocked = true; // hold the FIRST git call (of the shared reconcile)
+          return gate.then(() => defaultGitRunner(r, args, opts));
+        }
+        return defaultGitRunner(r, args, opts);
+      };
+      const s = new ChangeRecordService({ runGit });
+      s.onRuntimeEvent(fileChanged('in-flight.txt', 'modified'), linkRoot);
+
+      const pViaLink = s.reconcile(linkRoot); // in-flight, blocked on the gate
+      // Real spelling shares the SAME key ⇒ shares the in-flight promise.
+      const pViaReal = s.reconcile(root);
+      release!();
+      const a = await pViaLink;
+      const b = await pViaReal;
+      expect(a.generatedAt).toBe(b.generatedAt); // one reconcile, not two
+      expect(a.records.map((r) => r.path)).toContain('in-flight.txt');
+    } finally {
+      fs.rmSync(linkRoot, { force: true });
+    }
+  });
+});

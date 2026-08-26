@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { normalize as normalizeOsPath } from 'node:path';
 import { EventEmitter } from 'node:events';
 
 import type {
@@ -56,10 +57,34 @@ export interface PendingRequest {
 export type ApprovalServiceEvent =
   | { event: 'request-created'; payload: ApprovalRequestPayload }
   | { event: 'resolved'; result: { approvalId: string; outcome: ApprovalOutcome; viaModal: boolean } }
-  | { event: 'notice'; notice: { kind: 'auto_denied'; reasons: string[] } };
+  | { event: 'notice'; notice: { kind: 'auto_denied'; reasons: string[] } }
+  | {
+      event: 'notice';
+      notice: { kind: 'respond_failed'; approvalId: string; reason: string };
+    };
 
-function grantKeyOf(tool: string | undefined, command: string | undefined): string {
-  return `${tool ?? ''}\u0000${command ?? ''}`;
+/**
+ * Normalize one operation target for grant-key binding: OS-normalize, unify
+ * separators, strip trailing slashes. Case is preserved (POSIX is
+ * case-sensitive); the runtime boundary service remains the authority.
+ */
+function normalizeTarget(p: string): string {
+  const unified = p.replace(/\\/g, '/');
+  // posix.normalize preserves a leading `//`; collapse duplicate separators
+  // so equivalent spellings share one grant key.
+  const n = normalizeOsPath(unified).replace(/\/{2,}/g, '/');
+  return n.length > 1 ? n.replace(/\/+$/, '') : n;
+}
+
+/**
+ * Review fix 1: a session-grant key binds the tool AND the normalized
+ * operation targets (command / paths). A "本次会话均允许" earned for one path
+ * can therefore never be replayed for a different path — least of all one
+ * outside the workspace.
+ */
+function grantKeyOf(frame: ApprovalRequiredEventFrame): string {
+  const paths = Array.isArray(frame.paths) ? frame.paths.map(normalizeTarget).sort() : [];
+  return JSON.stringify([frame.tool ?? '', typeof frame.command === 'string' ? frame.command : '', paths]);
 }
 
 export class ApprovalService extends EventEmitter {
@@ -95,24 +120,40 @@ export class ApprovalService extends EventEmitter {
     return [...this.pending.values()].map((p) => p.payload);
   }
 
-  /** Renderer answered a modal (Allow / Allow Once / Reject). */
+  /** Renderer answered a modal (Allow / Allow Once / Reject).
+   *
+   * Review fix 3: the runtime delivery result is authoritative. When
+   * `respond()` reports failure (runtime unwritable), the request is NOT
+   * consumed, NO session grant is cached, and NO success is reported — a
+   * `respond_failed` notice is emitted instead and the modal stays open so
+   * the user can retry. */
   resolveRequest(requestId: string, reply: Omit<ApprovalReply, 'requestId'>): boolean {
     const entry = this.pending.get(requestId);
     if (!entry) return false;
-    this.pending.delete(requestId);
-    if (entry.timer) clearTimeout(entry.timer);
 
     const decision = reply.decision === 'allow' ? 'allow' : 'reject';
     const scope = reply.scope === 'session' ? 'session' : 'once';
     const outcome: ApprovalOutcome = decision === 'allow' ? 'allowed' : 'rejected';
-    if (decision === 'allow' && scope === 'session') {
-      this.sessionGrants.add(entry.grantKey);
-    }
-    this.deps.respond({
+
+    const sent = this.deps.respond({
       approvalId: entry.payload.approvalId,
       decision,
       scope
     });
+    if (!sent) {
+      this.emit('notice', {
+        kind: 'respond_failed',
+        approvalId: entry.payload.approvalId,
+        reason: 'runtime_unreachable'
+      });
+      return false;
+    }
+
+    this.pending.delete(requestId);
+    if (entry.timer) clearTimeout(entry.timer);
+    if (decision === 'allow' && scope === 'session') {
+      this.sessionGrants.add(entry.grantKey);
+    }
     this.emit('resolved', {
       approvalId: entry.payload.approvalId,
       outcome,
@@ -120,6 +161,11 @@ export class ApprovalService extends EventEmitter {
     });
     entry.settle(outcome === 'allowed' ? 'allowed' : 'rejected');
     return true;
+  }
+
+  /** True while a pending request exists (IPC error classification). */
+  hasPending(requestId: string): boolean {
+    return this.pending.has(requestId);
   }
 
   /** Process one approval_required frame end-to-end. */
@@ -134,16 +180,11 @@ export class ApprovalService extends EventEmitter {
       paths: frame.paths,
       claimedLevel: frame.risk_level
     };
-    const grantKey = grantKeyOf(frame.tool, frame.command);
+    const grantKey = grantKeyOf(frame);
 
-    // 1. Session grants short-circuit identical repeat operations.
-    if (this.sessionGrants.has(grantKey)) {
-      this.deps.respond({ approvalId, decision: 'allow', scope: 'session' });
-      this.emitResolved(approvalId, 'allowed', false);
-      return 'allowed';
-    }
-
-    // 2. Boundary verdict from the P1-A workspace service.
+    // 1. Boundary verdict from the P1-A workspace service. Computed BEFORE
+    // any grant replay: a cached session grant must never bypass a fresh
+    // out-of-workspace / unverifiable determination.
     let boundary: BoundaryVerdict | undefined;
     const paths = frame.paths ?? [];
     if (this.deps.checkPaths && paths.length > 0) {
@@ -154,19 +195,28 @@ export class ApprovalService extends EventEmitter {
       }
     }
 
+    // 2. Session grants short-circuit identical repeat operations — same
+    // tool, same command, SAME normalized targets — and only while the
+    // fresh boundary verdict still confirms in-workspace, verifiable
+    // targets ("先内后外": a grant earned inside never covers outside).
+    if (this.sessionGrants.has(grantKey)) {
+      const stillCovered =
+        boundary?.needsAuthorization !== true && boundary?.unverifiable !== true;
+      if (stillCovered) {
+        return this.autoRespond(approvalId, 'allow', 'session', 'allowed');
+      }
+      // Grant exists but the target is no longer provably safe → fall
+      // through to the full matrix and ask again.
+    }
+
     // 3. Pure rule matrix.
     const evaluation = evaluateApproval(this.deps.getMode(), op, boundary);
 
     if (evaluation.decision === 'deny') {
-      this.deps.respond({ approvalId, decision: 'reject', scope: 'auto' });
-      this.emit('notice', { kind: 'auto_denied', reasons: evaluation.reasons });
-      this.emitResolved(approvalId, 'auto_denied', false);
-      return 'auto_denied';
+      return this.autoRespond(approvalId, 'reject', 'auto', 'auto_denied', evaluation.reasons);
     }
     if (evaluation.decision === 'allow') {
-      this.deps.respond({ approvalId, decision: 'allow', scope: 'auto' });
-      this.emitResolved(approvalId, 'auto_allowed', false);
-      return 'auto_allowed';
+      return this.autoRespond(approvalId, 'allow', 'auto', 'auto_allowed');
     }
 
     // 4. Modal path: the promise settles when the renderer answers.
@@ -195,8 +245,23 @@ export class ApprovalService extends EventEmitter {
 
       if (this.deps.timeoutMs !== undefined) {
         const timer = setTimeout(() => {
-          // A timed-out modal behaves like closing it: reject.
-          this.resolveRequest(requestId, { decision: 'reject', scope: 'once' });
+          // A timed-out modal behaves like closing it: reject. If even the
+          // rejection cannot be delivered (runtime unwritable), drop the
+          // entry so it cannot leak forever — the safe default stands and
+          // no grant is cached either way.
+          const sent = this.resolveRequest(requestId, { decision: 'reject', scope: 'once' });
+          if (!sent) {
+            const dropped = this.pending.get(requestId);
+            if (dropped && this.pending.delete(requestId)) {
+              if (dropped.timer) clearTimeout(dropped.timer);
+              this.emit('notice', {
+                kind: 'respond_failed',
+                approvalId: dropped.payload.approvalId,
+                reason: 'runtime_unreachable'
+              });
+              dropped.settle('rejected');
+            }
+          }
         }, this.deps.timeoutMs);
         timer.unref?.();
         entry.timer = timer;
@@ -205,6 +270,35 @@ export class ApprovalService extends EventEmitter {
       this.emit('request-created', payload);
       this.deps.notifyRenderer(payload);
     });
+  }
+
+  /**
+   * Deliver an automatic decision (matrix allow/deny, cached session grant)
+   * to the runtime. Review fix 3: when delivery fails, NO success is
+   * reported — no `resolved` event, nothing settles — and a retryable
+   * `respond_failed` notice is emitted. The matrix outcome is still
+   * returned so callers can log/decide, with delivery state carried by the
+   * notice.
+   */
+  private autoRespond(
+    approvalId: string,
+    decision: 'allow' | 'reject',
+    scope: 'once' | 'session' | 'auto',
+    outcome: ApprovalOutcome,
+    reasons?: string[]
+  ): ApprovalOutcome {
+    const sent = this.deps.respond({ approvalId, decision, scope });
+    if (!sent) {
+      this.emit('notice', {
+        kind: 'respond_failed',
+        approvalId,
+        reason: 'runtime_unreachable'
+      });
+      return outcome;
+    }
+    if (reasons) this.emit('notice', { kind: 'auto_denied', reasons });
+    this.emitResolved(approvalId, outcome, false);
+    return outcome;
   }
 
   private emitResolved(approvalId: string, outcome: ApprovalOutcome, viaModal: boolean): void {

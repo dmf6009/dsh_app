@@ -62,6 +62,8 @@ export default function WorkspacePage(): JSX.Element {
   const [connection, setConnection] = useState<ConnectionState>('stopped');
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [approval, setApproval] = useState<ApprovalRequestPayload | null>(null);
+  /** Review fix 3: retryable send-failure banner while the modal stays open. */
+  const [approvalSendError, setApprovalSendError] = useState<string | null>(null);
   const [modelChoice, setModelChoice] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [sessions, setSessions] = useState<SessionEntry[]>([
@@ -86,10 +88,12 @@ export default function WorkspacePage(): JSX.Element {
       void window.desktop.getStatus().then(setStatus).catch(() => undefined);
     });
     const offApproval = window.desktop.onApprovalRequest((payload) => {
+      setApprovalSendError(null);
       setApproval(payload);
       dispatch({ type: 'approval-opened', payload });
     });
     const offResolved = window.desktop.onApprovalResolved(() => {
+      setApprovalSendError(null);
       setApproval(null);
     });
 
@@ -172,8 +176,20 @@ export default function WorkspacePage(): JSX.Element {
 
   const respondApproval = useCallback(
     async (requestId: string, decision: 'allow' | 'reject', scope: 'once' | 'session'): Promise<void> => {
-      setApproval(null);
-      await window.desktop.respondApproval(requestId, { decision, scope });
+      setApprovalSendError(null);
+      const result = await window.desktop.respondApproval(requestId, { decision, scope });
+      if (result.ok || result.error === 'no_pending_request') {
+        // Delivered (or already settled elsewhere — safe default stands).
+        setApproval(null);
+        return;
+      }
+      // Review fix 3: runtime unreachable — keep the modal open and surface
+      // the retryable error instead of pretending the answer was delivered.
+      setApprovalSendError(
+        result.error === 'runtime_unreachable'
+          ? '发送到运行时失败，请重试'
+          : (result.error ?? '发送失败，请重试')
+      );
     },
     []
   );
@@ -334,7 +350,11 @@ export default function WorkspacePage(): JSX.Element {
         <p className="changes-note">变更列表按事件顺序排列；点击条目查看 Diff 的能力由 P1-C 提供。</p>
       </aside>
 
-      <ApprovalModal payload={approval} onRespond={(id, decision, scope) => void respondApproval(id, decision, scope)} />
+      <ApprovalModal
+        payload={approval}
+        sendError={approvalSendError}
+        onRespond={(id, decision, scope) => void respondApproval(id, decision, scope)}
+      />
     </div>
   );
 }

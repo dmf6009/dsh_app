@@ -28,11 +28,17 @@ const LEVEL_LABEL: Record<string, string> = {
 
 export interface ApprovalModalProps {
   payload: ApprovalRequestPayload | null;
+  /**
+   * Review fix 3: retryable delivery error. Non-null keeps the modal open
+   * with an explicit banner instead of silently pretending the decision was
+   * delivered to the runtime.
+   */
+  sendError?: string | null;
   /** Resolve the request; `decision` is what the user picked. */
   onRespond: (requestId: string, decision: 'allow' | 'reject', scope: 'once' | 'session') => void;
 }
 
-export function ApprovalModal({ payload, onRespond }: ApprovalModalProps): JSX.Element | null {
+export function ApprovalModal({ payload, sendError, onRespond }: ApprovalModalProps): JSX.Element | null {
   const dialogRef = useRef<HTMLDivElement>(null);
   const rejectRef = useRef<HTMLButtonElement>(null);
 
@@ -146,6 +152,12 @@ export function ApprovalModal({ payload, onRespond }: ApprovalModalProps): JSX.E
               <li key={i}>{reason}</li>
             ))}
           </ul>
+        )}
+
+        {sendError != null && sendError !== '' && (
+          <div className="oob-banner" role="alert" data-testid="approval-send-error">
+            ✕ {sendError}
+          </div>
         )}
 
         <footer className="approval-actions">

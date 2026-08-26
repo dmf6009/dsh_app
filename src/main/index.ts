@@ -183,9 +183,13 @@ function registerIpcHandlers(context: {
       return { ok: false, error: '参数无效' };
     }
     const resolved = approvals.resolveRequest(requestId, { decision, scope });
-    // Closing the modal or answering an already-settled request is not an
-    // error for the user — it is simply a no-op (safe default stands).
-    return resolved ? { ok: true } : { ok: false, error: 'no_pending_request' };
+    if (resolved) return { ok: true };
+    // Review fix 3: distinguish "runtime could not receive the answer"
+    // (retryable — keep the modal open) from an already-settled request
+    // (closing the modal late is a harmless no-op; safe default stands).
+    return approvals.hasPending(requestId)
+      ? { ok: false, error: 'runtime_unreachable' }
+      : { ok: false, error: 'no_pending_request' };
   });
 
   /* ---- Runtime Logs (§33) ---- */
@@ -486,7 +490,9 @@ async function main(): Promise<void> {
     crash: crashSnapshot(),
     lastError: client.state === 'crashed'
       ? redactSecrets(manager.recentStderr.split('\n').filter(Boolean).at(-1) ?? '', settings.allSecrets()) || null
-      : lastRuntimeError
+      : client.lastStartupError !== null && lastRuntimeError === null
+        ? redactSecrets(client.lastStartupError, settings.allSecrets())
+        : lastRuntimeError
   });
 
   registerIpcHandlers({

@@ -192,3 +192,171 @@ describe('ApprovalService — modal path', () => {
     h.service.detach();
   });
 });
+
+describe('ApprovalService — grant binding (review fix 1)', () => {
+  const INSIDE_OK = { needsAuthorization: false, unverifiable: false };
+
+  it('does NOT replay a session grant across different paths (同工具同命令、不同路径)', async () => {
+    const h = makeService({ checkPaths: async () => INSIDE_OK });
+    // Grant a path-bound edit operation.
+    const first = h.service.handleApprovalRequired(
+      frame({
+        approval_id: 'a1',
+        tool: 'edit_file',
+        command: undefined,
+        risk_level: 'L1',
+        paths: ['/ws/src/a.txt']
+      })
+    );
+    await Promise.resolve();
+    expect(h.pushed).toHaveLength(1);
+    h.service.resolveRequest(h.pushed[0]!.requestId, { decision: 'allow', scope: 'session' });
+    await expect(first).resolves.toBe('allowed');
+
+    // Same tool, same (absent) command, DIFFERENT path → must prompt again,
+    // never silently reuse the earlier grant.
+    const second = h.service.handleApprovalRequired(
+      frame({
+        approval_id: 'a2',
+        tool: 'edit_file',
+        command: undefined,
+        risk_level: 'L1',
+        paths: ['/ws/src/b.txt']
+      })
+    );
+    await Promise.resolve();
+    expect(h.pushed).toHaveLength(2); // reached the renderer, not short-circuited
+    expect(h.service.pendingCount).toBe(1);
+    h.service.resolveRequest(h.pushed[1]!.requestId, { decision: 'reject', scope: 'once' });
+    await expect(second).resolves.toBe('rejected');
+  });
+
+  it('re-evaluates the boundary on every cache hit — 先内后外', async () => {
+    const verdicts = [INSIDE_OK, { needsAuthorization: true, unverifiable: false }];
+    const h = makeService({
+      checkPaths: async () => verdicts.shift() ?? INSIDE_OK
+    });
+    const mk = (id: string): ApprovalRequiredEventFrame =>
+      frame({ approval_id: id, tool: 'shell', command: 'cat notes.md', risk_level: 'L1', paths: ['/ws/notes.md'] });
+
+    const first = h.service.handleApprovalRequired(mk('a1'));
+    await Promise.resolve();
+    h.service.resolveRequest(h.pushed[0]!.requestId, { decision: 'allow', scope: 'session' });
+    await expect(first).resolves.toBe('allowed');
+
+    // IDENTICAL key hits the cache — but the fresh boundary verdict now
+    // flags the target as outside the workspace, so the grant must NOT
+    // bypass the check: the user is asked again.
+    const second = h.service.handleApprovalRequired(mk('a2'));
+    await Promise.resolve();
+    expect(h.pushed).toHaveLength(2);
+    expect(h.pushed[1]!.needsBoundaryAuthorization).toBe(true);
+    expect(h.respondCalls.filter((c) => c.scope === 'session')).toHaveLength(1); // only the original
+    h.service.resolveRequest(h.pushed[1]!.requestId, { decision: 'allow', scope: 'once' });
+    await expect(second).resolves.toBe('allowed');
+  });
+
+  it('normalizes equivalent path spellings into one grant key', async () => {
+    const h = makeService({ checkPaths: async () => INSIDE_OK });
+    const mk = (id: string, p: string): ApprovalRequiredEventFrame =>
+      frame({ approval_id: id, tool: 'edit_file', command: undefined, risk_level: 'L1', paths: [p] });
+
+    const first = h.service.handleApprovalRequired(mk('a1', '/ws/src/a.txt'));
+    await Promise.resolve();
+    h.service.resolveRequest(h.pushed[0]!.requestId, { decision: 'allow', scope: 'session' });
+    await expect(first).resolves.toBe('allowed');
+
+    // Trailing slash / duplicate separators denote the SAME file → grant applies.
+    const second = await h.service.handleApprovalRequired(mk('a2', '//ws/src/a.txt///'));
+    expect(second).toBe('allowed');
+    expect(h.pushed).toHaveLength(1); // no second prompt
+    expect(h.respondCalls[1]).toEqual({ approvalId: 'a2', decision: 'allow', scope: 'session' });
+  });
+});
+
+describe('ApprovalService — send-failure semantics (review fix 3)', () => {
+  interface Ctx {
+    service: ApprovalService;
+    calls: Array<{ approvalId: string; decision: string; scope: string }>;
+    setHealthy: (v: boolean) => void;
+    resolved: Array<{ approvalId: string; outcome: string; viaModal: boolean }>;
+    notices: Array<{ kind: string; [k: string]: unknown }>;
+  }
+  function makeFailingService(over: Partial<ConstructorParameters<typeof ApprovalService>[0]> = {}): Ctx {
+    const calls: Ctx['calls'] = [];
+    let healthy = false;
+    const ctx: Ctx = {
+      calls,
+      setHealthy: (v) => {
+        healthy = v;
+      },
+      resolved: [],
+      notices: [],
+      service: null as unknown as ApprovalService
+    };
+    ctx.service = new ApprovalService({
+      respond: (input) => {
+        calls.push(input);
+        return healthy;
+      },
+      getMode: () => 'ask',
+      notifyRenderer: () => undefined,
+      ...over
+    });
+    ctx.service.on('resolved', (r) => ctx.resolved.push(r));
+    ctx.service.on('notice', (n) => ctx.notices.push(n as Ctx['notices'][number]));
+    return ctx;
+  }
+
+  it('keeps a modal request retryable when the runtime cannot receive the answer', async () => {
+    const ctx = makeFailingService();
+    const p = ctx.service.handleApprovalRequired(frame({ approval_id: 'a1' }));
+    await Promise.resolve();
+    const requestId = ctx.service.listPending()[0]!.requestId;
+
+    // Delivery fails: nothing consumed, nothing cached, no success reported.
+    expect(ctx.service.resolveRequest(requestId, { decision: 'allow', scope: 'session' })).toBe(false);
+    expect(ctx.calls).toEqual([{ approvalId: 'a1', decision: 'allow', scope: 'session' }]);
+    expect(ctx.service.pendingCount).toBe(1);
+    expect(ctx.resolved).toEqual([]);
+    expect(ctx.notices).toContainEqual(
+      expect.objectContaining({ kind: 'respond_failed', approvalId: 'a1', reason: 'runtime_unreachable' })
+    );
+
+    // Runtime recovers → the SAME request retries successfully and ONLY NOW
+    // is the session grant earned.
+    ctx.setHealthy(true);
+    expect(ctx.service.resolveRequest(requestId, { decision: 'allow', scope: 'session' })).toBe(true);
+    await expect(p).resolves.toBe('allowed');
+    expect(ctx.resolved).toEqual([{ approvalId: 'a1', outcome: 'allowed', viaModal: true }]);
+    const replay = await ctx.service.handleApprovalRequired(frame({ approval_id: 'a2' }));
+    expect(replay).toBe('allowed'); // grant valid after confirmed delivery
+    expect(ctx.service.pendingCount).toBe(0);
+  });
+
+  it('treats an undeliverable auto-deny as reported-but-not-resolved', async () => {
+    const ctx = makeFailingService({
+      checkPaths: async () => ({ needsAuthorization: false, unverifiable: true })
+    });
+    const outcome = await ctx.service.handleApprovalRequired(frame({ paths: ['link-bomb'] }));
+    expect(outcome).toBe('auto_denied'); // matrix decided…
+    expect(ctx.resolved).toEqual([]); // …but no success was reported upstream
+    expect(ctx.notices).toContainEqual(expect.objectContaining({ kind: 'respond_failed' }));
+    expect(ctx.notices).not.toContainEqual(expect.objectContaining({ kind: 'auto_denied' }));
+  });
+
+  it('drops a timed-out modal whose rejection cannot be delivered (no zombie pendings)', async () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = makeFailingService({ timeoutMs: 1000 });
+      const p = ctx.service.handleApprovalRequired(frame({ approval_id: 'a1' }));
+      await vi.advanceTimersByTimeAsync(1100);
+      await expect(p).resolves.toBe('rejected');
+      expect(ctx.service.pendingCount).toBe(0);
+      expect(ctx.resolved).toEqual([]); // still no fabricated success
+      expect(ctx.notices).toContainEqual(expect.objectContaining({ kind: 'respond_failed' }));
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 10_000);
+});

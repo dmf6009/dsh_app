@@ -19,6 +19,7 @@ import type {
 } from '../../../shared/approval-protocol';
 import type { RuntimeEventFrame } from '../../../shared/protocol/types';
 import { ApprovalModal } from '../components/ApprovalModal';
+import { useMediaQuery } from '../hooks/use-media-query';
 import { Button, Spinner } from '../components/ui';
 import {
   INITIAL_MODEL,
@@ -184,6 +185,61 @@ export default function WorkspacePage(): JSX.Element {
     // Unlock happens only when run_cancelled arrives (AC-11).
   }, [dispatch]);
 
+  /* ---- responsive drawers (#5) ---------------------------------------
+   * Below 960px the side columns become off-canvas drawers: the middle
+   * column and the composer always own the viewport so Stop / 停止中 stay
+   * fully visible, focusable and clickable at every window size. Toggles
+   * expose an accessible name and expanded state; Esc / backdrop closes and
+   * focus returns to the opening toggle. The Approval modal keeps its own
+   * focus trap and Esc=Reject — the drawer Esc handler stands down while it
+   * is open.
+   */
+  const narrow = useMediaQuery('(max-width: 960px)');
+  const [drawer, setDrawer] = useState<'sessions' | 'changes' | null>(null);
+  const sessionsPanelRef = useRef<HTMLElement>(null);
+  const changesPanelRef = useRef<HTMLElement>(null);
+  const sessionsToggleRef = useRef<HTMLButtonElement>(null);
+  const changesToggleRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<'sessions' | 'changes' | null>(null);
+  drawerRef.current = drawer;
+
+  useEffect(() => {
+    if (!narrow) setDrawer(null);
+  }, [narrow]);
+
+  const openDrawer = useCallback((side: 'sessions' | 'changes'): void => {
+    setDrawer(side);
+  }, []);
+
+  // Move focus into the freshly opened drawer after React commits the
+  // off-canvas -> visible class swap (a rAF can fire before that commit,
+  // and focus() silently no-ops on a visibility:hidden element).
+  useEffect(() => {
+    if (drawer === null) return;
+    (drawer === 'sessions' ? sessionsPanelRef : changesPanelRef).current?.focus();
+  }, [drawer]);
+
+  const closeDrawer = useCallback((restoreFocus: boolean): void => {
+    const current = drawerRef.current;
+    if (current === null) return;
+    setDrawer(null);
+    if (restoreFocus) {
+      (current === 'sessions' ? sessionsToggleRef : changesToggleRef).current?.focus();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!narrow || drawer === null || approval !== null) return;
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        closeDrawer(true);
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [narrow, drawer, approval, closeDrawer]);
+
   const respondApproval = useCallback(
     async (requestId: string, decision: 'allow' | 'reject', scope: 'once' | 'session'): Promise<void> => {
       setApprovalSendError(null);
@@ -225,7 +281,13 @@ export default function WorkspacePage(): JSX.Element {
   return (
     <div className="page page-workspace">
       {/* ---------------- Left: sessions ---------------- */}
-      <aside className="col col-sessions" aria-label="Sessions">
+      <aside
+        ref={sessionsPanelRef}
+        id="sessions-panel"
+        tabIndex={drawer === 'sessions' ? -1 : undefined}
+        className={`col col-sessions${drawer === 'sessions' ? ' drawer-open' : ''}`}
+        aria-label="Sessions"
+      >
         <h2 className="panel-title">Sessions</h2>
         <ul className="session-list">
           {sessions.map((s) => (
@@ -242,6 +304,44 @@ export default function WorkspacePage(): JSX.Element {
       {/* ---------------- Middle: conversation ---------------- */}
       <section className="col col-chat" aria-label="Conversation">
         <header className="chat-header">
+          {narrow && (
+            <div className="drawer-toggles">
+              <button
+                ref={sessionsToggleRef}
+                type="button"
+                data-side="sessions"
+                className={`btn btn-secondary sidebar-toggle${
+                  drawer === 'sessions' ? ' sidebar-toggle-active' : ''
+                }`}
+                aria-expanded={drawer === 'sessions'}
+                aria-controls="sessions-panel"
+                aria-label="会话列表"
+                title="会话列表"
+                onClick={() =>
+                  drawer === 'sessions' ? closeDrawer(true) : openDrawer('sessions')
+                }
+              >
+                ☰ 会话
+              </button>
+              <button
+                ref={changesToggleRef}
+                type="button"
+                data-side="changes"
+                className={`btn btn-secondary sidebar-toggle${
+                  drawer === 'changes' ? ' sidebar-toggle-active' : ''
+                }`}
+                aria-expanded={drawer === 'changes'}
+                aria-controls="changes-panel"
+                aria-label="变更列表"
+                title="变更列表"
+                onClick={() =>
+                  drawer === 'changes' ? closeDrawer(true) : openDrawer('changes')
+                }
+              >
+                ▤ 变更
+              </button>
+            </div>
+          )}
           <span className={statePillClass}>
             <span className="pill-dot" aria-hidden="true" />
             {STATE_LABEL[connection]}
@@ -344,7 +444,13 @@ export default function WorkspacePage(): JSX.Element {
       </section>
 
       {/* ---------------- Right: changes ---------------- */}
-      <aside className="col col-changes" aria-label="Changes">
+      <aside
+        ref={changesPanelRef}
+        id="changes-panel"
+        tabIndex={drawer === 'changes' ? -1 : undefined}
+        className={`col col-changes${drawer === 'changes' ? ' drawer-open' : ''}`}
+        aria-label="Changes"
+      >
         <h2 className="panel-title">Changes</h2>
         {model.changes.length === 0 ? (
           <p className="empty-hint">本次会话还没有文件变更。变更由 file_changed 事件驱动，真实 Diff 视图见后续阶段。</p>
@@ -361,6 +467,13 @@ export default function WorkspacePage(): JSX.Element {
         <p className="changes-note">变更列表按事件顺序排列；点击条目查看 Diff 的能力由 P1-C 提供。</p>
       </aside>
 
+      {narrow && drawer !== null && (
+        <div
+          className="workspace-drawer-backdrop"
+          onClick={() => closeDrawer(false)}
+          aria-hidden="true"
+        />
+      )}
       {approvalNotice !== null && (
         <div className="oob-banner approval-notice-banner" role="alert">
           <span>✕ {approvalNotice}</span>

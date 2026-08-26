@@ -97,12 +97,27 @@ export function normalizeEventPath(root: string | null, rawPath: string): string
   return cleaned;
 }
 
-/** Canonical partition key for a workspace root (P1: per-root isolation). */
+/**
+ * Canonical partition key for a workspace root (P1: per-root isolation).
+ *
+ * Uses realpath semantics (NOT `path.resolve`, which is lexical): a symlinked
+ * spelling and the real spelling of the SAME physical workspace must land in
+ * the SAME partition, so event records, the read ledger, the cache and
+ * in-flight reconciles are shared — never split across two views of one
+ * workspace. realpath resolves symlinks and Windows junction/reparse points.
+ *
+ * Degradation: a root that cannot be verified (missing/unreadable) is keyed
+ * under a `unverifiable:` prefix derived from its lexical absolute path. Such
+ * a key can never collide with a verified real-root key, so it fails closed —
+ * it neither shares state with a verified partition nor pollutes one.
+ */
 function canonicalRootKey(root: string | null): string {
-  // path.resolve collapses aliases to one normalized absolute spelling. This
-  // partitions event records, the read ledger, the cache and in-flight
-  // reconciles per workspace, so switching A→B never leaks A's state into B.
-  return root ? path.resolve(root) : '<none>';
+  if (!root) return '<none>';
+  try {
+    return fs.realpathSync(root);
+  } catch {
+    return `unverifiable:${path.resolve(root)}`;
+  }
 }
 
 /** All mutable state bound to ONE workspace root. */

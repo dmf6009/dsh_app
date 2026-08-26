@@ -21,6 +21,21 @@ import type { ChangeRecord } from '../src/shared/changes';
 
 let root = '';
 
+/** True when the platform allows creating symlinks (Linux/macOS; some CI). */
+const HAS_SYMLINKS = (() => {
+  try {
+    const t = path.join(os.tmpdir(), `dsh-crs-sym-${process.pid}`);
+    fs.writeFileSync(t, '');
+    const l = `${t}-l`;
+    fs.symlinkSync(t, l);
+    fs.unlinkSync(l);
+    fs.unlinkSync(t);
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
 function git(args: string[]): void {
   execFileSync('git', args, { cwd: root });
 }
@@ -403,6 +418,69 @@ describe('root isolation (P1 review fix)', () => {
       expect(fs.readFileSync(path.join(rootB, 'notes.txt'), 'utf8')).toBe("B's own data\n");
     } finally {
       fs.rmSync(rootB, { recursive: true, force: true });
+    }
+  });
+
+  it('symlink root and real root of the SAME workspace share one partition (canonical key)', async () => {
+    if (!HAS_SYMLINKS) return;
+    const linkRoot = path.join(os.tmpdir(), `dsh-crs-canon-${process.pid}`);
+    fs.rmSync(linkRoot, { force: true });
+    fs.symlinkSync(root, linkRoot);
+    try {
+      const s = svc();
+      // Event via the symlink spelling, read via the real spelling.
+      s.onRuntimeEvent(fileChanged('shared.txt', 'modified'), linkRoot);
+      s.onRuntimeEvent({ v: 1, type: 'file_read', path: 'shared-read.ts' }, root);
+
+      // Same physical workspace ⇒ same partition (records + ledger shared).
+      expect(s.eventRecordCount(linkRoot)).toBe(1);
+      expect(s.eventRecordCount(root)).toBe(1);
+      expect(s.readLedger(root)).toContain('shared-read.ts');
+      expect(s.readLedger(linkRoot)).toContain('shared-read.ts');
+
+      // Cache shared: reconcile via one spelling, peek via the other.
+      await s.reconcile(linkRoot);
+      const cachedViaReal = s.peekSnapshot(root);
+      expect(cachedViaReal.records.map((r) => r.path)).toContain('shared.txt');
+      // Reconcile via the real spelling returns the same partition's records.
+      const again = await s.reconcile(root);
+      expect(again.records.map((r) => r.path)).toContain('shared.txt');
+    } finally {
+      fs.rmSync(linkRoot, { force: true });
+    }
+  });
+
+  it('same physical workspace: in-flight reconcile is shared across spellings', async () => {
+    if (!HAS_SYMLINKS) return;
+    const linkRoot = path.join(os.tmpdir(), `dsh-crs-inflight-${process.pid}`);
+    fs.rmSync(linkRoot, { force: true });
+    fs.symlinkSync(root, linkRoot);
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      let blocked = false;
+      const runGit: GitRunner = (r, args, opts) => {
+        if (!blocked) {
+          blocked = true; // hold the FIRST git call (of the shared reconcile)
+          return gate.then(() => defaultGitRunner(r, args, opts));
+        }
+        return defaultGitRunner(r, args, opts);
+      };
+      const s = new ChangeRecordService({ runGit });
+      s.onRuntimeEvent(fileChanged('in-flight.txt', 'modified'), linkRoot);
+
+      const pViaLink = s.reconcile(linkRoot); // in-flight, blocked on the gate
+      // Real spelling shares the SAME key ⇒ shares the in-flight promise.
+      const pViaReal = s.reconcile(root);
+      release!();
+      const a = await pViaLink;
+      const b = await pViaReal;
+      expect(a.generatedAt).toBe(b.generatedAt); // one reconcile, not two
+      expect(a.records.map((r) => r.path)).toContain('in-flight.txt');
+    } finally {
+      fs.rmSync(linkRoot, { force: true });
     }
   });
 });

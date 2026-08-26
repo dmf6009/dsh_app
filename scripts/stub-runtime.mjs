@@ -513,9 +513,17 @@ if (process.env.STUB_GARBAGE_STDOUT === '1') {
   process.stdout.write('this is not json at all\n{"v": 1, "type": "run_\n');
 }
 
-emit({
-  type: 'ready',
-  profile: 'desktop-stub',
-  pid: process.pid,
-  dsh_version: 'stub-0.1.0'
-});
+// Test hooks (review fix 2): STUB_EXIT_BEFORE_READY dies before any frame;
+// STUB_SILENT stays alive reading stdin but never emits `ready`.
+if (truthyEnv('STUB_EXIT_BEFORE_READY')) {
+  process.exit(7);
+}
+const SILENT = truthyEnv('STUB_SILENT');
+if (!SILENT) {
+  emit({
+    type: 'ready',
+    profile: 'desktop-stub',
+    pid: process.pid,
+    dsh_version: 'stub-0.1.0'
+  });
+}

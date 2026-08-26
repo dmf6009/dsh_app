@@ -53,7 +53,7 @@ describe('RuntimeClient — lifecycle', () => {
     expect(client.state).toBe('stopped');
   });
 
-  it('start() rejects and lands in crashed when the command cannot spawn', async () => {
+  it('start() rejects with a recoverable state + diagnostics when the command cannot spawn', async () => {
     const manager = makeStubManager({
       command: '/no/such/binary',
       args: []
@@ -62,13 +62,60 @@ describe('RuntimeClient — lifecycle', () => {
     clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
 
     await expect(client.start()).rejects.toThrow(/failed to start|ENOENT|spawn/i);
-    expect(client.state).toBe('crashed');
-    // Recovery: pointing at the stub works again from the same client.
+    // Review fix 2: never stuck in `starting`; lands in the clean retryable
+    // state with the diagnostic preserved for the startup-failure banner.
+    expect(client.state).toBe('stopped');
+    expect(client.lastStartupError).toMatch(/failed to start|ENOENT|spawn/i);
+    // Retry is not blocked by a stale `starting` guard.
+    await expect(client.start()).rejects.toThrow(/failed to start|ENOENT|spawn/i);
+    expect(client.state).toBe('stopped');
+    // Recovery: pointing at the stub works again from the same client shape.
     // (manager options are immutable; build a fresh one to prove restartability
     // of the flow itself.)
     const recovered = makeClient();
     await recovered.client.start();
     expect(recovered.client.state).toBe('ready');
+    expect(recovered.client.lastStartupError).toBeNull();
+  }, 20_000);
+
+  // Review fix 2 (生命周期阻断): process alive but NEVER ready — start() must
+  // reject on the ready timeout, stop the surviving child, land in a
+  // recoverable state and keep diagnostics; retry must be possible.
+  it('start() recovers when the process stays alive but never becomes ready', async () => {
+    const manager = makeStubManager({ env: { STUB_SILENT: '1' } });
+    const client = new RuntimeClient(manager, { readyTimeoutMs: 600 });
+    clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
+
+    await expect(client.start()).rejects.toThrow(/did not become ready within 600ms/);
+    expect(client.state).toBe('stopped'); // recoverable, NOT stuck in starting
+    expect(client.lastStartupError).toMatch(/did not become ready/);
+    // The surviving-but-not-ready child was cleaned up.
+    await until(() => manager.currentState === 'idle', 5_000, 'silent child reaped');
+
+    // Retry path: a new attempt actually spawns again (not blocked by the
+    // old `starting` guard) and fails cleanly the same way.
+    await expect(client.start()).rejects.toThrow(/did not become ready within 600ms/);
+    expect(client.state).toBe('stopped');
+  }, 20_000);
+
+  // Review fix 2: exit BEFORE ready — rejects fast, keeps crash semantics
+  // (the child really died) and stays retryable instead of wedging start().
+  it('start() is retryable after the runtime exits before becoming ready', async () => {
+    const manager = makeStubManager({ env: { STUB_EXIT_BEFORE_READY: '1' } });
+    const client = new RuntimeClient(manager, { readyTimeoutMs: 8_000 });
+    clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
+
+    await expect(client.start()).rejects.toThrow(/exited before becoming ready/);
+    expect(['crashed', 'stopped']).toContain(client.state); // recoverable either way
+    expect(client.lastStartupError).toMatch(/exited before becoming ready/);
+    await until(
+      () => manager.currentState === 'exited' || manager.currentState === 'idle',
+      5_000,
+      'dead child reaped'
+    );
+
+    // Retry attempts a fresh spawn rather than being rejected by lifecycle guards.
+    await expect(client.start()).rejects.toThrow(/exited before becoming ready/);
   }, 20_000);
 });
 

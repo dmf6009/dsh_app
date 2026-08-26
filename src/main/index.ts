@@ -40,7 +40,7 @@ import {
 } from './runtime/orphan-recovery';
 import type { BusMessage } from './runtime/event-bus';
 import type { ApprovalResolution, RuntimeCrashSnapshot } from '../shared/desktop-api';
-import type { ApprovalReply, ApprovalRequestPayload } from '../shared/approval-protocol';
+import type { ApprovalReply } from '../shared/approval-protocol';
 
 const isSmokeMode = process.env.DSH_SMOKE === '1';
 

@@ -52,24 +52,11 @@ export interface PendingRequest {
   timer?: NodeJS.Timeout;
 }
 
-export declare interface ApprovalService {
-  on(event: 'request-created', listener: (payload: ApprovalRequestPayload) => void): this;
-  on(
-    event: 'resolved',
-    listener: (result: {
-      approvalId: string;
-      outcome: ApprovalOutcome;
-      viaModal: boolean;
-    }) => void
-  ): this;
-  on(event: 'notice', listener: (notice: { kind: 'auto_denied'; reasons: string[] }) => void): this;
-  emit(event: 'request-created', payload: ApprovalRequestPayload): boolean;
-  emit(
-    event: 'resolved',
-    result: { approvalId: string; outcome: ApprovalOutcome; viaModal: boolean }
-  ): boolean;
-  emit(event: 'notice', notice: { kind: 'auto_denied'; reasons: string[] }): boolean;
-}
+/** Typed notification payloads (see `emitNotice` / `notify*` helpers). */
+export type ApprovalServiceEvent =
+  | { event: 'request-created'; payload: ApprovalRequestPayload }
+  | { event: 'resolved'; result: { approvalId: string; outcome: ApprovalOutcome; viaModal: boolean } }
+  | { event: 'notice'; notice: { kind: 'auto_denied'; reasons: string[] } };
 
 function grantKeyOf(tool: string | undefined, command: string | undefined): string {
   return `${tool ?? ''}\u0000${command ?? ''}`;

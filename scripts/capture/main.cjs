@@ -1,15 +1,20 @@
 /**
- * Capture harness for the Diff page acceptance evidence (DSHA-6 P1-2).
+ * Capture + hard-assertion harness for the Diff page acceptance evidence
+ * (DSHA-6 P1-2 / UI-UE review).
  *
- * Boots the BUILT renderer in Electron with a stub `window.desktop` (see
- * ./preload.cjs), navigates to the Diff page and captures, at 500x400 /
- * 700x500 / 1280x800, screenshots + element-bounds JSON for the normal /
- * binary / empty states and the Revert Stage-1 / Stage-2 / busy flow.
+ * Boots the BUILT renderer in Electron with a stub `window.desktop`
+ * (./preload.cjs), navigates to the Diff page, and for each scenario captures
+ * a screenshot + element-bounds JSON and runs HARD assertions. ANY unmet
+ * acceptance requirement is reported per-scene with the field/values and the
+ * process exits non-zero (no false-green).
  *
- * Headless-only evidence (Xvfb): it does NOT substitute for a real-desktop
- * 100%/125% DPI manual walkthrough — that remains an explicit regression
- * boundary (see issue reply). No real runtime, no git, no writes outside
- * docs/acceptance/dsha-6/.
+ * Coverage matrix (each at 500x400, 700x500, 1280x800):
+ *   normal, binary, empty, Revert Stage-1, Revert Stage-2, Revert busy+guard,
+ *   Revert cancel → focus restore.
+ *
+ * Headless-only evidence (Xvfb): does NOT substitute for a real-desktop
+ * 100%/125% DPI manual walkthrough — that stays an explicit regression
+ * boundary. No real runtime, no git, no writes outside docs/acceptance/dsha-6/.
  *
  * Run:  xvfb-run -a node scripts/capture/main.cjs   (or npm run capture:diff)
  */
@@ -51,6 +56,7 @@ const BOUNDS_JS = `(() => {
     fileList: rect('.diff-files'),
     monacoHost: rect('.diff-monaco-host'),
     empty: rect('.diff-empty'),
+    diffStatus: !!document.querySelector('.diff-status'),
     dialog: rect('.confirm-dialog'),
     actionBtns,
     activeText: ae ? (ae.textContent || '').trim().slice(0, 40) : null,
@@ -63,13 +69,42 @@ const BOUNDS_JS = `(() => {
   };
 })()`;
 
-let win = null;
-let error = null;
+const SELECT_FIRST = `(() => { document.querySelector('.diff-files .change-btn')?.click(); return true; })()`;
+const SELECT_BINARY = `(() => { [...document.querySelectorAll('.diff-files .change-btn')].find(b => (b.textContent||'').includes('logo.bin'))?.click(); return true; })()`;
+const OPEN_REVERT = `(() => { const b = [...document.querySelectorAll('.diff-actions button')].find(x => (x.textContent||'').includes('恢复')); b?.focus(); b?.click(); return true; })()`;
+const GO_STAGE2 = `(() => { [...document.querySelectorAll('.confirm-actions button')].find(b => (b.textContent||'').includes('继续'))?.click(); return true; })()`;
+const GO_CONFIRM = `(() => { [...document.querySelectorAll('.confirm-actions button')].find(b => (b.textContent||'').includes('确认'))?.click(); return true; })()`;
+const ESCAPE_TRY = `(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })); return true; })()`;
+const CLICK_BACKDROP = `(() => { document.querySelector('.confirm-backdrop')?.click(); return true; })()`;
+const CANCEL_DIALOG = `(() => { [...document.querySelectorAll('.confirm-actions button')].find(b => (b.textContent||'').includes('取消'))?.click(); return true; })()`;
+const NAV_DIFF = `(() => { [...document.querySelectorAll('.nav-btn')].find(b => (b.textContent||'').includes('Diff'))?.click(); return true; })()`;
 
-async function shoot({ label, w, h, state, actions, wait }) {
+let win = null;
+const allFailures = [];
+
+function pushFailures(scene, list) {
+  for (const f of list) {
+    allFailures.push(`[${scene}] ${f}`);
+  }
+}
+
+function overlapCheck(btns) {
+  const out = [];
+  for (let i = 0; i < btns.length; i += 1) {
+    for (let j = i + 1; j < btns.length; j += 1) {
+      const a = btns[i];
+      const b = btns[j];
+      const intersect =
+        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+      if (intersect) out.push(`${a.text || a.x} ↔ ${b.text || b.x}`);
+    }
+  }
+  return out;
+}
+
+async function shoot(scene) {
+  const { label, w, h, state, actions, wait, expect: expectFn } = scene;
   try {
-    // Fresh page per shot so a busy dialog / pending revert from a previous
-    // shot can never leak into this one.
     win.webContents.reload();
     await sleep(500);
     win.webContents.send('capture:state', state);
@@ -86,25 +121,126 @@ async function shoot({ label, w, h, state, actions, wait }) {
     fs.writeFileSync(path.join(OUT, `${label}.png`), image.toPNG());
     const bounds = await win.webContents.executeJavaScript(BOUNDS_JS);
     fs.writeFileSync(path.join(OUT, `${label}.bounds.json`), JSON.stringify(bounds, null, 2));
+
+    const failures = expectFn(bounds);
+    pushFailures(label, failures);
+    const ok = failures.length === 0;
     console.log(
-      `[capture] ${label} @ ${w}x${h} noPageHScroll=${bounds.noPageHScroll} ` +
-        `toolbar=${!!bounds.toolbar} dialog=${bounds.dialogOpen} active="${bounds.activeText || ''}"`
+      `[capture] ${label} @ ${w}x${h} ${ok ? 'PASS' : 'FAIL'} ` +
+        `noPageHScroll=${bounds.noPageHScroll} dialog=${bounds.dialogOpen} active="${bounds.activeText || ''}"`
     );
+    return ok;
   } catch (err) {
-    error = err;
+    pushFailures(label, [`harness error: ${err && err.message ? err.message : err}`]);
     console.error(`[capture] FAILED ${label}:`, err && err.message ? err.message : err);
+    return false;
   }
 }
 
-const SELECT_FIRST = `(() => { document.querySelector('.diff-files .change-btn')?.click(); return true; })()`;
-const SELECT_BINARY = `(() => { [...document.querySelectorAll('.diff-files .change-btn')].find(b => (b.textContent||'').includes('logo.bin'))?.click(); return true; })()`;
-const OPEN_REVERT = `(() => { const b = [...document.querySelectorAll('.diff-actions button')].find(x => (x.textContent||'').includes('恢复')); b?.focus(); b?.click(); return true; })()`;
-const GO_STAGE2 = `(() => { [...document.querySelectorAll('.confirm-actions button')].find(b => (b.textContent||'').includes('继续'))?.click(); return true; })()`;
-const GO_CONFIRM = `(() => { [...document.querySelectorAll('.confirm-actions button')].find(b => (b.textContent||'').includes('确认'))?.click(); return true; })()`;
-const ESCAPE_TRY = `(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })); return true; })()`;
-const CLICK_BACKDROP = `(() => { document.querySelector('.confirm-backdrop')?.click(); return true; })()`;
-const CANCEL_DIALOG = `(() => { [...document.querySelectorAll('.confirm-actions button')].find(b => (b.textContent||'').includes('取消'))?.click(); return true; })()`;
-const NAV_DIFF = `(() => { [...document.querySelectorAll('.nav-btn')].find(b => (b.textContent||'').includes('Diff'))?.click(); return true; })()`;
+/* ---- assertion presets ---- */
+const noHScroll = (b) =>
+  b.noPageHScroll === true ? [] : [`noPageHScroll=false (page=${b.pageScrollWidth} client=${b.pageClientWidth})`];
+const toolbarVisible = (b) => (b.toolbar ? [] : ['toolbar not visible']);
+const noOverlap = (b) => {
+  const ov = overlapCheck(b.actionBtns);
+  return ov.length ? [`action buttons overlap: ${ov.join(', ')}`] : [];
+};
+
+const V = [
+  { w: 500, h: 400, tag: '500' },
+  { w: 700, h: 500, tag: '700' },
+  { w: 1280, h: 800, tag: '1280' }
+];
+
+const scenes = [];
+for (const { w, h, tag } of V) {
+  scenes.push(
+    {
+      label: `diff-normal-${tag}`,
+      w,
+      h,
+      state: { mode: 'normal' },
+      actions: [SELECT_FIRST],
+      expect: (b) => [...noHScroll(b), ...toolbarVisible(b), ...noOverlap(b)]
+    },
+    {
+      label: `diff-binary-${tag}`,
+      w,
+      h,
+      state: { mode: 'normal' },
+      actions: [SELECT_BINARY],
+      expect: (b) => [
+        ...noHScroll(b),
+        ...toolbarVisible(b),
+        ...(b.diffStatus ? [] : ['binary placeholder (.diff-status) not shown'])
+      ]
+    },
+    {
+      label: `diff-empty-${tag}`,
+      w,
+      h,
+      state: { mode: 'empty' },
+      expect: (b) => [...noHScroll(b), ...(b.empty ? [] : ['empty state not visible'])]
+    },
+    {
+      label: `revert-stage1-${tag}`,
+      w,
+      h,
+      state: { mode: 'normal' },
+      actions: [SELECT_FIRST, OPEN_REVERT],
+      expect: (b) => [
+        ...noHScroll(b),
+        ...toolbarVisible(b),
+        ...(b.dialogOpen ? [] : ['dialog not open']),
+        ...(b.activeIsCancel ? [] : ['Stage-1 focus not on cancel (active=' + (b.activeText || 'none') + ')'])
+      ]
+    },
+    {
+      label: `revert-stage2-${tag}`,
+      w,
+      h,
+      state: { mode: 'normal' },
+      actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2],
+      expect: (b) => [
+        ...noHScroll(b),
+        ...toolbarVisible(b),
+        ...(b.dialogOpen ? [] : ['dialog not open']),
+        ...(b.activeIsCancel ? ['Stage-2 focus still on cancel'] : []),
+        ...(b.activeText === '确认丢弃我的修改' ? [] : ['Stage-2 focus not on confirm (active=' + (b.activeText || 'none') + ')'])
+      ]
+    },
+    {
+      label: `revert-busy-guard-${tag}`,
+      w,
+      h,
+      state: { mode: 'normal', busyDelayMs: 4000 },
+      actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2, GO_CONFIRM, ESCAPE_TRY, CLICK_BACKDROP],
+      wait: 400,
+      expect: (b) => [
+        ...noHScroll(b),
+        ...toolbarVisible(b),
+        ...(b.dialogOpen ? [] : ['busy: dialog was dismissed by Esc/backdrop']),
+        ...(b.dialogBusy ? [] : ['busy: aria-busy not set']),
+        ...(b.confirmDisabled === true ? [] : ['busy: confirm button not disabled']),
+        ...(b.hasSpinner ? [] : ['busy: no spinner shown'])
+      ]
+    },
+    {
+      label: `revert-cancel-restore-${tag}`,
+      w,
+      h,
+      state: { mode: 'normal' },
+      actions: [SELECT_FIRST, OPEN_REVERT, CANCEL_DIALOG],
+      wait: 300,
+      expect: (b) => [
+        ...noHScroll(b),
+        ...toolbarVisible(b),
+        ...(b.dialogOpen ? ['cancel: dialog still open'] : []),
+        ...(b.activeText === '恢复此文件…' ? [] : ['focus not restored to trigger (active=' + (b.activeText || 'none') + ')'])
+      ]
+    }
+  );
+}
 
 app.disableHardwareAcceleration();
 
@@ -123,31 +259,33 @@ app.whenReady().then(async () => {
       offscreen: false
     }
   });
-
   await win.loadFile(INDEX);
   await sleep(300);
-  await win.webContents.executeJavaScript(NAV_DIFF);
-  await sleep(400);
 
-  // Normal diff state across the three required viewports.
-  await shoot({ label: 'diff-normal-1280', w: 1280, h: 800, state: { mode: 'normal' }, actions: [SELECT_FIRST] });
-  await shoot({ label: 'diff-normal-700', w: 700, h: 500, state: { mode: 'normal' }, actions: [SELECT_FIRST] });
-  await shoot({ label: 'diff-normal-500', w: 500, h: 400, state: { mode: 'normal' }, actions: [SELECT_FIRST] });
+  let passed = 0;
+  for (const scene of scenes) {
+    if (await shoot(scene)) passed += 1;
+  }
 
-  // Binary + empty states.
-  await shoot({ label: 'diff-binary-1280', w: 1280, h: 800, state: { mode: 'normal' }, actions: [SELECT_BINARY] });
-  await shoot({ label: 'diff-empty-1280', w: 1280, h: 800, state: { mode: 'empty' } });
-
-  // Revert two-step + busy flow.
-  await shoot({ label: 'revert-stage1-1280', w: 1280, h: 800, state: { mode: 'normal' }, actions: [SELECT_FIRST, OPEN_REVERT] });
-  await shoot({ label: 'revert-stage2-1280', w: 1280, h: 800, state: { mode: 'normal' }, actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2] });
-  await shoot({ label: 'revert-busy-1280', w: 1280, h: 800, state: { mode: 'normal', busyDelayMs: 4000 }, actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2, GO_CONFIRM], wait: 400 });
-  // While busy, Esc and backdrop click must NOT dismiss the dialog, the confirm
-  // button stays disabled with a spinner, and aria-busy is set.
-  await shoot({ label: 'revert-busy-guard-1280', w: 1280, h: 800, state: { mode: 'normal', busyDelayMs: 4000 }, actions: [SELECT_FIRST, OPEN_REVERT, GO_STAGE2, GO_CONFIRM, ESCAPE_TRY, CLICK_BACKDROP], wait: 400 });
-  // Focus restore after close: cancelling returns focus to the trigger button.
-  await shoot({ label: 'revert-cancel-restore-1280', w: 1280, h: 800, state: { mode: 'normal' }, actions: [SELECT_FIRST, OPEN_REVERT, CANCEL_DIALOG], wait: 300 });
-
-  console.log(error ? '[capture] DONE with errors' : '[capture] DONE ok');
-  app.exit(error ? 1 : 0);
+  console.log(`[capture] assertion gate: ${passed}/${scenes.length} scenarios passed`);
+  if (allFailures.length) {
+    console.log('[capture] FAILURES:');
+    for (const f of allFailures) console.log('  - ' + f);
+  }
+  fs.writeFileSync(
+    path.join(OUT, 'gate-summary.json'),
+    JSON.stringify(
+      {
+        scenarios: scenes.length,
+        passed,
+        failures: allFailures,
+        generatedAt: new Date().toISOString()
+      },
+      null,
+      2
+    )
+  );
+  const failed = allFailures.length > 0;
+  console.log(failed ? '[capture] DONE FAIL — non-zero exit' : '[capture] DONE ok');
+  app.exit(failed ? 1 : 0);
 });

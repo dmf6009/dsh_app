@@ -29,6 +29,7 @@
     "visible": true
   },
   "empty": null,
+  "diffStatus": false,
   "dialog": {
     "x": 400,
     "y": 274,

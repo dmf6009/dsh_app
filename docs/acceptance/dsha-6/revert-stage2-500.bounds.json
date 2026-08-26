@@ -30,7 +30,13 @@
   },
   "empty": null,
   "diffStatus": false,
-  "dialog": null,
+  "dialog": {
+    "x": 16,
+    "y": 74,
+    "w": 468,
+    "h": 251,
+    "visible": true
+  },
   "actionBtns": [
     {
       "text": "↑ 上一个",
@@ -54,11 +60,11 @@
       "h": 28
     }
   ],
-  "activeText": "DSH DesktopHomeWorkspaceDiff ViewerRunti",
-  "activeClass": "enable-motion underline-links",
+  "activeText": "确认丢弃我的修改",
+  "activeClass": "btn btn-danger",
   "activeIsCancel": false,
-  "dialogOpen": false,
+  "dialogOpen": true,
   "dialogBusy": false,
-  "confirmDisabled": null,
+  "confirmDisabled": false,
   "hasSpinner": false
 }

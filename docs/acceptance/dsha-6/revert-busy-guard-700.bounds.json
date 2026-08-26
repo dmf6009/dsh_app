@@ -1,55 +1,61 @@
 {
   "viewport": {
-    "w": 1280,
-    "h": 800
+    "w": 700,
+    "h": 500
   },
   "noPageHScroll": true,
-  "pageScrollWidth": 1280,
-  "pageClientWidth": 1280,
-  "bodyScrollWidth": 1280,
+  "pageScrollWidth": 700,
+  "pageClientWidth": 700,
+  "bodyScrollWidth": 700,
   "toolbar": {
-    "x": 332,
-    "y": 107,
-    "w": 485,
+    "x": 20,
+    "y": 264,
+    "w": 507,
     "h": 28,
     "visible": true
   },
   "fileList": {
     "x": 20,
-    "y": 107,
-    "w": 300,
-    "h": 673,
+    "y": 105,
+    "w": 507,
+    "h": 151,
     "visible": true
   },
   "monacoHost": {
-    "x": 332,
-    "y": 187,
-    "w": 485,
-    "h": 593,
+    "x": 20,
+    "y": 298,
+    "w": 507,
+    "h": 300,
     "visible": true
   },
   "empty": null,
-  "diffStatus": true,
-  "dialog": null,
+  "diffStatus": false,
+  "dialog": {
+    "x": 110,
+    "y": 124,
+    "w": 480,
+    "h": 251,
+    "visible": true
+  },
   "actionBtns": [
     {
       "text": "↑ 上一个",
-      "x": 499,
-      "y": 107,
+      "x": 208,
+      "y": 264,
       "w": 67,
       "h": 28
     },
     {
       "text": "↓ 下一个",
-      "x": 650,
-      "y": 107,
+      "x": 359,
+      "y": 264,
       "w": 67,
       "h": 28
     },
     {
       "text": "恢复此文件…",
-      "x": 723,
-      "y": 107,
+      "x": 433,
+      "y": 264,
       "w": 94,
       "h": 28
     }
@@ -57,8 +63,8 @@
   "activeText": "DSH DesktopHomeWorkspaceDiff ViewerRunti",
   "activeClass": "enable-motion underline-links",
   "activeIsCancel": false,
-  "dialogOpen": false,
-  "dialogBusy": false,
-  "confirmDisabled": null,
-  "hasSpinner": false
+  "dialogOpen": true,
+  "dialogBusy": true,
+  "confirmDisabled": true,
+  "hasSpinner": true
 }

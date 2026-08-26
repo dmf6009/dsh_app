@@ -1,18 +1,18 @@
 {
   "viewport": {
-    "w": 1280,
-    "h": 800
+    "w": 700,
+    "h": 500
   },
   "noPageHScroll": true,
-  "pageScrollWidth": 1280,
-  "pageClientWidth": 1280,
-  "bodyScrollWidth": 1280,
+  "pageScrollWidth": 700,
+  "pageClientWidth": 700,
+  "bodyScrollWidth": 700,
   "toolbar": null,
   "fileList": null,
   "monacoHost": null,
   "empty": {
     "x": 20,
-    "y": 107,
+    "y": 105,
     "w": 507,
     "h": 204,
     "visible": true

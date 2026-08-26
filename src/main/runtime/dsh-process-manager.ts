@@ -140,6 +140,11 @@ export class DshProcessManager extends EventEmitter {
     return this.stderrTail.toString();
   }
 
+  /** Details of the last child exit, or null if it has not exited yet. */
+  get exitInfo(): ExitInfo | null {
+    return this.lastExit;
+  }
+
   /**
    * Spawn the child process. Resolves once the OS-level spawn succeeded and
    * stdio is wired; application readiness is signaled separately by the

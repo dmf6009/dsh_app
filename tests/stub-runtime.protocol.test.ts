@@ -135,14 +135,8 @@ describe('stub runtime — protocol consistency', () => {
     const firstDeltaAt = idxOf('message_delta')[0]!;
     const lastDeltaAt = Math.max(...idxOf('message_delta'));
     const completedAt = idxOf('message_completed')[0]!;
-    const toolStartedAt = idxOf('tool_started')[0]!;
-    const firstToolOutputAt = idxOf('tool_output')[0]!;
-    const lastToolOutputAt = Math.max(...idxOf('tool_output'));
-    const toolCompletedAt = idxOf('tool_completed')[0]!;
     expect(startedAt).toBeLessThan(firstDeltaAt);
     expect(lastDeltaAt).toBeLessThan(completedAt);
-    expect(toolStartedAt).toBeLessThan(firstToolOutputAt);
-    expect(lastToolOutputAt).toBeLessThan(toolCompletedAt);
     expect(idxOf('done')).toEqual([types.length - 1]); // terminal & last
     expect(isTerminalEventType(h.frames.at(-1)!.type)).toBe(true);
 
@@ -157,21 +151,51 @@ describe('stub runtime — protocol consistency', () => {
     expect(streamed.length).toBeGreaterThan(0);
     expect(completed.content).toBe(streamed);
 
-    // Tool trio shares one tool_call_id and reports success.
+    // Every tool trio shares one tool_call_id with its outputs/completion,
+    // and each started call is closed exactly once (multiple trios per run
+    // are allowed — e.g. the shell + sub-agent demo steps).
     type WithToolCallId = { run_id?: string; tool_call_id?: string };
-    const startedToolId = (
-      h.frames.find((f) => f.type === 'tool_started')! as unknown as WithToolCallId
-    ).tool_call_id;
-    expect(typeof startedToolId).toBe('string');
+    const startedIds = h.frames
+      .filter((f) => f.type === 'tool_started')
+      .map((f) => (f as unknown as WithToolCallId).tool_call_id ?? '');
+    expect(startedIds.length).toBeGreaterThan(0);
+    const startedIdSet = new Set<string>(startedIds as string[]);
+    for (const id of startedIds) {
+      expect(typeof id).toBe('string');
+    }
+    // Per-call ordering: every trio runs started → outputs → completed.
+    const callIdOf = (frame: RuntimeEventFrame): string | undefined =>
+      (frame as unknown as WithToolCallId).tool_call_id;
+    for (const id of startedIds) {
+      const s = h.frames.findIndex((f) => f.type === 'tool_started' && callIdOf(f) === id);
+      const outs = h.frames
+        .map((f, i) => ({ f, i }))
+        .filter(({ f }) => f.type === 'tool_output' && callIdOf(f) === id)
+        .map(({ i }) => i);
+      const c = h.frames.findIndex((f) => f.type === 'tool_completed' && callIdOf(f) === id);
+      expect(s).toBeGreaterThanOrEqual(0);
+      expect(outs.length).toBeGreaterThan(0);
+      expect(c).toBeGreaterThanOrEqual(0);
+      expect(s).toBeLessThan(outs[0]!);
+      expect(Math.max(...outs)).toBeLessThan(c);
+    }
+    const completionsByCall = new Map<string, string[]>();
     for (const frame of h.frames) {
       if (frame.type === 'tool_output' || frame.type === 'tool_completed') {
-        expect((frame as unknown as WithToolCallId).tool_call_id).toBe(startedToolId);
+        const callId = (frame as unknown as WithToolCallId).tool_call_id ?? '';
+        expect(startedIdSet.has(callId)).toBe(true);
+        if (frame.type === 'tool_completed') {
+          const list = completionsByCall.get(callId) ?? [];
+          list.push((frame as unknown as { status?: string }).status ?? '');
+          completionsByCall.set(callId, list);
+        }
       }
     }
-    const toolCompleted = h.frames.find((f) => f.type === 'tool_completed')! as unknown as {
-      status?: string;
-    };
-    expect(toolCompleted.status).toBe('ok');
+    for (const id of startedIds) {
+      const statuses = completionsByCall.get(id) ?? [];
+      expect(statuses).toHaveLength(1);
+      expect(statuses[0]).toBe('ok');
+    }
     expect(h.frames.find((f) => f.type === 'done')!.summary).toBeTruthy();
 
     // No decoder-level violations were produced by a well-behaved stub.

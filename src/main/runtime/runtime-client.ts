@@ -15,14 +15,24 @@ import { EventEmitter } from 'node:events';
 import type { DshProcessManager } from './dsh-process-manager';
 import {
   isTerminalEventType,
+  makeApprovalResponse,
   makeCancelCommand,
   makeRunCommand,
+  type ApprovalResponseCommandFrame,
   type CancelCommandFrame,
   type RunCommandFrame,
   type RuntimeEventFrame
 } from '../../shared/protocol/types';
 
 export type RuntimeConnectionState = 'stopped' | 'starting' | 'ready' | 'crashed';
+
+/** What the user sees when the runtime dies unexpectedly (§32). */
+export interface RuntimeCrashInfo {
+  code: number | null;
+  signal: string | null;
+  /** Raw stderr tail at crash time; redact before displaying. */
+  stderrTail: string;
+}
 
 export interface StartOptions {
   sessionId?: string;
@@ -54,6 +64,13 @@ export class RuntimeClient extends EventEmitter {
   /** True while an intentional stop() is in flight, so the resulting exit is
    * not mistaken for a runtime crash. */
   private stopping = false;
+  /**
+   * True while an intentional restart() is in flight. The old child exits
+   * during a restart; that exit must keep the "running" semantics (Phase 0
+   * memo ②) instead of flashing `crashed` before the replacement is ready.
+   */
+  private restarting = false;
+  private crashInfo: RuntimeCrashInfo | null = null;
   private readonly sessionId: string;
 
   constructor(private readonly manager: DshProcessManager, options: StartOptions = {}) {
@@ -78,13 +95,21 @@ export class RuntimeClient extends EventEmitter {
     return this.connectionState === 'ready';
   }
 
+  /** Details of the most recent crash, or null while the runtime is healthy.
+   * Cleared once a replacement process reports ready. */
+  get lastCrash(): RuntimeCrashInfo | null {
+    return this.connectionState === 'crashed' ? this.crashInfo : null;
+  }
+
   /** Spawn the runtime process and wait for its `ready` frame. */
   async start(): Promise<void> {
     if (this.connectionState === 'ready' || this.connectionState === 'starting') return;
+    if (this.connectionState !== 'crashed') this.crashInfo = null;
     this.setConnectionState('starting');
     try {
       await this.manager.start();
     } catch (err) {
+      this.captureCrash();
       this.setConnectionState('crashed');
       throw err;
     }
@@ -103,9 +128,24 @@ export class RuntimeClient extends EventEmitter {
     this.setConnectionState('stopped');
   }
 
+  /**
+   * Restart the runtime process. Session state lives in the renderer and is
+   * preserved across restarts — only the transport resets.
+   */
   async restart(): Promise<void> {
-    await this.manager.restart();
+    // Mark restarting BEFORE touching the manager so the old child's exit
+    // event cannot flip us to `crashed` mid-restart (no crash flash).
+    this.restarting = true;
     this.setConnectionState('starting');
+    try {
+      await this.manager.restart();
+    } catch (err) {
+      this.restarting = false;
+      this.captureCrash();
+      this.setConnectionState('crashed');
+      throw err;
+    }
+    this.restarting = false;
     await this.waitForReady();
   }
 
@@ -132,6 +172,18 @@ export class RuntimeClient extends EventEmitter {
     return this.manager.send(command);
   }
 
+  /**
+   * Answer an `approval_required` event. Returns false when the runtime
+   * cannot receive commands right now (caller decides how to surface it).
+   */
+  respondApproval(input: {
+    approvalId: string;
+    decision: 'allow' | 'reject';
+    scope: ApprovalResponseCommandFrame['scope'];
+  }): boolean {
+    return this.manager.send(makeApprovalResponse(input));
+  }
+
   /* ---------------------------------------------------------------- */
 
   private wireManager(): void {
@@ -139,16 +191,31 @@ export class RuntimeClient extends EventEmitter {
     this.manager.on('decode-error', (info) => this.emit('protocol-violation', info));
     this.manager.on('stderr', (text) => this.emit('stderr', text));
     this.manager.on('exit', () => {
-      if (!this.stopping && this.connectionState !== 'crashed' && this.connectionState !== 'stopped') {
+      // Intentional stop and mid-restart exits keep the connection semantics
+      // instead of reporting a crash.
+      if (this.stopping || this.restarting) return;
+      if (this.connectionState !== 'crashed' && this.connectionState !== 'stopped') {
+        this.captureCrash();
         this.setConnectionState('crashed');
       }
     });
+  }
+
+  /** Snapshot exit details + stderr tail for the §32 crash surface. */
+  private captureCrash(): void {
+    const exit = this.manager.exitInfo;
+    this.crashInfo = {
+      code: exit?.code ?? null,
+      signal: exit?.signal ?? null,
+      stderrTail: this.manager.recentStderr
+    };
   }
 
   private onFrame(raw: unknown): void {
     const frame = raw as RuntimeEventFrame;
     switch (frame.type) {
       case 'ready': {
+        this.crashInfo = null;
         this.setConnectionState('ready');
         break;
       }

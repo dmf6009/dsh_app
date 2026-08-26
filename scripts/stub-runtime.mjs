@@ -368,6 +368,48 @@ function buildRunSteps(runId, sessionId) {
       })
   });
 
+  // §9 Sub-Agent placeholder demo (P1-D will replace this with a real
+  // sub-agent surface; the desktop already renders the card from these
+  // frames).
+  const TASK_CALL_ID = `${TOOL_CALL_ID}-task`;
+  steps.push({
+    label: 'subagent_started',
+    frame: () => {
+      activeRun?.unfinishedTools.add(TASK_CALL_ID);
+      emit({
+        type: 'tool_started',
+        run_id: runId,
+        tool_call_id: TASK_CALL_ID,
+        tool: 'task',
+        command: '分析登录模块的会话依赖'
+      })
+    }
+  });
+  steps.push({
+    label: 'subagent_output',
+    frame: () =>
+      emit({
+        type: 'tool_output',
+        run_id: runId,
+        tool_call_id: TASK_CALL_ID,
+        content: '子任务进行中：已扫描 12 个相关文件',
+        stream: 'stdout'
+      })
+  });
+  steps.push({
+    label: 'subagent_completed',
+    frame: () => {
+      activeRun?.unfinishedTools.delete(TASK_CALL_ID);
+      emit({
+        type: 'tool_completed',
+        run_id: runId,
+        tool_call_id: TASK_CALL_ID,
+        status: 'ok',
+        summary: '确认 session 过期分支缺少异常保护（P1-D 提供完整子任务视图）'
+      })
+    }
+  });
+
   steps.push({
     label: 'done',
     frame: () =>

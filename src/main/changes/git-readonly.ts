@@ -337,11 +337,15 @@ async function synthesizeAddDiff(
   }
   const lines = content.toString('utf8').split('\n');
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  const rel = normalizeRel(relPath);
+  // A real @@ hunk header keeps the synthesized diff parseable by the
+  // renderer's unified parser and consistent with git's add-only output.
   const header =
-    `diff --git a/${normalizeRel(relPath)} b/${normalizeRel(relPath)}\n` +
+    `diff --git a/${rel} b/${rel}\n` +
     `new file mode 100644\n` +
     `--- /dev/null\n` +
-    `+++ b/${normalizeRel(relPath)}\n`;
+    `+++ b/${rel}\n` +
+    `@@ -0,0 +1,${lines.length} @@\n`;
   const bodySize = lines.reduce((acc, l) => acc + l.length + 2, 0);
   if (header.length + bodySize > MAX_SYNTH_DIFF_BYTES) {
     const budget = MAX_SYNTH_DIFF_BYTES - header.length;

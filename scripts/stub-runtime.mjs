@@ -27,8 +27,15 @@
  * - STUB_RESIDENT_CANCEL         keep process alive after cancel (default off)
  * - STUB_APPROVAL_FLOW           pause for approval mid-run (default off)
  * - STUB_EMIT_CANCELLED_TOOLS    close tools as cancelled on stop (default off)
+ * - DSH_STUB_TOUCH_FILES         write the demo files under
+ *                                `<workspace>/.dsh-stub-changes/` before the
+ *                                file_changed events fire, so the Changes /
+ *                                Diff pages show real readable content
+ *                                (DSHA-6 QA helper; default off)
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import process from 'node:process';
 
 const PROTOCOL_VERSION = 1;
@@ -37,6 +44,7 @@ const MAX_LINE_BYTES = positiveIntEnv('STUB_MAX_LINE_BYTES', 1024 * 1024);
 const RESIDENT_CANCEL = truthyEnv('STUB_RESIDENT_CANCEL');
 const APPROVAL_FLOW = truthyEnv('STUB_APPROVAL_FLOW');
 const EMIT_CANCELLED_TOOLS = truthyEnv('STUB_EMIT_CANCELLED_TOOLS');
+const TOUCH_FILES = truthyEnv('DSH_STUB_TOUCH_FILES');
 
 const CANNED_ANSWER =
   '登录接口偶发 500 的原因已定位：session 校验在过期分支直接抛出未捕获异常。' +
@@ -62,6 +70,59 @@ function truthyEnv(name) {
 function emit(frame) {
   const line = `${JSON.stringify({ v: PROTOCOL_VERSION, ...frame })}\n`;
   process.stdout.write(line);
+}
+
+/* ------------------------------------------------------------------ */
+/* DSHA-6 QA helper: real files behind the demo file_changed events.    */
+/* ------------------------------------------------------------------ */
+
+let stubWorkspace; // captured from the inbound run command
+
+const STUB_FILES = [
+  {
+    rel: '.dsh-stub-changes/src/auth/login.py',
+    body: [
+      '"""Session login helpers (stub demo file)."""\n',
+      'import logging\n',
+      '\n',
+      'LOG = logging.getLogger(__name__)\n',
+      '\n',
+      '\n',
+      'def authenticate(session_id: str) -> str:\n',
+      '    if not session_id:\n',
+      "        raise ValueError('session_id is required')\n",
+      '    # DSHA-6 stub change: expired sessions now redirect instead of raising.\n',
+      '    return redirect_to_login(session_id)\n'
+    ].join('\n')
+  },
+  {
+    rel: '.dsh-stub-changes/tests/test_login_session.py',
+    body: [
+      '"""Regression tests for expired session handling (stub demo file)."""\n',
+      'from auth.login import authenticate\n',
+      '\n',
+      '\n',
+      'def test_empty_session_rejected():\n',
+      '    try:\n',
+      "        authenticate('')\n",
+      '    except ValueError:\n',
+      '        pass\n'
+    ].join('\n')
+  }
+];
+
+/** Write demo files into the run workspace (best effort, never fatal). */
+function touchStubFiles() {
+  if (!TOUCH_FILES || typeof stubWorkspace !== 'string' || stubWorkspace === '') return;
+  for (const file of STUB_FILES) {
+    try {
+      const abs = path.join(stubWorkspace, file.rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, `${file.body}\n`, 'utf8');
+    } catch {
+      // The stub must keep streaming events even on a read-only workspace.
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -157,6 +218,7 @@ function startRun(frame) {
   }
   const runId = typeof frame.run_id === 'string' ? frame.run_id : `stub-run-${Date.now()}`;
   const sessionId = typeof frame.session_id === 'string' ? frame.session_id : undefined;
+  stubWorkspace = typeof frame.workspace === 'string' ? frame.workspace : undefined;
 
   activeRun = {
     id: runId,
@@ -356,16 +418,20 @@ function buildRunSteps(runId, sessionId) {
     }
   });
 
-  // Changes column demo data.
+  // Changes column demo data. With DSH_STUB_TOUCH_FILES=1 the matching files
+  // are written under <workspace>/.dsh-stub-changes/ first so the Diff page
+  // can render real unified content (DSHA-6).
   steps.push({
     label: 'file_changed_modified',
-    frame: () =>
+    frame: () => {
+      touchStubFiles();
       emit({
         type: 'file_changed',
         run_id: runId,
         path: 'src/auth/login.py',
         change: 'modified'
       })
+    }
   });
   steps.push({
     label: 'file_changed_added',

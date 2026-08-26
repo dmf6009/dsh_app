@@ -37,7 +37,7 @@ function makeSource(): { source: FakeSource; clientLike: FakeClient } {
   };
 }
 
-type FakeClient = Parameters<typeof RuntimeEventBus.prototype.accept>[0];
+type FakeClient = ConstructorParameters<typeof RuntimeEventBus>[0];
 
 function frame(partial: Partial<RuntimeEventFrame> & { type: string }): RuntimeEventFrame {
   return { v: 1, ...partial } as unknown as RuntimeEventFrame;

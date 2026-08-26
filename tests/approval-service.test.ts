@@ -88,7 +88,7 @@ describe('ApprovalService — non-modal paths', () => {
     // First prompt → user answers "Allow" with session scope.
     const firstPromise = h.service.handleApprovalRequired(frame({ approval_id: 'a1' }));
     expect(h.service.pendingCount).toBe(1);
-    h.service.resolveRequest([...h.service.listPending()][0].requestId, {
+    h.service.resolveRequest([...h.service.listPending()][0]!.requestId, {
       decision: 'allow',
       scope: 'session'
     });
@@ -107,7 +107,7 @@ describe('ApprovalService — non-modal paths', () => {
     const p = h.service.handleApprovalRequired(
       frame({ approval_id: 'a1', command: 'npm run lint', risk_level: 'L1' })
     );
-    h.service.resolveRequest([...h.service.listPending()][0].requestId, {
+    h.service.resolveRequest([...h.service.listPending()][0]!.requestId, {
       decision: 'allow',
       scope: 'session'
     });
@@ -118,8 +118,8 @@ describe('ApprovalService — non-modal paths', () => {
     );
     // L2 still prompts even though another command was granted.
     expect(h.pushed).toHaveLength(2);
-    expect(h.pushed[1].command).toBe('rm -rf build/');
-    h.service.resolveRequest(h.pushed[1].requestId, { decision: 'reject', scope: 'once' });
+    expect(h.pushed[1]!.command).toBe('rm -rf build/');
+    h.service.resolveRequest(h.pushed[1]!.requestId, { decision: 'reject', scope: 'once' });
     await expect(second).resolves.toBe('rejected');
   });
 });
@@ -134,11 +134,11 @@ describe('ApprovalService — modal path', () => {
       await Promise.resolve(); // let the handler reach the modal branch
 
       expect(h.pushed).toHaveLength(1);
-      expect(h.pushed[0].level).toBe('L2');
-      expect(h.pushed[0].command).toBe('rm -rf build/');
+      expect(h.pushed[0]!.level).toBe('L2');
+      expect(h.pushed[0]!.command).toBe('rm -rf build/');
       expect(h.service.pendingCount).toBe(1);
 
-      h.service.resolveRequest(h.pushed[0].requestId, { decision: 'reject', scope: 'once' });
+      h.service.resolveRequest(h.pushed[0]!.requestId, { decision: 'reject', scope: 'once' });
       await expect(outcomePromise).resolves.toBe('rejected');
       expect(h.respondCalls).toEqual([
         { approvalId: `apr-${mode}`, decision: 'reject', scope: 'once' }
@@ -156,7 +156,7 @@ describe('ApprovalService — modal path', () => {
     await Promise.resolve();
     expect(h.service.resolveRequest('nope', { decision: 'allow', scope: 'once' })).toBe(false);
 
-    h.service.resolveRequest(h.pushed[0].requestId, { decision: 'allow', scope: 'once' });
+    h.service.resolveRequest(h.pushed[0]!.requestId, { decision: 'allow', scope: 'once' });
     await expect(p).resolves.toBe('allowed');
     expect(resolved).toEqual([{ approvalId: 'apr-1', outcome: 'allowed', viaModal: true }]);
   });
@@ -186,7 +186,7 @@ describe('ApprovalService — modal path', () => {
     expect(h.service.pendingCount).toBe(1);
 
     // Cleanup path.
-    h.service.resolveRequest(h.pushed[0].requestId, { decision: 'reject', scope: 'once' });
+    h.service.resolveRequest(h.pushed[0]!.requestId, { decision: 'reject', scope: 'once' });
     h.bus.emitToBus({ kind: 'violation', info: { reason: 'json_parse_error' } });
     expect(h.service.pendingCount).toBe(0);
     h.service.detach();

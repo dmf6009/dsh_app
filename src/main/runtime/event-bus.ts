@@ -22,14 +22,10 @@
 
 import { EventEmitter } from 'node:events';
 
-import type { RuntimeEventFrame } from '../../shared/protocol/types';
+import type { ProtocolViolationInfo, RuntimeEventFrame } from '../../shared/protocol/types';
 import { isTerminalEventType } from '../../shared/protocol/types';
 
-export interface ProtocolViolationInfo {
-  reason: string;
-  detail?: string;
-  preview?: string;
-}
+export type { ProtocolViolationInfo };
 
 export type BusMessage =
   | { kind: 'event'; seq: number; frame: RuntimeEventFrame }

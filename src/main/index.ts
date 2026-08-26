@@ -28,11 +28,29 @@ import { WorkspaceManager } from './workspace';
 import type { OpenProjectResult } from '../shared/workspace';
 import { DshProcessManager } from './runtime/dsh-process-manager';
 import { RuntimeClient } from './runtime/runtime-client';
+import { RuntimeEventBus } from './runtime/event-bus';
+import { RuntimeLogStore } from './runtime/runtime-log';
+import { ApprovalService } from './approval/approval-service';
+import {
+  claimRuntimePidFile,
+  defaultTerminate,
+  readLinuxCommandLine,
+  recoverOrphanRuntime,
+  releaseRuntimePidFile
+} from './runtime/orphan-recovery';
+import type { BusMessage } from './runtime/event-bus';
+import type { ApprovalResolution, RuntimeCrashSnapshot } from '../shared/desktop-api';
+import type { ApprovalReply, ApprovalRequestPayload } from '../shared/approval-protocol';
 
 const isSmokeMode = process.env.DSH_SMOKE === '1';
 
 /** Number of recent stderr bytes kept for the Settings → DSH viewer (§32). */
 const STDERR_TAIL_LIMIT = 16 * 1024;
+
+/** Pid file used for orphan cleanup across desktop restarts (P0-7 同口径). */
+function runtimePidFile(home: string): string {
+  return path.join(home, '.dsh', 'desktop', 'runtime.pid');
+}
 
 interface RuntimeCommandSpec {
   command: string;
@@ -113,9 +131,11 @@ function registerIpcHandlers(context: {
   status: () => RuntimeStatus;
   workspaces: WorkspaceManager;
   settings: SettingsStore;
+  approvals: ApprovalService;
+  getLogTail: (category?: 'stdout' | 'stderr' | 'event' | 'tool' | 'model') => string;
   getWindow: () => BrowserWindow | null;
 }): void {
-  const { client, status, workspaces, settings, getWindow } = context;
+  const { client, status, workspaces, settings, approvals, getLogTail, getWindow } = context;
 
   ipcMain.handle('runtime:get-status', () => status());
   ipcMain.handle('runtime:start', async () => {
@@ -148,6 +168,36 @@ function registerIpcHandlers(context: {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   });
+
+  /* ---- Approval (DSHA-5 §12/§13) ---- */
+
+  ipcMain.handle('approval:respond', (_event, requestId: unknown, reply: unknown) => {
+    if (typeof requestId !== 'string' || typeof reply !== 'object' || reply === null) {
+      return { ok: false, error: '参数无效' };
+    }
+    const candidate = reply as Partial<ApprovalReply>;
+    const decision =
+      candidate.decision === 'allow' ? 'allow' : candidate.decision === 'reject' ? 'reject' : null;
+    const scope = candidate.scope === 'session' ? 'session' : 'once';
+    if (decision === null) {
+      return { ok: false, error: '参数无效' };
+    }
+    const resolved = approvals.resolveRequest(requestId, { decision, scope });
+    // Closing the modal or answering an already-settled request is not an
+    // error for the user — it is simply a no-op (safe default stands).
+    return resolved ? { ok: true } : { ok: false, error: 'no_pending_request' };
+  });
+
+  /* ---- Runtime Logs (§33) ---- */
+
+  ipcMain.handle('runtime:get-log-tail', (_event, category: unknown): string =>
+    getLogTail(
+      category === 'stdout' || category === 'stderr' || category === 'event'
+        || category === 'tool' || category === 'model'
+        ? category
+        : undefined
+    )
+  );
 
   /* ---- Home / workspace ---- */
 
@@ -285,17 +335,52 @@ async function main(): Promise<void> {
 
   // Compiled output lives at dist/main/index.js → repo root is ../../..
   const appRoot = path.resolve(__dirname, '..', '..');
-  const { manager, spec } = createManager(appRoot);
-  const client = new RuntimeClient(manager);
 
   // Desktop-owned stores live under ~/.dsh so all product state is together.
   const home = app.getPath('home');
+  const pidFile = runtimePidFile(home);
+
+  // P0-7 同口径：clean up a runtime orphaned by an earlier hard crash before
+  // spawning anything new. Foreign processes are never touched.
+  try {
+    const recovery = await recoverOrphanRuntime({
+      pidFile,
+      isAlive: (pid) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      readCommandLine: readLinuxCommandLine,
+      terminate: defaultTerminate()
+    });
+    if (recovery.action !== 'none') {
+      console.log(`[runtime] orphan recovery: ${JSON.stringify(recovery)}`);
+    }
+  } catch (err) {
+    console.error('[runtime] orphan recovery failed:', err instanceof Error ? err.message : err);
+  }
+
+  const { manager, spec } = createManager(appRoot);
+  const client = new RuntimeClient(manager);
+
   const secretSource: { current: SecretSource } = { current: () => [] };
   const settings = new SettingsStore({
     home,
     log: (line) => console.log(`[settings] ${redactSecrets(line, secretSource.current())}`)
   });
   secretSource.current = () => settings.allSecrets();
+
+  // §33 Runtime Logs — the single redaction choke point for everything the
+  // desktop records about the runtime conversation.
+  const logStore = new RuntimeLogStore(() => settings.allSecrets(), { home });
+
+  // AC-08 ordered bus between the client and every consumer (renderer,
+  // approval service, logs).
+  const bus = new RuntimeEventBus(client);
+
   const workspaces = new WorkspaceManager({
     home,
     selectDirectory: async () => {
@@ -311,24 +396,97 @@ async function main(): Promise<void> {
 
   const broadcastState = (state: ConnectionState): void => {
     mainWindow?.webContents.send('runtime:connection-state', state);
+    // §32 crash recovery: record the pid claim lifecycle alongside state.
+    if (state === 'ready') {
+      const pid = manager.pid;
+      if (pid !== undefined) {
+        void claimRuntimePidFile(pidFile, {
+          pid,
+          command: [spec.command, ...spec.args].join(' ')
+        }).catch(() => undefined);
+      }
+    }
+    if (state === 'stopped') {
+      void releaseRuntimePidFile(pidFile).catch(() => undefined);
+    }
   };
   client.on('connection-state', broadcastState);
-  client.on('event', (frame: RuntimeEventFrame) => {
+
+  // Ordered, de-duplicated fan-out (AC-08): the renderer and the log store
+  // only ever see bus messages, never raw client events.
+  let lastRuntimeError: string | null = null;
+  bus.subscribe((message: BusMessage) => {
+    if (message.kind === 'violation') {
+      mainWindow?.webContents.send('runtime:protocol-violation', message.info);
+      return;
+    }
+    const frame = message.frame;
+    logStore.appendEvent(frame);
+    if (frame.type === 'error' && typeof (frame as { message?: unknown }).message === 'string') {
+      // Error text is redacted before it is ever stored or displayed.
+      lastRuntimeError = String((frame as { message?: string }).message);
+    }
     mainWindow?.webContents.send('runtime:event', frame);
   });
+
   client.on('stderr', (text: string) => {
     stderrTail = (stderrTail + text).slice(-STDERR_TAIL_LIMIT);
+    // Raw stderr also lands in the runtime log — append() applies redaction.
+    logStore.append('stderr', text);
     if (process.env.DSH_DEBUG) {
       process.stderr.write(`[dsh stderr] ${redactSecrets(text, settings.allSecrets())}`);
     }
   });
 
+  /* ---- Approval service wiring (§12/§13) ---- */
+
+  const approvals = new ApprovalService({
+    respond: (input) => client.respondApproval(input),
+    getMode: () => settings.view().permissionsMode,
+    checkPaths: async (paths) => {
+      const checks = await Promise.all(
+        paths.map(async (p) => {
+          try {
+            return await workspaces.boundary().check(p);
+          } catch {
+            return { allowed: false, needsAuthorization: false, resolvedPath: p } as const;
+          }
+        })
+      );
+      return {
+        needsAuthorization: checks.some((c) => c.needsAuthorization === true),
+        unverifiable: checks.some((c) => c.allowed === false && c.needsAuthorization !== true)
+      };
+    },
+    notifyRenderer: (payload) => mainWindow?.webContents.send('runtime:approval-request', payload)
+  });
+  approvals.attach(bus);
+  approvals.on(
+    'resolved',
+    (result: { approvalId: string; outcome: ApprovalResolution['outcome']; viaModal: boolean }) => {
+      mainWindow?.webContents.send('runtime:approval-resolved', result);
+    }
+  );
+
   const commandLine = [spec.command, ...spec.args].join(' ');
+  const crashSnapshot = (): RuntimeCrashSnapshot | null => {
+    const info = client.lastCrash;
+    if (!info && client.state !== 'crashed') return null;
+    const exit = manager.exitInfo;
+    return {
+      exitCode: info?.code ?? exit?.code ?? null,
+      signal: info?.signal ?? exit?.signal ?? null
+    };
+  };
   const status = (): RuntimeStatus => ({
     state: client.state,
     sessionId: client.state === 'stopped' ? null : client.currentSessionId,
     activeRunId: client.activeRun,
-    commandLine: spec.label ? `${commandLine}  (${spec.label})` : commandLine
+    commandLine: spec.label ? `${commandLine}  (${spec.label})` : commandLine,
+    crash: crashSnapshot(),
+    lastError: client.state === 'crashed'
+      ? redactSecrets(manager.recentStderr.split('\n').filter(Boolean).at(-1) ?? '', settings.allSecrets()) || null
+      : lastRuntimeError
   });
 
   registerIpcHandlers({
@@ -336,6 +494,9 @@ async function main(): Promise<void> {
     status,
     workspaces,
     settings,
+    approvals,
+    getLogTail: (category) =>
+      logStore.tail({ category, maxChars: 32 * 1024 }),
     getWindow: () => mainWindow
   });
 
@@ -366,6 +527,28 @@ async function main(): Promise<void> {
       app.exit(1);
     }
   }
+
+  /* ---- Graceful shutdown (P0-7 同口径 / §32) ---- */
+
+  app.on('window-all-closed', () => {
+    app.quit();
+  });
+
+  let shuttingDown = false;
+  app.on('before-quit', (event) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    event.preventDefault();
+    // Stop the runtime first so the child sees a graceful exit and the pid
+    // claim is released; then flush the runtime log and leave.
+    void client
+      .stop()
+      .catch(() => undefined)
+      .then(() => releaseRuntimePidFile(pidFile).catch(() => undefined))
+      .then(() => logStore.close())
+      .catch(() => undefined)
+      .finally(() => app.exit(0));
+  });
 }
 
 void main().catch((err) => {

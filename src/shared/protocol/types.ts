@@ -302,3 +302,14 @@ export function isProtocolEnvelope(value: unknown): value is { v: number; type: 
   const frame = value as Record<string, unknown>;
   return frame['v'] === PROTOCOL_VERSION && typeof frame['type'] === 'string';
 }
+
+/**
+ * Diagnostic describing one protocol violation detected on the stream
+ * (malformed JSON, bad envelope, unknown type…). Violations travel as data
+ * on the ordered bus instead of breaking the pipeline (DSHA-5, AC-08).
+ */
+export interface ProtocolViolationInfo {
+  reason: string;
+  detail?: string;
+  preview?: string;
+}

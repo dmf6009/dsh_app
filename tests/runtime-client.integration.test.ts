@@ -100,6 +100,36 @@ describe('RuntimeClient — lifecycle', () => {
 
   // Review fix 2: exit BEFORE ready — rejects fast, keeps crash semantics
   // (the child really died) and stays retryable instead of wedging start().
+  // Second-review fix (阻断项 1): during restart(), an exit of the NEW child
+  // before ready is a REAL crash — it must keep `crashed` semantics with the
+  // crash snapshot intact, never downgrade to `stopped`.
+  it('restart() keeps crash semantics when the replacement child exits before ready', async () => {
+    const manager = makeStubManager({ env: { STUB_EXIT_BEFORE_READY: '1' } });
+    const client = new RuntimeClient(manager, { readyTimeoutMs: 8_000 });
+    clients.push({ dispose: async () => { await manager.stop().catch(() => undefined); } });
+    const states: string[] = [];
+    client.on('connection-state', (st) => states.push(st));
+
+    // First start fails (exit-before-ready → crashed).
+    await expect(client.start()).rejects.toThrow(/exited before becoming ready/);
+    expect(client.state).toBe('crashed');
+
+    // Restart attempt: the replacement child really exits → genuine crash,
+    // NOT a `stopped` downgrade, WITH crash diagnostics preserved.
+    await expect(client.restart()).rejects.toThrow(/exited before becoming ready/);
+    await until(() => client.state === 'crashed', 5_000, 'restart lands in crashed');
+    expect(client.lastStartupError).toMatch(/exited before becoming ready/);
+    const crash = client.lastCrash;
+    expect(crash).not.toBeNull();
+    expect(crash?.code).toBe(7); // stub exits with process.exit(7)
+    expect(manager.exitInfo?.code).toBe(7);
+
+    // Retry can still be initiated afterwards (not wedged in starting).
+    await expect(client.restart()).rejects.toThrow(/exited before becoming ready/);
+    expect(states.filter((st) => st === 'starting')).toHaveLength(3);
+    expect(states).not.toContain('stopped');
+  }, 20_000);
+
   it('start() is retryable after the runtime exits before becoming ready', async () => {
     const manager = makeStubManager({ env: { STUB_EXIT_BEFORE_READY: '1' } });
     const client = new RuntimeClient(manager, { readyTimeoutMs: 8_000 });

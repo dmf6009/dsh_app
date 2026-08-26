@@ -81,6 +81,14 @@ export class RuntimeClient extends EventEmitter {
    * `crashed` — the failure already landed in a recoverable state.
    */
   private handshakeFailed = false;
+  /**
+   * True once the CURRENT handshake's child has actually been spawned.
+   * During a restart the OLD child's teardown exit is expected and must be
+   * ignored, but once the replacement process is live an exit-before-ready
+   * is a REAL crash of the new child and must keep `crashed` semantics +
+   * crash snapshot (review fix: they were being downgraded to `stopped`).
+   */
+  private handshakeChildLive = false;
   private readonly sessionId: string;
   private readonly readyTimeoutMs: number;
 
@@ -133,9 +141,11 @@ export class RuntimeClient extends EventEmitter {
     this.handshakeFailed = false;
     this.startupError = null;
     if (this.connectionState !== 'crashed') this.crashInfo = null;
+    this.handshakeChildLive = false;
     this.setConnectionState('starting');
     try {
       await this.manager.start();
+      this.handshakeChildLive = true;
       await this.waitForReady();
     } catch (err) {
       await this.recoverFromHandshakeFailure(err);
@@ -165,10 +175,14 @@ export class RuntimeClient extends EventEmitter {
     // event cannot flip us to `crashed` mid-restart (no crash flash).
     this.restarting = true;
     this.handshakeFailed = false;
+    this.handshakeChildLive = false;
     this.startupError = null;
     this.setConnectionState('starting');
     try {
       await this.manager.restart();
+      // Replacement child is spawned: from here its exit is a real crash,
+      // not the expected teardown of the old one.
+      this.handshakeChildLive = true;
       await this.waitForReady();
     } catch (err) {
       await this.recoverFromHandshakeFailure(err);
@@ -242,10 +256,13 @@ export class RuntimeClient extends EventEmitter {
     this.manager.on('decode-error', (info) => this.emit('protocol-violation', info));
     this.manager.on('stderr', (text) => this.emit('stderr', text));
     this.manager.on('exit', () => {
-      // Intentional stop, mid-restart exits, and cleanup after a failed
-      // ready handshake keep the connection semantics instead of reporting
-      // a crash.
-      if (this.stopping || this.restarting || this.handshakeFailed) return;
+      // Intentional stops and cleanup after a failed ready handshake keep
+      // the connection semantics instead of reporting a crash.
+      if (this.stopping || this.handshakeFailed) return;
+      // Mid-restart: ONLY the old child's teardown exit is expected. Once
+      // the replacement child is live (`handshakeChildLive`), an
+      // exit-before-ready is a genuine crash of the new process.
+      if (this.restarting && !this.handshakeChildLive) return;
       if (this.connectionState !== 'crashed' && this.connectionState !== 'stopped') {
         this.captureCrash();
         this.setConnectionState('crashed');

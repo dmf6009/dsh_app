@@ -64,6 +64,11 @@ export default function WorkspacePage(): JSX.Element {
   const [approval, setApproval] = useState<ApprovalRequestPayload | null>(null);
   /** Review fix 3: retryable send-failure banner while the modal stays open. */
   const [approvalSendError, setApprovalSendError] = useState<string | null>(null);
+  /**
+   * Second-review fix: push notice for auto-decision delivery failures.
+   * Dismissible; also cleared by the next approval event or user action.
+   */
+  const [approvalNotice, setApprovalNotice] = useState<string | null>(null);
   const [modelChoice, setModelChoice] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [sessions, setSessions] = useState<SessionEntry[]>([
@@ -95,6 +100,10 @@ export default function WorkspacePage(): JSX.Element {
     const offResolved = window.desktop.onApprovalResolved(() => {
       setApprovalSendError(null);
       setApproval(null);
+      setApprovalNotice(null);
+    });
+    const offApprovalNotice = window.desktop.onApprovalNotice((notice) => {
+      setApprovalNotice(notice.message);
     });
 
     void window.desktop.getStatus().then((initial) => {
@@ -127,6 +136,7 @@ export default function WorkspacePage(): JSX.Element {
       offState();
       offApproval();
       offResolved();
+      offApprovalNotice();
     };
   }, [dispatch]);
 
@@ -177,6 +187,7 @@ export default function WorkspacePage(): JSX.Element {
   const respondApproval = useCallback(
     async (requestId: string, decision: 'allow' | 'reject', scope: 'once' | 'session'): Promise<void> => {
       setApprovalSendError(null);
+      setApprovalNotice(null);
       const result = await window.desktop.respondApproval(requestId, { decision, scope });
       if (result.ok || result.error === 'no_pending_request') {
         // Delivered (or already settled elsewhere — safe default stands).
@@ -350,6 +361,18 @@ export default function WorkspacePage(): JSX.Element {
         <p className="changes-note">变更列表按事件顺序排列；点击条目查看 Diff 的能力由 P1-C 提供。</p>
       </aside>
 
+      {approvalNotice !== null && (
+        <div className="oob-banner approval-notice-banner" role="alert">
+          <span>✕ {approvalNotice}</span>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => setApprovalNotice(null)}
+          >
+            知道了
+          </button>
+        </div>
+      )}
       <ApprovalModal
         payload={approval}
         sendError={approvalSendError}

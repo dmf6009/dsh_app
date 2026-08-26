@@ -203,7 +203,17 @@ export class ApprovalService extends EventEmitter {
       const stillCovered =
         boundary?.needsAuthorization !== true && boundary?.unverifiable !== true;
       if (stillCovered) {
-        return this.autoRespond(approvalId, 'allow', 'session', 'allowed');
+        return this.autoRespond({
+          approvalId,
+          decision: 'allow',
+          scope: 'session',
+          outcome: 'allowed',
+          frame,
+          grantKey,
+          op,
+          boundary,
+          paths
+        });
       }
       // Grant exists but the target is no longer provably safe → fall
       // through to the full matrix and ask again.
@@ -213,15 +223,54 @@ export class ApprovalService extends EventEmitter {
     const evaluation = evaluateApproval(this.deps.getMode(), op, boundary);
 
     if (evaluation.decision === 'deny') {
-      return this.autoRespond(approvalId, 'reject', 'auto', 'auto_denied', evaluation.reasons);
+      return this.autoRespond({
+        approvalId,
+        decision: 'reject',
+        scope: 'auto',
+        outcome: 'auto_denied',
+        frame,
+        grantKey,
+        op,
+        boundary,
+        paths,
+        evaluation,
+        denyReasons: evaluation.reasons
+      });
     }
     if (evaluation.decision === 'allow') {
-      return this.autoRespond(approvalId, 'allow', 'auto', 'auto_allowed');
+      return this.autoRespond({
+        approvalId,
+        decision: 'allow',
+        scope: 'auto',
+        outcome: 'auto_allowed',
+        frame,
+        grantKey,
+        op,
+        boundary,
+        paths,
+        evaluation
+      });
     }
 
     // 4. Modal path: the promise settles when the renderer answers.
-    const requestId = randomUUID();
     const outsidePaths = boundary?.needsAuthorization === true ? paths.slice() : [];
+    return this.openPending(frame, approvalId, grantKey, evaluation, outsidePaths);
+  }
+
+  /**
+   * Open a pending modal request and wait for the renderer's answer.
+   * `extraReasons` (escalated auto-decision failures) are shown first so the
+   * user understands why a normally-automatic operation is asking.
+   */
+  private openPending(
+    frame: ApprovalRequiredEventFrame,
+    approvalId: string,
+    grantKey: string,
+    evaluation: ReturnType<typeof evaluateApproval>,
+    outsidePaths: readonly string[],
+    extraReasons: string[] = []
+  ): Promise<ApprovalOutcome> {
+    const requestId = randomUUID();
     const payload: ApprovalRequestPayload = {
       requestId,
       approvalId,
@@ -232,10 +281,10 @@ export class ApprovalService extends EventEmitter {
       level: evaluation.level,
       category: evaluation.category,
       needsBoundaryAuthorization: evaluation.needsBoundaryAuthorization,
-      outsidePaths,
-      reasons: evaluation.reasons
+      outsidePaths: [...outsidePaths],
+      reasons: [...extraReasons, ...evaluation.reasons]
     };
-    return await new Promise<ApprovalOutcome>((settle) => {
+    return new Promise<ApprovalOutcome>((settle) => {
       const entry: PendingRequest = {
         payload,
         grantKey,
@@ -274,31 +323,58 @@ export class ApprovalService extends EventEmitter {
 
   /**
    * Deliver an automatic decision (matrix allow/deny, cached session grant)
-   * to the runtime. Review fix 3: when delivery fails, NO success is
-   * reported — no `resolved` event, nothing settles — and a retryable
-   * `respond_failed` notice is emitted. The matrix outcome is still
-   * returned so callers can log/decide, with delivery state carried by the
-   * notice.
+   * to the runtime.
+   *
+   * Failure closure (second review): an undeliverable auto decision is NEVER
+   * recorded as resolved — no fabricated success, no grant write. Instead:
+   *   1. a retryable `respond_failed` notice is emitted, AND
+   *   2. the request escalates to a REAL pending prompt pushed to the
+   *      renderer (`notifyRenderer`), pre-annotated with what the system
+   *      intended and why it needs the user. The user's manual answer — or
+   *      the timeout safe-reject — then flows through the ordinary
+   *      resolveRequest pipeline, giving the failure a UI-visible follow-up
+   *      action instead of leaving the runtime waiting forever.
    */
-  private autoRespond(
-    approvalId: string,
-    decision: 'allow' | 'reject',
-    scope: 'once' | 'session' | 'auto',
-    outcome: ApprovalOutcome,
-    reasons?: string[]
-  ): ApprovalOutcome {
-    const sent = this.deps.respond({ approvalId, decision, scope });
-    if (!sent) {
-      this.emit('notice', {
-        kind: 'respond_failed',
-        approvalId,
-        reason: 'runtime_unreachable'
-      });
-      return outcome;
+  private async autoRespond(ctx: {
+    approvalId: string;
+    decision: 'allow' | 'reject';
+    scope: 'once' | 'session' | 'auto';
+    outcome: ApprovalOutcome;
+    frame: ApprovalRequiredEventFrame;
+    grantKey: string;
+    op: Parameters<typeof evaluateApproval>[1];
+    boundary?: BoundaryVerdict;
+    paths: readonly string[];
+    /** Pre-computed matrix result when the caller already ran it. */
+    evaluation?: ReturnType<typeof evaluateApproval>;
+    /** Matrix deny reasons (auto-deny only). */
+    denyReasons?: string[];
+  }): Promise<ApprovalOutcome> {
+    const sent = this.deps.respond({
+      approvalId: ctx.approvalId,
+      decision: ctx.decision,
+      scope: ctx.scope
+    });
+    if (sent) {
+      if (ctx.denyReasons) this.emit('notice', { kind: 'auto_denied', reasons: ctx.denyReasons });
+      this.emitResolved(ctx.approvalId, ctx.outcome, false);
+      return ctx.outcome;
     }
-    if (reasons) this.emit('notice', { kind: 'auto_denied', reasons });
-    this.emitResolved(approvalId, outcome, false);
-    return outcome;
+    this.emit('notice', {
+      kind: 'respond_failed',
+      approvalId: ctx.approvalId,
+      reason: 'runtime_unreachable'
+    });
+    const evaluation =
+      ctx.evaluation ?? evaluateApproval(this.deps.getMode(), ctx.op, ctx.boundary);
+    const outsidePaths = ctx.boundary?.needsAuthorization === true ? [...ctx.paths] : [];
+    const note =
+      ctx.decision === 'allow'
+        ? '系统此前判定自动允许该操作，但结果未能送达运行时；请手动确认允许或拒绝。'
+        : '系统此前判定自动拒绝该操作，但结果未能送达运行时；请手动确认允许或拒绝。';
+    return this.openPending(ctx.frame, ctx.approvalId, ctx.grantKey, evaluation, outsidePaths, [
+      note
+    ]);
   }
 
   private emitResolved(approvalId: string, outcome: ApprovalOutcome, viaModal: boolean): void {

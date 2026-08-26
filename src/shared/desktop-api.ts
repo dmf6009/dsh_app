@@ -41,6 +41,17 @@ export interface ApprovalResolution {
   viaModal: boolean;
 }
 
+/**
+ * Pushed when an approval decision could not be delivered to the runtime
+ * (second review fix). The affected request is escalated to a pending
+ * prompt — this notice makes the failure itself visible.
+ */
+export interface ApprovalDeliveryNotice {
+  approvalId: string;
+  reason: string;
+  message: string;
+}
+
 /** Result of probing for a DSH installation (§32/§38 startup chain). */
 export interface DshDetection {
   found: boolean;
@@ -70,6 +81,8 @@ export interface DesktopApi {
   /** Push channel for pending approval prompts. */
   onApprovalRequest(listener: (payload: ApprovalRequestPayload) => void): () => void;
   onApprovalResolved(listener: (resolution: ApprovalResolution) => void): () => void;
+  /** Push channel for approval delivery failures (retryable). */
+  onApprovalNotice(listener: (notice: ApprovalDeliveryNotice) => void): () => void;
 
   /* ---- Runtime Logs (§33) ---- */
   /** Tail of the redacted runtime log, optionally filtered by category. */

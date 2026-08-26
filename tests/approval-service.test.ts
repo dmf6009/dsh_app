@@ -334,15 +334,71 @@ describe('ApprovalService — send-failure semantics (review fix 3)', () => {
     expect(ctx.service.pendingCount).toBe(0);
   });
 
-  it('treats an undeliverable auto-deny as reported-but-not-resolved', async () => {
+  it('escalates an undeliverable auto-deny to a renderer-visible pending with follow-up', async () => {
+    // Second-review fix: the failure closure is a REAL pending prompt —
+    // renderer-visible via notifyRenderer, actionable by the user — never a
+    // silently recorded auto-resolution.
     const ctx = makeFailingService({
       checkPaths: async () => ({ needsAuthorization: false, unverifiable: true })
     });
-    const outcome = await ctx.service.handleApprovalRequired(frame({ paths: ['link-bomb'] }));
-    expect(outcome).toBe('auto_denied'); // matrix decided…
-    expect(ctx.resolved).toEqual([]); // …but no success was reported upstream
+    const outcomePromise = ctx.service.handleApprovalRequired(frame({ approval_id: 'a9', paths: ['link-bomb'] }));
+    await Promise.resolve();
+
+    // Renderer-visible failure with follow-up action:
+    expect(ctx.notices).toContainEqual(
+      expect.objectContaining({ kind: 'respond_failed', reason: 'runtime_unreachable' })
+    );
+    expect(ctx.service.pendingCount).toBe(1);
+    const escalated = [...ctx.service.listPending()][0]!;
+    expect(escalated.approvalId).toBe('a9');
+    expect(escalated.reasons[0]).toContain('未能送达运行时');
+    expect(ctx.resolved).toEqual([]); // NOT recorded as auto-resolved
+
+    // Runtime recovers → the user's manual answer closes the loop through
+    // the ordinary pipeline.
+    ctx.setHealthy(true);
+    ctx.service.resolveRequest(escalated.requestId, { decision: 'allow', scope: 'once' });
+    await expect(outcomePromise).resolves.toBe('allowed');
+    expect(ctx.calls).toEqual([
+      { approvalId: 'a9', decision: 'reject', scope: 'auto' }, // failed auto attempt
+      { approvalId: 'a9', decision: 'allow', scope: 'once' } // manual answer delivered
+    ]);
+    expect(ctx.resolved).toEqual([{ approvalId: 'a9', outcome: 'allowed', viaModal: true }]);
+  });
+
+  it('escalates a failed cached-grant replay the same way (same treatment for all auto paths)', async () => {
+    const INSIDE = { needsAuthorization: false, unverifiable: false };
+    const ctx = makeFailingService({ checkPaths: async () => INSIDE });
+    // Earn the grant while healthy.
+    ctx.setHealthy(true);
+    const first = ctx.service.handleApprovalRequired(frame({ approval_id: 'a1' }));
+    await Promise.resolve();
+    ctx.service.resolveRequest([...ctx.service.listPending()][0]!.requestId, {
+      decision: 'allow',
+      scope: 'session'
+    });
+    await expect(first).resolves.toBe('allowed');
+
+    // Runtime dies; identical replay must NOT fake an auto-allow…
+    ctx.setHealthy(false);
+    const second = ctx.service.handleApprovalRequired(frame({ approval_id: 'a2' }));
+    await Promise.resolve();
     expect(ctx.notices).toContainEqual(expect.objectContaining({ kind: 'respond_failed' }));
-    expect(ctx.notices).not.toContainEqual(expect.objectContaining({ kind: 'auto_denied' }));
+    expect(ctx.service.pendingCount).toBe(1);
+    expect([...ctx.service.listPending()][0]!.approvalId).toBe('a2');
+
+    // …but escalate to an actionable prompt whose answer really delivers.
+    ctx.setHealthy(true);
+    ctx.service.resolveRequest([...ctx.service.listPending()][0]!.requestId, {
+      decision: 'allow',
+      scope: 'session'
+    });
+    await expect(second).resolves.toBe('allowed');
+    expect(ctx.calls[ctx.calls.length - 1]).toEqual({
+      approvalId: 'a2',
+      decision: 'allow',
+      scope: 'session'
+    });
   });
 
   it('drops a timed-out modal whose rejection cannot be delivered (no zombie pendings)', async () => {

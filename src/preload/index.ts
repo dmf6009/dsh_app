@@ -7,6 +7,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
 import type {
+  ApprovalDeliveryNotice,
   ApprovalResolution,
   ConnectionState,
   DesktopApi,
@@ -53,6 +54,8 @@ const api: DesktopApi = {
     subscribe<ApprovalRequestPayload>('runtime:approval-request', listener),
   onApprovalResolved: (listener: (resolution: ApprovalResolution) => void): (() => void) =>
     subscribe<ApprovalResolution>('runtime:approval-resolved', listener),
+  onApprovalNotice: (listener: (notice: ApprovalDeliveryNotice) => void): (() => void) =>
+    subscribe<ApprovalDeliveryNotice>('runtime:approval-notice', listener),
 
   getRuntimeLogTail: (category?: 'stdout' | 'stderr' | 'event' | 'tool' | 'model'): Promise<string> =>
     ipcRenderer.invoke('runtime:get-log-tail', category),

@@ -471,6 +471,23 @@ async function main(): Promise<void> {
       mainWindow?.webContents.send('runtime:approval-resolved', result);
     }
   );
+  // Second-review fix: delivery failures must reach the UI. Auto decisions
+  // that could not be sent escalate to a pending prompt inside the service;
+  // this push keeps the renderer informed about the failure itself.
+  approvals.on(
+    'notice',
+    (notice: { kind: string; approvalId?: string; reason?: string }) => {
+      if (notice.kind !== 'respond_failed' || typeof notice.approvalId !== 'string') return;
+      mainWindow?.webContents.send('runtime:approval-notice', {
+        approvalId: notice.approvalId,
+        reason: notice.reason ?? 'runtime_unreachable',
+        message:
+          notice.reason === 'runtime_unreachable'
+            ? '审批结果未能送达运行时，请重试或在弹窗中手动处理。'
+            : '审批处理出现问题，请重试。'
+      });
+    }
+  );
 
   const commandLine = [spec.command, ...spec.args].join(' ');
   const crashSnapshot = (): RuntimeCrashSnapshot | null => {

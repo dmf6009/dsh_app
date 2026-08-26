@@ -1,0 +1,516 @@
+{
+  "generatedAt": "2026-08-26T05:06:28.201Z",
+  "approvalFlow": false,
+  "sizes": [
+    "500x400",
+    "700x500",
+    "1280x800"
+  ],
+  "results": [
+    {
+      "size": "500x400",
+      "scenario": "idle/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 500,
+        "clientW": 500,
+        "bodyScrollW": 500
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "idle/primary-action-in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 412,
+        "y": 340,
+        "w": 72,
+        "h": 44
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "idle/primary-action-focusable",
+      "ok": true,
+      "detail": {
+        "focusable": false,
+        "disabled": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-sessions/toggle-present",
+      "ok": true,
+      "detail": {
+        "present": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-sessions/opens-with-expanded-state",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-sessions/within-viewport",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-sessions/focus-moved-into-panel",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-sessions/esc-closes-and-focus-returns",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "offscreenOrHidden": true,
+        "ariaExpanded": false,
+        "focusReturnedToToggle": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-changes/toggle-present",
+      "ok": true,
+      "detail": {
+        "present": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-changes/opens-with-expanded-state",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-changes/within-viewport",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-changes/focus-moved-into-panel",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-changes/esc-closes-and-focus-returns",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "offscreenOrHidden": true,
+        "ariaExpanded": false,
+        "focusReturnedToToggle": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "running/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 500,
+        "clientW": 500,
+        "bodyScrollW": 500
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "running/primary-action-in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 412,
+        "y": 340,
+        "w": 72,
+        "h": 44
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "running/primary-action-focusable",
+      "ok": true,
+      "detail": {
+        "focusable": true,
+        "disabled": false
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "awaiting_cancel/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 500,
+        "innerW": 500
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "awaiting_cancel/in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 378,
+        "y": 340,
+        "w": 106,
+        "h": 44
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "awaiting_cancel/focusable-or-disabled",
+      "ok": true,
+      "detail": {
+        "focusable": false,
+        "disabled": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "idle/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 700,
+        "clientW": 700,
+        "bodyScrollW": 700
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "idle/primary-action-in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 612,
+        "y": 440,
+        "w": 72,
+        "h": 44
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "idle/primary-action-focusable",
+      "ok": true,
+      "detail": {
+        "focusable": false,
+        "disabled": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-sessions/toggle-present",
+      "ok": true,
+      "detail": {
+        "present": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-sessions/opens-with-expanded-state",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-sessions/within-viewport",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-sessions/focus-moved-into-panel",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-sessions/esc-closes-and-focus-returns",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "offscreenOrHidden": true,
+        "ariaExpanded": false,
+        "focusReturnedToToggle": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-changes/toggle-present",
+      "ok": true,
+      "detail": {
+        "present": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-changes/opens-with-expanded-state",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-changes/within-viewport",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-changes/focus-moved-into-panel",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "ariaExpanded": true,
+        "visible": true,
+        "withinViewport": true,
+        "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-changes/esc-closes-and-focus-returns",
+      "ok": true,
+      "detail": {
+        "present": true,
+        "offscreenOrHidden": true,
+        "ariaExpanded": false,
+        "focusReturnedToToggle": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "running/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 700,
+        "clientW": 700,
+        "bodyScrollW": 700
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "running/primary-action-in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 612,
+        "y": 440,
+        "w": 72,
+        "h": 44
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "running/primary-action-focusable",
+      "ok": true,
+      "detail": {
+        "focusable": true,
+        "disabled": false
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "awaiting_cancel/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 700,
+        "innerW": 700
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "awaiting_cancel/in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 578,
+        "y": 440,
+        "w": 106,
+        "h": 44
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "awaiting_cancel/focusable-or-disabled",
+      "ok": true,
+      "detail": {
+        "focusable": false,
+        "disabled": true
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "idle/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 1280,
+        "clientW": 1280,
+        "bodyScrollW": 1280
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "idle/primary-action-in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 952,
+        "y": 740,
+        "w": 72,
+        "h": 44
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "idle/primary-action-focusable",
+      "ok": true,
+      "detail": {
+        "focusable": false,
+        "disabled": true
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "wide/three-column-permanent",
+      "ok": true,
+      "detail": {
+        "sessions": {
+          "visible": true,
+          "withinViewport": true
+        },
+        "changes": {
+          "visible": true,
+          "withinViewport": true
+        },
+        "toggleCount": 0,
+        "backdropCount": 0
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "running/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 1280,
+        "clientW": 1280,
+        "bodyScrollW": 1280
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "running/primary-action-in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 952,
+        "y": 740,
+        "w": 72,
+        "h": 44
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "running/primary-action-focusable",
+      "ok": true,
+      "detail": {
+        "focusable": true,
+        "disabled": false
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "awaiting_cancel/no-horizontal-overflow",
+      "ok": true,
+      "detail": {
+        "scrollW": 1280,
+        "innerW": 1280
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "awaiting_cancel/in-viewport",
+      "ok": true,
+      "detail": {
+        "x": 918,
+        "y": 740,
+        "w": 106,
+        "h": 44
+      }
+    },
+    {
+      "size": "1280x800",
+      "scenario": "awaiting_cancel/focusable-or-disabled",
+      "ok": true,
+      "detail": {
+        "focusable": false,
+        "disabled": true
+      }
+    }
+  ],
+  "failures": []
+}

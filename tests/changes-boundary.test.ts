@@ -107,6 +107,30 @@ describe('P0: symlink boundary on the Diff read path', () => {
       expect(res.modified ?? '').not.toContain('DIR OUTSIDE SECRET');
     }
   });
+
+  it('untracked FILE symlink pointing outside does not leak (synthesizeAddDiff)', async () => {
+    if (!HAS_SYMLINKS) return;
+    git(['commit', '--allow-empty', '-m', 'seed']); // HEAD exists → add-diff path
+    const secret = path.join(outsideDir, 'untracked-secret.txt');
+    fs.writeFileSync(secret, 'UNTRACKED OUTSIDE SECRET\n');
+    fs.symlinkSync(secret, path.join(root, 'evil.py')); // untracked, never added
+
+    const res = await buildFileDiff(root, 'evil.py');
+    // Both worktree and synthesized unified must never contain outside bytes.
+    expect(res.modified ?? '').not.toContain('UNTRACKED OUTSIDE SECRET');
+    expect(res.unified ?? '').not.toContain('UNTRACKED OUTSIDE SECRET');
+  });
+
+  it('untracked DIRECTORY symlink pointing outside does not leak (synthesizeAddDiff)', async () => {
+    if (!HAS_SYMLINKS) return;
+    git(['commit', '--allow-empty', '-m', 'seed']);
+    fs.writeFileSync(path.join(outsideDir, 'leak2.txt'), 'UNTRACKED DIR SECRET\n');
+    fs.symlinkSync(outsideDir, path.join(root, 'linked2'));
+
+    const res = await buildFileDiff(root, 'linked2/leak2.txt');
+    expect(res.modified ?? '').not.toContain('UNTRACKED DIR SECRET');
+    expect(res.unified ?? '').not.toContain('UNTRACKED DIR SECRET');
+  });
 });
 
 describe('P0: symlink boundary on the Revert write/delete path', () => {

@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import type { ChangeKind } from '../../shared/changes';
+import { guardRead } from './boundary';
 
 /** Hard ceiling for diff text handed to the renderer (bytes). */
 export const MAX_DIFF_BYTES = 16 * 1024 * 1024;
@@ -317,6 +318,15 @@ async function synthesizeAddDiff(
   _run: GitRunner = defaultGitRunner
 ): Promise<UnifiedDiffResult | null> {
   const abs = safeResolve(root, relPath);
+  // Canonical boundary check (P0/QA-adjacent): untracked add-diff synthesis
+  // must never read through a file/dir symlink to outside the workspace.
+  // Fail closed — an out-of-bound target yields an empty (safe) unified diff,
+  // never leaked bytes.
+  try {
+    await guardRead(root, abs);
+  } catch {
+    return { unified: '', truncated: false, binary: false };
+  }
   let stat: fs.Stats;
   try {
     stat = fs.statSync(abs);

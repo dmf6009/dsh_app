@@ -49,7 +49,11 @@ export interface FileDiffResult {
   path: string;
   /** Unified diff text (`git diff HEAD -- <path>`), when readable. */
   unified?: string;
-  /** True when original content came back from HEAD (deleted/restored files). */
+  /** Pre-change text (HEAD blob / index fallback); '' when newly added. */
+  original?: string;
+  /** Current worktree text; '' when deleted. Absent for binaries. */
+  modified?: string;
+  /** True when the original side came from HEAD rather than the index. */
   originalFromHead?: boolean;
   /** True when the target is binary — line rendering refused by design. */
   binary?: boolean;

@@ -42,6 +42,9 @@ import {
 import type { BusMessage } from './runtime/event-bus';
 import type { ApprovalResolution, RuntimeCrashSnapshot } from '../shared/desktop-api';
 import type { ApprovalReply } from '../shared/approval-protocol';
+import type { ChangesSnapshot } from '../shared/changes';
+import { ChangeRecordService } from './changes/change-record-service';
+import { buildFileDiff } from './changes/file-diff';
 
 const isSmokeMode = process.env.DSH_SMOKE === '1';
 /** #5 responsive regression: DSH_RESPONSIVE_MEASURE=1 drives the UI probe. */
@@ -137,8 +140,20 @@ function registerIpcHandlers(context: {
   approvals: ApprovalService;
   getLogTail: (category?: 'stdout' | 'stderr' | 'event' | 'tool' | 'model') => string;
   getWindow: () => BrowserWindow | null;
+  changeRecords: ChangeRecordService;
+  broadcastChanges: (snapshot: ChangesSnapshot) => void;
 }): void {
-  const { client, status, workspaces, settings, approvals, getLogTail, getWindow } = context;
+  const {
+    client,
+    status,
+    workspaces,
+    settings,
+    approvals,
+    getLogTail,
+    getWindow,
+    changeRecords,
+    broadcastChanges
+  } = context;
 
   ipcMain.handle('runtime:get-status', () => status());
   ipcMain.handle('runtime:start', async () => {
@@ -170,6 +185,26 @@ function registerIpcHandlers(context: {
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
+  });
+
+  /* ---- Changes / Diff (DSHA-6) — strictly read-only git access ---- */
+
+  ipcMain.handle('changes:get-snapshot', async (): Promise<ChangesSnapshot> =>
+    changeRecords.reconcile(workspaces.currentRoot)
+  );
+  ipcMain.handle('changes:get-file-diff', (_event, relPath: unknown) =>
+    buildFileDiff(workspaces.currentRoot, typeof relPath === 'string' ? relPath : '')
+  );
+  // S-5: destructive per-file revert. The renderer double-confirms before
+  // calling; the service restores worktree content WITHOUT any git write.
+  ipcMain.handle('changes:revert-file', async (_event, relPath: unknown) => {
+    const target = typeof relPath === 'string' ? relPath : '';
+    const result = await changeRecords.revertFile(workspaces.currentRoot, target);
+    const snapshot = await changeRecords.reconcile(workspaces.currentRoot).catch(() =>
+      changeRecords.peekSnapshot(workspaces.currentRoot)
+    );
+    broadcastChanges(snapshot);
+    return { result, snapshot };
   });
 
   /* ---- Approval (DSHA-5 §12/§13) ---- */
@@ -422,6 +457,13 @@ async function main(): Promise<void> {
   // Ordered, de-duplicated fan-out (AC-08): the renderer and the log store
   // only ever see bus messages, never raw client events.
   let lastRuntimeError: string | null = null;
+
+  /* ---- Change Record service (DSHA-6) ---- */
+  const changeRecords = new ChangeRecordService();
+  const broadcastChanges = (snapshot: ChangesSnapshot): void => {
+    mainWindow?.webContents.send('changes:snapshot', snapshot);
+  };
+
   bus.subscribe((message: BusMessage) => {
     if (message.kind === 'violation') {
       mainWindow?.webContents.send('runtime:protocol-violation', message.info);
@@ -432,6 +474,16 @@ async function main(): Promise<void> {
     if (frame.type === 'error' && typeof (frame as { message?: unknown }).message === 'string') {
       // Error text is redacted before it is ever stored or displayed.
       lastRuntimeError = String((frame as { message?: string }).message);
+    }
+    const terminalRunFrame = changeRecords.onRuntimeEvent(frame, workspaces.currentRoot);
+    // Terminal run frames trigger git reconciliation (F3 对账兜底): merge
+    // runtime-reported changes with the read-only status/diff sources and
+    // push the merged snapshot to the Changes panel.
+    if (terminalRunFrame) {
+      void changeRecords
+        .reconcile(workspaces.currentRoot)
+        .then(broadcastChanges)
+        .catch(() => undefined);
     }
     mainWindow?.webContents.send('runtime:event', frame);
   });
@@ -523,7 +575,9 @@ async function main(): Promise<void> {
     approvals,
     getLogTail: (category) =>
       logStore.tail({ category, maxChars: 32 * 1024 }),
-    getWindow: () => mainWindow
+    getWindow: () => mainWindow,
+    changeRecords,
+    broadcastChanges
   });
 
   mainWindow = new BrowserWindow({

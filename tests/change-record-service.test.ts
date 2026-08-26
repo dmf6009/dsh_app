@@ -111,7 +111,7 @@ describe('event aggregation', () => {
   it('upserts repeated file_changed events into ONE record per path', () => {
     const s = svc();
     expect(s.onRuntimeEvent(fileChanged('src/login.py'), root)).toBe(false);
-    expect(s.onRuntimeEvent({ ...fileChanged('src/login.py'), change: 'deleted' }, root)).toBe(false);
+    expect(s.onRuntimeEvent(fileChanged('src/login.py', 'deleted'), root)).toBe(false);
     expect(s.eventRecordCount).toBe(1);
   });
 

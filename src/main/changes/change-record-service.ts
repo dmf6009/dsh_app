@@ -104,7 +104,7 @@ export class ChangeRecordService {
   /** Cached merged view + branch facts for the active root. */
   private cachedSnapshot: ChangesSnapshot | null = null;
   private cachedRoot: string | null = null;
-  private reconciling: Promise<void> | null = null;
+  private reconciling: Promise<ChangesSnapshot> | null = null;
 
   constructor(
     private readonly deps: {

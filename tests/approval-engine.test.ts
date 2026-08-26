@@ -109,6 +109,12 @@ describe('matrixDecision + evaluateApproval — full 3 × 3 × 6 sweep', () => {
     full_auto: { L0: 'allow', L1: 'allow', L2: 'ask' }
   };
 
+  it('covers every risk level exactly once per mode', () => {
+    for (const mode of MODES) {
+      expect(Object.keys(EXPECTED[mode]).sort()).toEqual([...LEVELS].sort());
+    }
+  });
+
   for (const mode of MODES) {
     for (const cell of SWEEP_CELLS) {
       const rep = REPRESENTATIVES.find((r) => `${r.category}/${r.level}` === cell)!;

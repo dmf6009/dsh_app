@@ -43,7 +43,11 @@ const CANNED_ANSWER =
   '我已修改 src/auth/login.py，将过期会话重定向到登录页，并补充了回归测试。';
 
 const TOOL_CALL_ID = 'call-login-fix-1';
-const APPROVAL_ID = 'approval-rm-build-1';
+// Approval ids must be unique per run: the desktop event bus collapses
+// repeated approval:<id> frames (AC-08), so a fixed id would drop every
+// approval after the first run in a resident process.
+const APPROVAL_ID_PREFIX = 'approval-rm-build';
+let approvalSeq = 0;
 
 function positiveIntEnv(name, fallback) {
   const raw = Number(process.env[name]);
@@ -281,12 +285,18 @@ function buildRunSteps(runId, sessionId) {
       label: 'approval_required',
       frame: () => {
         activeRun.paused = true;
+        const approvalId = `${APPROVAL_ID_PREFIX}-${++approvalSeq}`;
+        activeRun.approvalId = approvalId;
         emit({
           type: 'approval_required',
           run_id: runId,
-          approval_id: APPROVAL_ID,
+          approval_id: approvalId,
           tool: 'shell',
-          command: 'rm -rf build/',
+          // Long on purpose: the desktop must keep this scrolling INTERNALLY
+          // (never pushing the decision row out of the viewport) — #5.
+          command:
+            'rm -rf build/ && rm -rf dist/ && find . -name "*.tmp" -not -path "./node_modules/*" -delete ' +
+            '&& docker system prune -af --volumes && kubectl delete namespace legacy-monolith staging-canary --wait --timeout=90s',
           risk_level: 'L2',
           summary: '删除构建产物目录 build/',
           paths: ['build/'],
@@ -470,7 +480,12 @@ function handleApprovalResponse(frame) {
   }
   const decision = frame.decision === 'allow' ? 'allow' : 'reject';
   // Echo the decision back so the desktop can assert the round trip.
-  emit({ type: 'approval_response', run_id: activeRun.id, approval_id: APPROVAL_ID, decision });
+  emit({
+    type: 'approval_response',
+    run_id: activeRun.id,
+    approval_id: typeof activeRun.approvalId === 'string' ? activeRun.approvalId : `${APPROVAL_ID_PREFIX}-?`,
+    decision
+  });
   if (decision === 'allow') {
     resumeRun();
   } else {

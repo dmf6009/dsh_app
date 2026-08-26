@@ -28,6 +28,7 @@ import { WorkspaceManager } from './workspace';
 import type { OpenProjectResult } from '../shared/workspace';
 import { DshProcessManager } from './runtime/dsh-process-manager';
 import { RuntimeClient } from './runtime/runtime-client';
+import { runResponsiveMeasure } from './responsive-measure';
 import { RuntimeEventBus } from './runtime/event-bus';
 import { RuntimeLogStore } from './runtime/runtime-log';
 import { ApprovalService } from './approval/approval-service';
@@ -43,6 +44,8 @@ import type { ApprovalResolution, RuntimeCrashSnapshot } from '../shared/desktop
 import type { ApprovalReply } from '../shared/approval-protocol';
 
 const isSmokeMode = process.env.DSH_SMOKE === '1';
+/** #5 responsive regression: DSH_RESPONSIVE_MEASURE=1 drives the UI probe. */
+const isResponsiveMeasureMode = process.env.DSH_RESPONSIVE_MEASURE === '1';
 
 /** Number of recent stderr bytes kept for the Settings → DSH viewer (§32). */
 const STDERR_TAIL_LIMIT = 16 * 1024;
@@ -549,6 +552,28 @@ async function main(): Promise<void> {
       console.error('[smoke] failed:', err instanceof Error ? err.message : err);
       app.exit(1);
     }
+  }
+
+  if (isResponsiveMeasureMode && mainWindow !== null) {
+    const win = mainWindow;
+    let failed = false;
+    try {
+      await runResponsiveMeasure(win, client, appRoot, {
+        approvalFlow: process.env.STUB_APPROVAL_FLOW === '1'
+      });
+    } catch (err) {
+      failed = true;
+      console.error(
+        '[responsive] failed:',
+        err instanceof Error ? err.message : String(err)
+      );
+    }
+    // Deterministic teardown: stop the resident stub so no child survives,
+    // then exit with the probe verdict.
+    await client.stop().catch(() => undefined);
+    console.log(JSON.stringify({ responsive: failed ? 'fail' : 'ok' }));
+    setTimeout(() => app.exit(failed ? 1 : 0), 100).unref();
+    return;
   }
 
   /* ---- Graceful shutdown (P0-7 同口径 / §32) ---- */

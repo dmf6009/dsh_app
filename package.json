@@ -18,7 +18,8 @@
     "stub": "node scripts/stub-runtime.mjs",
     "smoke:protocol": "node scripts/smoke-protocol.mjs",
     "smoke:dsh": "node scripts/smoke-dsh-desktop.mjs",
-    "smoke:app": "node scripts/smoke-electron.mjs"
+    "smoke:app": "node scripts/smoke-electron.mjs",
+    "test:responsive": "node scripts/measure-responsive.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

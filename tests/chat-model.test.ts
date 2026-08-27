@@ -155,12 +155,30 @@ describe('chat model — stop flow (AC-11 / memo ①)', () => {
 });
 
 describe('chat model — provider errors', () => {
-  it('maps 401/404/429 to actionable copy and keeps other codes raw', () => {
-    expect(describeError('bad key', 401)).toContain('API Key 无效或未配置（401）');
-    expect(describeError('no such model', '404')).toContain('模型或接口不存在（404）');
-    expect(describeError('slow down', '429')).toContain('请求过于频繁，请稍后重试（429）');
-    expect(describeError('boom', 'EPIPE')).toBe('boom [EPIPE]');
-    expect(describeError('boom')).toBe('boom');
+  it('maps 401/404/429 to three-part §32 copy and keeps raw diagnostics', () => {
+    // §32 three-part: what / why / action / raw detail.
+    const e401 = describeError('bad key', 401);
+    expect(e401).toContain('模型接口认证失败（401）');
+    expect(e401).toContain('原因：');
+    expect(e401).toContain('建议：');
+    expect(e401).toContain('原始信息：bad key');
+
+    const e404 = describeError('no such model', '404');
+    expect(e404).toContain('模型或接口不存在（404）');
+    expect(e404).toContain('原始信息：no such model');
+
+    const e429 = describeError('slow down', '429');
+    expect(e429).toContain('请求过于频繁或额度用尽（429）');
+
+    // Unknown codes keep the raw message + code in the three-part frame.
+    const other = describeError('boom', 'EPIPE');
+    expect(other).toContain('模型接口返回错误');
+    expect(other).toContain('EPIPE');
+    expect(other).toContain('原始信息：boom');
+
+    // No code → still framed with the raw message preserved.
+    const nocd = describeError('boom');
+    expect(nocd).toContain('原始信息：boom');
   });
 
   it('a non-recoverable error ends the run phase; recoverable ones keep it', () => {

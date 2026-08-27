@@ -14,6 +14,12 @@ import type {
   SettingsView
 } from './settings';
 import type { OpenProjectResult, PathCheckResult, RecentProject } from './workspace';
+import type {
+  SessionLoadResult,
+  SessionMutationResult,
+  SessionRecord,
+  SessionSummary
+} from './session';
 
 export type ConnectionState = 'stopped' | 'starting' | 'ready' | 'crashed';
 
@@ -114,6 +120,22 @@ export interface DesktopApi {
   removeRecentProject(id: string): Promise<OperationResult>;
   checkPath(path: string): Promise<PathCheckResult>;
   getCurrentWorkspace(): Promise<{ path: string | null }>;
+
+  /* ---- Sessions (§15/§16, F10/AC-12) ---- */
+  /** Sidebar summaries for the active workspace (newest-updated first). */
+  listSessions(): Promise<SessionSummary[]>;
+  /** Persisted active session id for the active workspace (AC-12 restore). */
+  getActiveSessionId(): Promise<{ id: string | null }>;
+  /** Create a new session and switch to it. Returns the fresh record. */
+  createSession(title?: string): Promise<{ result: SessionMutationResult; record?: SessionRecord }>;
+  /** Load one session record (corrupt/missing degrade to a soft error). */
+  loadSession(id: string): Promise<SessionLoadResult>;
+  /** Persist the full transcript + metadata of an existing session. */
+  saveSession(record: SessionRecord): Promise<SessionMutationResult>;
+  /** Mark a session as active (§15 切换). */
+  switchSession(id: string): Promise<SessionMutationResult>;
+  /** Delete a session record (§15 删除; idempotent). */
+  deleteSession(id: string): Promise<SessionMutationResult>;
 
   /* ---- Settings (§17/§12/§32) ---- */
   getSettings(): Promise<SettingsView>;

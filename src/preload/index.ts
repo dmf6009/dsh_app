@@ -24,6 +24,12 @@ import type {
   SettingsView
 } from '../shared/settings';
 import type { OpenProjectResult, PathCheckResult, RecentProject } from '../shared/workspace';
+import type {
+  SessionLoadResult,
+  SessionMutationResult,
+  SessionRecord,
+  SessionSummary
+} from '../shared/session';
 
 function subscribe<T>(channel: string, listener: (value: T) => void): () => void {
   const wrapped = (_event: unknown, value: T): void => listener(value);
@@ -83,6 +89,20 @@ const api: DesktopApi = {
     ipcRenderer.invoke('workspace:check-path', path),
   getCurrentWorkspace: (): Promise<{ path: string | null }> =>
     ipcRenderer.invoke('workspace:get-current'),
+
+  listSessions: (): Promise<SessionSummary[]> => ipcRenderer.invoke('session:list'),
+  getActiveSessionId: (): Promise<{ id: string | null }> =>
+    ipcRenderer.invoke('session:get-active-id'),
+  createSession: (title?: string): Promise<{ result: SessionMutationResult; record?: SessionRecord }> =>
+    ipcRenderer.invoke('session:create', title),
+  loadSession: (id: string): Promise<SessionLoadResult> =>
+    ipcRenderer.invoke('session:load', id),
+  saveSession: (record: SessionRecord): Promise<SessionMutationResult> =>
+    ipcRenderer.invoke('session:save', record),
+  switchSession: (id: string): Promise<SessionMutationResult> =>
+    ipcRenderer.invoke('session:switch', id),
+  deleteSession: (id: string): Promise<SessionMutationResult> =>
+    ipcRenderer.invoke('session:delete', id),
 
   getSettings: (): Promise<SettingsView> => ipcRenderer.invoke('settings:get'),
   saveProvider: (input: SaveProviderInput): Promise<OperationResult> =>

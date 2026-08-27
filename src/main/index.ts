@@ -43,8 +43,15 @@ import type { BusMessage } from './runtime/event-bus';
 import type { ApprovalResolution, RuntimeCrashSnapshot } from '../shared/desktop-api';
 import type { ApprovalReply } from '../shared/approval-protocol';
 import type { ChangesSnapshot } from '../shared/changes';
+import type {
+  SessionLoadResult,
+  SessionMutationResult,
+  SessionRecord,
+  SessionSummary
+} from '../shared/session';
 import { ChangeRecordService } from './changes/change-record-service';
 import { buildFileDiff } from './changes/file-diff';
+import { SessionStore } from './session/session-store';
 
 const isSmokeMode = process.env.DSH_SMOKE === '1';
 /** #5 responsive regression: DSH_RESPONSIVE_MEASURE=1 drives the UI probe. */
@@ -142,6 +149,7 @@ function registerIpcHandlers(context: {
   getWindow: () => BrowserWindow | null;
   changeRecords: ChangeRecordService;
   broadcastChanges: (snapshot: ChangesSnapshot) => void;
+  sessions: SessionStore;
 }): void {
   const {
     client,
@@ -152,7 +160,8 @@ function registerIpcHandlers(context: {
     getLogTail,
     getWindow,
     changeRecords,
-    broadcastChanges
+    broadcastChanges,
+    sessions
   } = context;
 
   ipcMain.handle('runtime:get-status', () => status());
@@ -274,6 +283,58 @@ function registerIpcHandlers(context: {
     return workspaces.checkPath(target);
   });
   ipcMain.handle('workspace:get-current', () => ({ path: workspaces.currentRoot }));
+
+  /* ---- Sessions (§15/§16, F10/AC-12) — local-first persistence ---- */
+
+  ipcMain.handle('session:list', (): Promise<SessionSummary[]> => {
+    const root = workspaces.currentRoot;
+    if (!root) return Promise.resolve([]);
+    return Promise.resolve(sessions.listSummaries(root));
+  });
+  ipcMain.handle('session:get-active-id', (): Promise<{ id: string | null }> => {
+    const root = workspaces.currentRoot;
+    if (!root) return Promise.resolve({ id: null });
+    return Promise.resolve({ id: sessions.getActiveId(root) });
+  });
+  ipcMain.handle(
+    'session:create',
+    (_event, title: unknown): Promise<{ result: SessionMutationResult; record?: SessionRecord }> => {
+      const root = workspaces.currentRoot;
+      if (!root) {
+        return Promise.resolve({ result: { ok: false, error: '未打开工作区' } });
+      }
+      const record = sessions.create(root, typeof title === 'string' ? title : undefined);
+      return Promise.resolve({ result: { ok: true, id: record.id }, record });
+    }
+  );
+  ipcMain.handle('session:load', (_event, id: unknown): Promise<SessionLoadResult> => {
+    const root = workspaces.currentRoot;
+    if (!root || typeof id !== 'string') {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 无效' });
+    }
+    return Promise.resolve(sessions.load(root, id));
+  });
+  ipcMain.handle('session:save', (_event, record: unknown): Promise<SessionMutationResult> => {
+    const root = workspaces.currentRoot;
+    if (!root || typeof record !== 'object' || record === null || typeof (record as { id?: unknown }).id !== 'string') {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话记录无效' });
+    }
+    return Promise.resolve(sessions.save(root, record as SessionRecord));
+  });
+  ipcMain.handle('session:switch', (_event, id: unknown): Promise<SessionMutationResult> => {
+    const root = workspaces.currentRoot;
+    if (!root || typeof id !== 'string') {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 无效' });
+    }
+    return Promise.resolve(sessions.switchTo(root, id));
+  });
+  ipcMain.handle('session:delete', (_event, id: unknown): Promise<SessionMutationResult> => {
+    const root = workspaces.currentRoot;
+    if (!root || typeof id !== 'string') {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 无效' });
+    }
+    return Promise.resolve(sessions.delete(root, id));
+  });
 
   /* ---- Settings ---- */
 
@@ -440,6 +501,8 @@ async function main(): Promise<void> {
     mainWindow?.webContents.send('runtime:connection-state', state);
     // §32 crash recovery: record the pid claim lifecycle alongside state.
     if (state === 'ready') {
+      // §34 performance probe: the runtime-ready timestamp signal.
+      console.log('[runtime] ready');
       const pid = manager.pid;
       if (pid !== undefined) {
         void claimRuntimePidFile(pidFile, {
@@ -463,6 +526,11 @@ async function main(): Promise<void> {
   const broadcastChanges = (snapshot: ChangesSnapshot): void => {
     mainWindow?.webContents.send('changes:snapshot', snapshot);
   };
+
+  /* ---- Session store (DSHA-7 §15/§16, F10/AC-12) ---- */
+  // Desktop-owned conversation state lives under ~/.dsh/desktop so all product
+  // state stays together; scoped per workspace root.
+  const sessions = new SessionStore();
 
   bus.subscribe((message: BusMessage) => {
     if (message.kind === 'violation') {
@@ -577,7 +645,8 @@ async function main(): Promise<void> {
       logStore.tail({ category, maxChars: 32 * 1024 }),
     getWindow: () => mainWindow,
     changeRecords,
-    broadcastChanges
+    broadcastChanges,
+    sessions
   });
 
   mainWindow = new BrowserWindow({
@@ -590,6 +659,14 @@ async function main(): Promise<void> {
       nodeIntegration: false,
       sandbox: true
     }
+  });
+
+  // §34 cold-start probe: first-paint timestamp = the first navigation the
+  // renderer finished loading (did-finish-load). Attached BEFORE loadFile so
+  // the initial load's event is captured; one-shot, logged to stdout so the
+  // startup measurement can time the首屏.
+  mainWindow.webContents.once('did-finish-load', () => {
+    console.log('[first-paint]');
   });
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;

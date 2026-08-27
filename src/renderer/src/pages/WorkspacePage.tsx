@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ConnectionState, RuntimeStatus } from '../../../shared/desktop-api';
+import { agentCrashCopy, runtimeStartupFailedCopy } from '../../../shared/error-copy';
 import type {
   ApprovalRequestPayload,
 } from '../../../shared/approval-protocol';
@@ -24,6 +25,7 @@ import { Button, Spinner } from '../components/ui';
 import { useApp } from '../store/app-store';
 import { useChanges } from '../changes/changes-store';
 import { badgeTitle, changedFiles, showRunSummary, summaryLabel } from '../changes/model';
+import { useSessionStore } from '../session/session-store';
 import {
   INITIAL_MODEL,
   reduceChat,
@@ -33,6 +35,7 @@ import {
   type FileChangedItem,
   type FileReadItem,
   type PlanItem,
+  type RunPhase,
   type SubagentItem,
   type SummaryItem,
   type ToolCardItem,
@@ -54,13 +57,9 @@ const STATE_LABEL: Record<ConnectionState, string> = {
   crashed: '已崩溃'
 };
 
-interface SessionEntry {
-  id: string;
-  title: string;
-  active: boolean;
-}
-
 export default function WorkspacePage(): JSX.Element {
+  const { state: appState, dispatch: appDispatch } = useApp();
+  const sessions = useSessionStore(appState.workspaceRoot);
   const [model, setModel] = useState<ChatModel>(INITIAL_MODEL);
   const [input, setInput] = useState('');
   const [connection, setConnection] = useState<ConnectionState>('stopped');
@@ -75,16 +74,12 @@ export default function WorkspacePage(): JSX.Element {
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null);
   const [modelChoice, setModelChoice] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [sessions, setSessions] = useState<SessionEntry[]>([
-    { id: 'local', title: '本地会话', active: true }
-  ]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<ChatModel>(INITIAL_MODEL);
   modelRef.current = model;
 
   /* ---- aggregated Changes (DSHA-6) ------------------------------------ */
 
-  const { dispatch: appDispatch } = useApp();
   const changes = useChanges();
   const runActive = model.phase !== 'idle';
   const changedFileList = changedFiles(changes.snapshot);
@@ -102,6 +97,43 @@ export default function WorkspacePage(): JSX.Element {
   const dispatch = useCallback((action: Parameters<typeof reduceChat>[1]): void => {
     setModel((prev) => reduceChat(prev, action));
   }, []);
+
+  /* ---- Session persistence (DSHA-7 §15/§16, F10/AC-12) ---------------- */
+
+  // Persist meta assembled from the live model + selection.
+  const persistMeta = useCallback(() => ({
+    model: modelChoice || null,
+    phase: modelRef.current.phase,
+    tokenUsage: null,
+    workspaceRoot: appState.workspaceRoot
+  }), [modelChoice, appState.workspaceRoot]);
+
+  // Hydrate the active session once it's loaded (and when the active id
+  // changes due to a switch). Never auto-resume a running task.
+  const { loaded: sessionLoaded, activeId: sessionActiveId, hydrate: sessionHydrate } = sessions;
+  useEffect(() => {
+    if (!sessionLoaded) return;
+    let cancelled = false;
+    void sessionHydrate().then((restored) => {
+      if (cancelled || restored === null) return;
+      setModel(restored);
+    });
+    return () => { cancelled = true; };
+  }, [sessionLoaded, sessionActiveId, sessionHydrate]);
+
+  // Persist on run termination (done / run_completed / run_cancelled / error)
+  // and when leaving to the Diff page so the transcript is checkpointed.
+  const lastPhaseRef = useRef<RunPhase>('idle');
+  const sessionPersist = sessions.persist;
+  useEffect(() => {
+    const prev = lastPhaseRef.current;
+    const next = model.phase;
+    lastPhaseRef.current = next;
+    // Just went idle from a non-idle state → the run ended, checkpoint.
+    if (prev !== 'idle' && next === 'idle' && sessionActiveId) {
+      void sessionPersist(modelRef.current, persistMeta());
+    }
+  }, [model.phase, sessionActiveId, sessionPersist, persistMeta]);
 
   /* ---- subscriptions ------------------------------------------------ */
 
@@ -130,17 +162,6 @@ export default function WorkspacePage(): JSX.Element {
     void window.desktop.getStatus().then((initial) => {
       setStatus(initial);
       setConnection(initial.state);
-      if (initial.sessionId !== null && initial.sessionId !== '') {
-        setSessions((prev) =>
-          prev.some((s) => s.id === initial.sessionId)
-            ? prev.map((s) => ({ ...s, active: s.id === initial.sessionId }))
-            : [...prev.map((s) => ({ ...s, active: false })), {
-                id: initial.sessionId!,
-                title: `会话 ${initial.sessionId!.slice(0, 8)}`,
-                active: true
-              }]
-        );
-      }
     });
     // Model choices come from configured providers; selection is cosmetic
     // until P1-C wires it into run requests.
@@ -174,6 +195,13 @@ export default function WorkspacePage(): JSX.Element {
   const submit = useCallback(async (): Promise<void> => {
     const text = input.trim();
     if (!canSend) return;
+    // Ensure a session exists before the first send so the transcript is
+    // persisted from the very first message (§15/AC-12).
+    if (!sessions.activeId) {
+      const restored = await sessions.create(text.slice(0, 40));
+      setModel(restored);
+      lastPhaseRef.current = 'idle';
+    }
     setInput('');
     dispatch({ type: 'send', text });
     const result = await window.desktop.sendMessage(text);
@@ -193,7 +221,7 @@ export default function WorkspacePage(): JSX.Element {
         ]
       }));
     }
-  }, [input, canSend, dispatch]);
+  }, [input, canSend, dispatch, sessions]);
 
   const stop = useCallback(async (): Promise<void> => {
     if (modelRef.current.phase === 'idle') return;
@@ -204,6 +232,29 @@ export default function WorkspacePage(): JSX.Element {
     }
     // Unlock happens only when run_cancelled arrives (AC-11).
   }, [dispatch]);
+
+  /* ---- Session actions (DSHA-7 §15 多会话) --------------------------- */
+
+  const newSession = useCallback(async (): Promise<void> => {
+    if (running) return; // lock during a run
+    const restored = await sessions.create();
+    setModel(restored);
+    lastPhaseRef.current = 'idle';
+  }, [running, sessions]);
+
+  const switchSession = useCallback(async (id: string): Promise<void> => {
+    if (running) return;
+    const restored = await sessions.switchTo(id, modelRef.current, persistMeta());
+    setModel(restored);
+    lastPhaseRef.current = 'idle';
+  }, [running, sessions, persistMeta]);
+
+  const deleteSession = useCallback(async (id: string): Promise<void> => {
+    if (running) return;
+    // The active session is saved by the user before this; deleting the
+    // active one lets the hydrate effect load the fallback when activeId flips.
+    await sessions.remove(id);
+  }, [running, sessions]);
 
   /* ---- responsive drawers (#5) ---------------------------------------
    * Below 960px the side columns become off-canvas drawers: the middle
@@ -308,17 +359,56 @@ export default function WorkspacePage(): JSX.Element {
         className={`col col-sessions${drawer === 'sessions' ? ' drawer-open' : ''}`}
         aria-label="Sessions"
       >
-        <h2 className="panel-title">Sessions</h2>
-        <ul className="session-list">
-          {sessions.map((s) => (
-            <li key={s.id} className={s.active ? 'session active' : 'session'}>
-              <span className="session-dot" aria-hidden="true" />
-              <span className="session-title">{s.title}</span>
-              {s.active && <span className="session-badge">当前</span>}
+        <div className="sessions-head">
+          <h2 className="panel-title">Sessions</h2>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => void newSession()}
+            disabled={running || !appState.workspaceRoot}
+            aria-label="新建会话"
+            title="新建会话"
+          >
+            + 新建
+          </Button>
+        </div>
+        <ul className="session-list" aria-label="会话列表">
+          {sessions.summaries.length === 0 && (
+            <li className="session session-empty">
+              <span className="session-title">暂无会话——点击「+ 新建」开始一段对话（本地持久化）。</span>
+            </li>
+          )}
+          {sessions.summaries.map((s) => (
+            <li
+              key={s.id}
+              className={s.active ? 'session active' : 'session'}
+            >
+              <button
+                type="button"
+                className="session-switch"
+                onClick={() => void switchSession(s.id)}
+                disabled={running || s.active}
+                aria-current={s.active ? 'true' : undefined}
+                title={`${s.title}（点击切换）`}
+              >
+                <span className="session-dot" aria-hidden="true" />
+                <span className="session-title">{s.title}</span>
+                {s.active && <span className="session-badge">当前</span>}
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost session-delete"
+                onClick={() => void deleteSession(s.id)}
+                disabled={running}
+                aria-label={`删除会话 ${s.title}`}
+                title="删除会话"
+              >
+                ✕
+              </button>
             </li>
           ))}
         </ul>
-        <p className="empty-hint">会话持久化将在后续阶段提供（当前为内存列表）。</p>
+        <p className="empty-hint">会话按工作区持久化在 ~/.dsh/desktop/sessions；完全关闭重开后可继续回看。</p>
       </aside>
 
       {/* ---------------- Middle: conversation ---------------- */}
@@ -390,37 +480,46 @@ export default function WorkspacePage(): JSX.Element {
           )}
         </header>
 
-        {connection === 'crashed' && (
-          <div className="recovery-banner recovery-crash" role="alert">
-            <div>
-              <strong>Runtime 已崩溃</strong>
-              {status?.crash != null && (
-                <code className="crash-detail">
-                  exit={String(status.crash.exitCode ?? '—')} signal={status.crash.signal ?? '—'}
-                </code>
-              )}
+        {connection === 'crashed' && (() => {
+          const crash = status?.crash;
+          const copy = agentCrashCopy(crash?.exitCode ?? null, crash?.signal ?? null);
+          return (
+            <div className="recovery-banner recovery-crash" role="alert">
+              <div className="recovery-copy">
+                <strong>{copy.what}</strong>
+                <p className="recovery-why">{copy.why}</p>
+                <p className="recovery-action">{copy.action}</p>
+                {copy.detail && <code className="crash-detail">{copy.detail}</code>}
+              </div>
+              <div className="recovery-actions">
+                <Button size="sm" variant="primary" onClick={recoverRestart}>
+                  重启 Runtime
+                </Button>
+                <Button size="sm" variant="secondary" onClick={recoverResume}>
+                  恢复会话
+                </Button>
+              </div>
             </div>
-            <div className="recovery-actions">
-              <Button size="sm" variant="primary" onClick={recoverRestart}>
-                重启 Runtime
+          );
+        })()}
+        {connection === 'stopped' && status?.lastError != null && status.lastError !== '' && (() => {
+          const copy = runtimeStartupFailedCopy(status.lastError);
+          return (
+            <div className="recovery-banner recovery-startup" role="alert">
+              <div className="recovery-copy">
+                <strong>{copy.what}</strong>
+                <p className="recovery-why">{copy.why}</p>
+                <p className="recovery-action">{copy.action}</p>
+                {copy.detail && copy.detail.trim() !== '' && (
+                  <pre className="startup-stderr">{copy.detail}</pre>
+                )}
+              </div>
+              <Button size="sm" variant="primary" onClick={recoverResume}>
+                重试启动
               </Button>
-              <Button size="sm" variant="secondary" onClick={recoverResume}>
-                恢复会话
-              </Button>
             </div>
-          </div>
-        )}
-        {connection === 'stopped' && status?.lastError != null && status.lastError !== '' && (
-          <div className="recovery-banner recovery-startup" role="alert">
-            <div>
-              <strong>Runtime 启动失败</strong>
-              <pre className="startup-stderr">{status.lastError}</pre>
-            </div>
-            <Button size="sm" variant="primary" onClick={recoverResume}>
-              重试启动
-            </Button>
-          </div>
-        )}
+          );
+        })()}
 
         <ChatList items={model.items} scrollRef={scrollRef} />
 

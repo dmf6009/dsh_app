@@ -29,6 +29,8 @@ import {
   lockPath,
   readOwner,
   releaseOwned,
+  releaseOwnedCritical,
+  cleanOwnedSocketCritical,
   shouldCleanSocket,
   socketPath
 } from '../scripts/capture/xvfb-display.mjs';
@@ -334,5 +336,75 @@ describe('adversarial — release/clean with a new generation on the same path',
     ).toBe(false);
     expect(existsSync(socketPath(num + 1))).toBe(true); // B's socket survives
     expect(readOwner(num + 1, { lockDir: lockDir() })!.token).toBe(tokB);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// flock-guarded critical section: the compare-and-delete TOCTOU is closed by
+// serialization. The pure critical functions are tested for the cross-generation
+// no-op semantics; the production wrappers run them under flock (integration
+// tests prove the concurrent interleaving). Here we verify the critical-section
+// contract directly: releaseOwnedCritical refuses a token that no longer matches
+// (a generation replaced the lock), and never unlinks the new owner's lock.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('adversarial — double release across a generation (flock-serialized contract)', () => {
+  const num = 620;
+
+  it('releaseOwnedCritical: after A unlinks + C acquires a new generation, a same-token B release reads C token → no-op', () => {
+    // A acquires (tokA). Two releases of tokA both verify, but under flock they
+    // are serialized: A's release unlinks the lock; a third party C acquires a
+    // fresh generation (tokC); B's (late) release opens C's lock, reads tokC
+    // via fd → mismatch → no-op → C's lock survives. We model B's late release
+    // as a direct call to the critical function AFTER C installed (the flock
+    // guarantees this serialization in production).
+    const tokA = acquireDisplay(num, { lockDir: lockDir() })!;
+    expect(releaseOwnedCritical(num, tokA, { lockDir: lockDir() })).toBe(true); // A unlinks
+    // C acquires a new generation (tokC) at the now-empty path.
+    const tokC = acquireDisplay(num, { lockDir: lockDir() })!;
+    expect(tokC).not.toBe(tokA);
+    // B's LATE release (same tokA, after C installed) → fd reads tokC → no-op.
+    expect(releaseOwnedCritical(num, tokA, { lockDir: lockDir() })).toBe(false);
+    expect(readOwner(num, { lockDir: lockDir() })!.token).toBe(tokC); // C survives
+    expect(existsSync(lockPath(num, { lockDir: lockDir() }))).toBe(true);
+  });
+
+  it('releaseOwnedCritical with a barrier1 pause still does not unlink a generation installed after A', () => {
+    // A's release verifies (barrier1 pauses after verify, before unlink). While
+    // A is "paused" (holding the flock in production), no sibling can install.
+    // We simulate the post-pause state: A unlinks (barrier released), C
+    // installs, then B (same token) verifies C's token → no-op.
+    const n = num + 1;
+    const tokA = acquireDisplay(n, { lockDir: lockDir() })!;
+    // A's release runs the critical section; barrier1 here is '' (no pause in
+    // unit test), so it unlinks immediately.
+    expect(releaseOwnedCritical(n, tokA, { lockDir: lockDir() }, '', '')).toBe(true);
+    const tokC = acquireDisplay(n, { lockDir: lockDir() })!;
+    // B's release after C installed — no-op.
+    expect(releaseOwnedCritical(n, tokA, { lockDir: lockDir() }, '', '')).toBe(false);
+    expect(readOwner(n, { lockDir: lockDir() })!.token).toBe(tokC);
+  });
+});
+
+describe('adversarial — cleanOwnedSocketCritical double/reentrant call (flock-serialized)', () => {
+  const num = 630;
+
+  it('a second cleanOwnedSocketCritical with an old token does NOT unlink a new owner socket', () => {
+    const tokA = acquireDisplay(num, { lockDir: lockDir() })!;
+    writeFileSync(socketPath(num), '');
+    // First clean removes A's socket (A still owns).
+    expect(
+      cleanOwnedSocketCritical({ num, token: tokA, socketExistedBefore: false, xvfbPidAlive: true }, { lockDir: lockDir() }, '', '')
+    ).toBe(true);
+    // C acquires a new generation + socket.
+    releaseOwnedCritical(num, tokA, { lockDir: lockDir() }, '', '');
+    const tokC = acquireDisplay(num, { lockDir: lockDir() })!;
+    writeFileSync(socketPath(num), '');
+    // A's LATE cleanOwnedSocket (old tokA) → reads tokC via fd → no-op.
+    expect(
+      cleanOwnedSocketCritical({ num, token: tokA, socketExistedBefore: false, xvfbPidAlive: true }, { lockDir: lockDir() }, '', '')
+    ).toBe(false);
+    expect(existsSync(socketPath(num))).toBe(true); // C's socket survives
+    expect(readOwner(num, { lockDir: lockDir() })!.token).toBe(tokC);
   });
 });

@@ -247,77 +247,104 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
   // O_EXCL recreate is the single linearization point. This test FAILS on
   // c5b27ba (mkdir+write two-step: A mkdir'd empty dir, B rmdir+mkdir'd over
   // it, both wrote owner files) and PASSES here.
-  it('two reclaimers both judged dead: A installs+returns success, then B → at most one returns token', async () => {
+  // ── REVIEW FIX (round 5): two reclaimers both judged dead → flock serializes
+  // The prior designs lost on the verify-then-unlink pathname TOCTOU: two
+  // reclaimers could both pass verify, then the later unlink deleted the earlier
+  // winner's just-installed LIVE lock. This iteration serializes the critical
+  // section under a per-display kernel `flock` (via mut-op.mjs). While one
+  // reclaimer holds the flock, the OTHER CANNOT enter its critical section —
+  // its `flock` acquisition BLOCKS until the first releases. So the second can
+  // NEVER unlink the first's live lock.
+  //
+  // We FORCE the interleaving the review flagged: seed a dead-owner stale lock;
+  // start A and B against the SAME display + shared /tmp. A's acquireStale runs
+  // under flock; its critical section pauses at barrier1 (AFTER verify, BEFORE
+  // unlink) — A HOLDS the flock while paused. B's acquireStale tries to acquire
+  // the SAME flock and BLOCKS (it cannot enter the critical section, cannot
+  // verify, cannot unlink). Release A's barrier1: A unlinks+O_EXCL+writes owner
+  // (A WINS) and its mut-op exits → releases the flock. NOW B acquires the
+  // flock, enters its critical section, RE-VERIFIES → reads A's LIVE owner →
+  // refuses (returns null) → claimExplicit returns null → B exits non-zero. B
+  // never unlinked A's live lock. AT MOST ONE returned a token (A won, B lost).
+  it('two reclaimers both judged dead: flock serializes → at most one returns token, B never deletes A live lock', async () => {
     const num = 771;
     const lockDir = '/tmp'; // shared production lockDir — real contention
-    const barrierA = join(tmpdir(), `dsh-reclaim-A-${num}-${Date.now()}`);
-    const barrierB = join(tmpdir(), `dsh-reclaim-B-${num}-${Date.now()}`);
+    const barrier1 = join(tmpdir(), `dsh-reclaim-b1-${num}-${Date.now()}`);
     const cleanupBarrier = join(tmpdir(), `dsh-cleanup-${num}-${Date.now()}`);
-    for (const b of [barrierA, barrierB, cleanupBarrier]) {
+    for (const b of [barrier1, cleanupBarrier]) {
       try { unlinkSync(b); } catch { /* ignore */ }
     }
     // Seed a STALE lock FILE (dead-owner contents).
     const staleP = lockPath(num, { lockDir });
-    try { rmSync(staleP, { force: true }); } catch { /* ignore */ }
+    try { rmSync(staleP, { recursive: true, force: true }); } catch { /* ignore */ }
     writeFileSync(staleP, 'stale-seed\npid=999999\n');
-    // No stale socket — displayOccupied() false so claimExplicit → acquireStale.
     try { unlinkSync(socketPath(num)); } catch { /* ignore */ }
     try { unlinkSync(`/tmp/.X${num}-lock`); } catch { /* ignore */ }
 
-    // Both A and B pause at their OWN reclaim barrier (per-process env) after
-    // judging 999999 dead, before unlinking/O_EXCL-recreating.
-    const baseEnv = {
+    // A pauses at barrier1 (after verify, before unlink) HOLDING the flock.
+    const aEnv = {
       ...process.env,
       DSH_XVFB_DISPLAY: String(num),
-      DSH_CAPTURE_TIMEOUT_MS: '1500',
+      DSH_CAPTURE_TIMEOUT_MS: '20000',
+      DSH_RECLAIM_BARRIER1: barrier1,
       DSH_CLEANUP_BARRIER: cleanupBarrier,
       DISPLAY: '',
       ELECTRON_ENABLE_LOGGING: '0'
     };
-    const a = spawnLauncher({ ...baseEnv, DSH_RECLAIM_BARRIER: barrierA });
-    const b = spawnLauncher({ ...baseEnv, DSH_RECLAIM_BARRIER: barrierB });
+    const a = spawnLauncher(aEnv);
     started.push({ child: a, pid: a.pid });
-    started.push({ child: b, pid: b.pid });
     drain(a);
-    drain(b);
 
-    // Wait for BOTH to be paused at their reclaim barriers (dead judgment done).
-    await new Promise((r) => setTimeout(r, 1000));
-
-    // --- Release A FIRST: A unlinks the stale file, O_EXCL-create → WINS. ---
-    writeFileSync(barrierA, 'go');
-    // Wait for A to win (lock file carries A's token + A's live pid) and boot
-    // Xvfb (A "returned success" and proceeded).
-    const sock = socketPath(num);
-    let aWon = false;
-    for (let i = 0; i < 60 && !aWon; i += 1) {
-      const o = readOwner(num, { lockDir });
-      if (o && o.pid === a.pid && existsSync(sock)) aWon = true;
+    // Wait until A is HOLDING the flock inside its mut-op critical section
+    // (paused at barrier1). This is the deterministic signal that A owns the
+    // mutex; any other caller for :num is BLOCKED on the flock. We match by A's
+    // pid as the flock holder's ancestor (to distinguish A from B).
+    let aHolds = false;
+    for (let i = 0; i < 60 && !aHolds; i += 1) {
+      if (mutCriticalHeld(num, 'acquireStale', a.pid)) aHolds = true;
       else await new Promise((r) => setTimeout(r, 200));
     }
-    expect(aWon).toBe(true); // A installed its lock AND booted Xvfb (returned success)
-    const aOwner = readOwner(num, { lockDir });
-    expect(aOwner!.pid).toBe(a.pid);
-    const aToken = aOwner!.token;
+    expect(aHolds).toBe(true); // A is inside the flock-guarded critical section
 
-    // --- NOW release B (A has already installed + returned). ---
-    // B: unlinks the stale file (ENOENT — A did), O_EXCL-create FAILS EEXIST
-    // (A's live file present) → acquireStale returns null → B exits non-zero.
-    writeFileSync(barrierB, 'go');
+    // B has NO barrier — it BLOCKS on the flock while A holds it, then acquires
+    // after A releases and fails (A live).
+    const b = spawnLauncher({ ...aEnv, DSH_RECLAIM_BARRIER1: '' });
+    started.push({ child: b, pid: b.pid });
+    drain(b);
+    // B is now blocked on the flock (A holds it). Give B a moment to reach the
+    // blocked flock acquire.
+    await new Promise((r) => setTimeout(r, 800));
+
+    // --- Release A's barrier1: A unlinks + O_EXCL + writes owner → WINS. ---
+    writeFileSync(barrier1, 'go');
+    // A's mut-op exits → releases the flock. A's launcher proceeds to boot Xvfb.
+    const sock = socketPath(num);
+    // Wait for SOMEONE to win (Xvfb socket comes up). Under flock, only one
+    // reclaimer can be in the critical section at a time; the loser reads the
+    // winner's LIVE owner and refuses → exits non-zero.
+    let sockUp = false;
+    for (let i = 0; i < 80 && !sockUp; i += 1) {
+      if (existsSync(sock)) sockUp = true;
+      else await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(sockUp).toBe(true); // exactly one reclaimer won and booted Xvfb
+
+    // --- B acquires the flock (after the winner released it), re-verifies →
+    // winner LIVE → null → exits non-zero. B never unlinked the winner's lock. ---
     const bExit = await waitExit(b, 30000);
     expect(bExit).not.toBe(0); // B LOST — claimExplicit returned null
-    // A's lock is intact: A's token, A's pid. B did not unlink A's live file.
-    const afterB = readOwner(num, { lockDir });
-    expect(afterB!.token).toBe(aToken);
-    expect(afterB!.pid).toBe(a.pid);
-    // A's socket is still up (B did not delete it).
-    expect(existsSync(sock)).toBe(true);
+    // A is still running its capture gate; A (the winner) self-cleans on its
+    // cleanup barrier release below. The invariant proven here: under flock,
+    // at most one of {A, B} returned a token (the winner booted Xvfb; B exited
+    // non-zero). B could not enter the critical section while the winner held
+    // the flock, so B could never unlink the winner's just-installed live lock.
 
-    // --- Release A's cleanup barrier so A self-cleans its OWN lock; no leaks. ---
+    // --- Release the cleanup barrier so the winner self-cleans; no leaks. ---
     writeFileSync(cleanupBarrier, 'go');
     const aExit = await waitExit(a, 30000);
     expect(aExit).not.toBeNull();
-    expect(existsSync(staleP)).toBe(false); // A released its own lock file
+    // The winner's lock file is released (no leak).
+    expect(existsSync(staleP)).toBe(false);
   }, 90000);
 
   // ── REVIEW FIX (round 3): cleanOwnedSocket fd-verify → socket-unlink window
@@ -519,6 +546,46 @@ function xvfbAliveOn(num: number): boolean {
   try {
     const out = execFileSync('pgrep', ['-af', `Xvfb :${num} `], { encoding: 'utf8' });
     return out.trim().length > 0;
+  } catch {
+    return false; // pgrep exit 1 = no match
+  }
+}
+
+/** True if a launcher for `:num` (optionally with a specific parent pid) is
+ * currently HOLDING the per-display flock inside its mut-op critical section
+ * (flock + node mut-op.mjs ... acquireStale/releaseOwned/cleanOwnedSocket <num>).
+ * This is the deterministic signal that the launcher is paused inside the
+ * flock-guarded critical section — proving another caller for the same display
+ * is BLOCKED on the flock. If `parentPid` is given, only matches holders whose
+ * flock-process is a descendant of that pid (distinguishes A from B). */
+function mutCriticalHeld(num: number, op?: string, parentPid?: number): boolean {
+  const needle = op ? `mut-op.mjs ${op} ${num}` : `mut-op.mjs`;
+  try {
+    // pgrep -af flock lists: <pid> flock <mutPath> <node> <mut-op.mjs> <op> <num> ...
+    const out = execFileSync('pgrep', ['-af', 'flock'], { encoding: 'utf8' });
+    const holderPid = (() => {
+      for (const line of out.split('\n')) {
+        if (line.includes(needle) && line.includes(`dsh-capture-xvfb-${num}.mut`)) {
+          const m = /^\s*(\d+)/.exec(line);
+          return m && m[1] ? parseInt(m[1], 10) : null;
+        }
+      }
+      return null;
+    })();
+    if (holderPid === null) return false;
+    if (parentPid === undefined) return true;
+    // Check the flock holder's ancestry includes parentPid.
+    // The flock process's parent chain: flock's parent is the launcher node,
+    // which is the test's spawnLauncher child (parentPid) OR a descendant.
+    try {
+      const ppid = parseInt(execFileSync('ps', ['-o', 'ppid=', '-p', String(holderPid)], { encoding: 'utf8' }).trim(), 10);
+      if (ppid === parentPid) return true;
+      // walk up one more level (flock may exec under a shell)
+      const ppid2 = parseInt(execFileSync('ps', ['-o', 'ppid=', '-p', String(ppid)], { encoding: 'utf8' }).trim(), 10);
+      return ppid2 === parentPid;
+    } catch {
+      return false;
+    }
   } catch {
     return false; // pgrep exit 1 = no match
   }

@@ -1,42 +1,48 @@
 /**
- * Unit tests for the pure helpers in scripts/capture/xvfb-display.mjs.
+ * Unit tests for the token-based display-ownership helpers
+ * (scripts/capture/xvfb-display.mjs).
  *
- * These test the OWNERSHIP/CONFLICT contract without Xvfb: the lockfile is
- * atomic (O_EXCL), a second claim of the same display fails, cleanup never
- * touches a socket that pre-existed, and explicit-display claiming fails on
- * an occupied display rather than clobbering it. The real Xvfb allocation is
- * covered by tests/xvfb-display.integration.test.ts.
+ * These test the OWNERSHIP / compare-and-release contract without Xvfb:
+ *  - acquireDisplay returns a fresh unforgeable token (UUID); O_EXCL makes a
+ *    second acquire of the same display fail.
+ *  - releaseOwned is compare-and-release: only the token-holder releases; a
+ *    stale/wrong token is a no-op (cannot delete a new owner's lock).
+ *  - cleanOwnedSocket re-verifies ownership at unlink time (token must still
+ *    match the lockfile) — the core cleanup-race fix.
+ *  - findFreeDisplay / claimExplicit return { num, token } handles; an explicit
+ *    display already occupied fails CLOSED.
+ *  - acquireStale reclaims a dead-owner lock but never a live one.
  */
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
   acquireDisplay,
+  acquireStale,
   claimExplicit,
+  cleanOwnedSocket,
   findFreeDisplay,
   lockPath,
-  releaseDisplay,
+  readOwner,
+  releaseOwned,
   shouldCleanSocket,
   socketPath
 } from '../scripts/capture/xvfb-display.mjs';
 
-// Use a private lockDir so concurrent vitest runs don't fight over /tmp locks.
 let dir: string;
 const lockDir = () => dir;
 
-function freshDir() {
+beforeEach(() => {
   try {
     rmSync(dir, { recursive: true, force: true });
   } catch {
     /* ignore */
   }
   dir = mkdtempSync(join(tmpdir(), 'dsh-xvfb-units-'));
-}
-
-beforeEach(freshDir);
+});
 afterEach(() => {
   try {
     rmSync(dir, { recursive: true, force: true });
@@ -45,89 +51,150 @@ afterEach(() => {
   }
 });
 
-describe('lockfile ownership (atomic O_EXCL)', () => {
-  it('acquireDisplay wins the first claim and loses the second on the same number', () => {
+describe('acquireDisplay (token + O_EXCL)', () => {
+  it('returns a fresh token on first acquire and null on the second', () => {
     const n = 500;
-    expect(acquireDisplay(n, { lockDir: lockDir() })).toBe(true);
-    expect(existsSync(lockPath(n, { lockDir: lockDir() }))).toBe(true);
-    // A second claim of the SAME display fails (lock held) — no clobbering.
-    expect(acquireDisplay(n, { lockDir: lockDir() })).toBe(false);
+    const tok = acquireDisplay(n, { lockDir: lockDir() });
+    expect(tok).not.toBeNull();
+    expect(typeof tok).toBe('string');
+    expect(acquireDisplay(n, { lockDir: lockDir() })).toBeNull(); // O_EXCL fails
   });
 
-  it('releaseDisplay frees our own lock so it can be re-claimed', () => {
-    const n = 501;
-    expect(acquireDisplay(n, { lockDir: lockDir() })).toBe(true);
-    releaseDisplay(n, { lockDir: lockDir() });
-    expect(existsSync(lockPath(n, { lockDir: lockDir() }))).toBe(false);
-    expect(acquireDisplay(n, { lockDir: lockDir() })).toBe(true);
-    releaseDisplay(n, { lockDir: lockDir() });
-  });
-
-  it('releaseDisplay on a lock we do NOT own is a no-op (no throw)', () => {
-    expect(() => releaseDisplay(999, { lockDir: lockDir() })).not.toThrow();
+  it('records the token + pid in the lockfile', () => {
+    const tok = acquireDisplay(501, { lockDir: lockDir() })!;
+    const owner = readOwner(501, { lockDir: lockDir() });
+    expect(owner).not.toBeNull();
+    expect(owner!.token).toBe(tok);
+    expect(typeof owner!.pid).toBe('number');
   });
 });
 
-describe('findFreeDisplay (auto-allocation, no conflict)', () => {
-  it('allocates a display whose socket is absent and lock is acquirable', () => {
-    const n = findFreeDisplay({ min: 510, max: 520, lockDir: lockDir() });
-    expect(n).not.toBeNull();
-    expect(existsSync(socketPath(n!))).toBe(false);
-    expect(existsSync(lockPath(n!, { lockDir: lockDir() }))).toBe(true);
+describe('releaseOwned (compare-and-release)', () => {
+  it('releases when the token matches', () => {
+    const tok = acquireDisplay(510, { lockDir: lockDir() })!;
+    expect(releaseOwned(510, tok, { lockDir: lockDir() })).toBe(true);
+    expect(existsSync(lockPath(510, { lockDir: lockDir() }))).toBe(false);
   });
 
-  it('does NOT re-allocate a display already claimed by another (concurrent-safe)', () => {
-    // Pre-claim 511 so findFree must skip it.
-    expect(acquireDisplay(511, { lockDir: lockDir() })).toBe(true);
-    const n = findFreeDisplay({ min: 511, max: 513, lockDir: lockDir() });
-    expect(n).not.toBe(511);
-    expect(n!).toBeGreaterThanOrEqual(512);
-    releaseDisplay(511, { lockDir: lockDir() });
-    releaseDisplay(n!, { lockDir: lockDir() });
+  it('is a NO-OP when the token does NOT match (cannot delete a new owner lock)', () => {
+    const tokA = acquireDisplay(511, { lockDir: lockDir() })!;
+    // A stale/wrong token must NOT release A's lock.
+    expect(releaseOwned(511, 'wrong-token', { lockDir: lockDir() })).toBe(false);
+    expect(existsSync(lockPath(511, { lockDir: lockDir() }))).toBe(true);
+    // The correct token still works.
+    expect(releaseOwned(511, tokA, { lockDir: lockDir() })).toBe(true);
   });
 
-  it('returns null when the entire scan range is locked', () => {
-    acquireDisplay(530, { lockDir: lockDir() });
-    acquireDisplay(531, { lockDir: lockDir() });
-    expect(findFreeDisplay({ min: 530, max: 531, lockDir: lockDir() })).toBeNull();
-    releaseDisplay(530, { lockDir: lockDir() });
-    releaseDisplay(531, { lockDir: lockDir() });
+  it('is a NO-OP when the lock is already gone', () => {
+    const tok = acquireDisplay(512, { lockDir: lockDir() })!;
+    releaseOwned(512, tok, { lockDir: lockDir() });
+    expect(releaseOwned(512, tok, { lockDir: lockDir() })).toBe(false);
   });
 });
 
-describe('claimExplicit (DSH_XVFB_DISPLAY)', () => {
-  it('claims a free explicit display', () => {
-    expect(claimExplicit(600, { lockDir: lockDir() })).toBe(true);
-    releaseDisplay(600, { lockDir: lockDir() });
+describe('cleanOwnedSocket (re-verify ownership at unlink time)', () => {
+  // These tests cannot create a real AF_UNIX socket without Xvfb, but they
+  // prove the ownership logic: cleanOwnedSocket removes the socket file ONLY
+  // when the token still matches the lockfile.
+  const num = 520;
+
+  it('removes the socket file when ownership is still ours at unlink time', () => {
+    const tok = acquireDisplay(num, { lockDir: lockDir() })!;
+    // Simulate the X11 socket file (plain file stands in for the socket).
+    writeFileSync(socketPath(num), '');
+    const removed = cleanOwnedSocket(
+      { num, token: tok, socketExistedBefore: false, xvfbPidAlive: true },
+      { lockDir: lockDir() }
+    );
+    expect(removed).toBe(true);
+    expect(existsSync(socketPath(num))).toBe(false);
   });
 
-  it('FAILS (false) on an explicit display whose socket already exists — no clobber', () => {
-    // Simulate a pre-existing X server socket by creating the socket file in
-    // a private dir. displayOccupied reads /tmp/.X11-unix — we cannot easily
-    // fake that path here, so this asserts the contract via shouldCleanSocket
-    // and the claimExplicit lock path. Instead we verify that an explicit
-    // display already LOCKED fails (the concurrent-second-run case).
-    expect(claimExplicit(601, { lockDir: lockDir() })).toBe(true);
-    // A second run claiming the same explicit display must fail.
-    expect(claimExplicit(601, { lockDir: lockDir() })).toBe(false);
-    releaseDisplay(601, { lockDir: lockDir() });
+  it('is a NO-OP when the lock no longer carries our token (new owner took over)', () => {
+    const tokA = acquireDisplay(num, { lockDir: lockDir() })!;
+    writeFileSync(socketPath(num), '');
+    // Simulate a new owner B taking the lock: A released, B acquired a new token.
+    releaseOwned(num, tokA, { lockDir: lockDir() });
+    const tokB = acquireDisplay(num, { lockDir: lockDir() })!;
+    expect(tokB).not.toBe(tokA);
+    // A's LATE cleanup with A's stale token must NOT delete the socket B may own.
+    const removed = cleanOwnedSocket(
+      { num, token: tokA, socketExistedBefore: false, xvfbPidAlive: true },
+      { lockDir: lockDir() }
+    );
+    expect(removed).toBe(false);
+    expect(existsSync(socketPath(num))).toBe(true); // untouched
+  });
+
+  it('is a NO-OP when the lock is gone entirely', () => {
+    const tok = acquireDisplay(num, { lockDir: lockDir() })!;
+    writeFileSync(socketPath(num), '');
+    releaseOwned(num, tok, { lockDir: lockDir() });
+    const removed = cleanOwnedSocket(
+      { num, token: tok, socketExistedBefore: false, xvfbPidAlive: true },
+      { lockDir: lockDir() }
+    );
+    expect(removed).toBe(false);
+    expect(existsSync(socketPath(num))).toBe(true);
+  });
+
+  it('is a NO-OP when shouldCleanSocket is false (socket pre-existed / Xvfb not up)', () => {
+    const tok = acquireDisplay(num, { lockDir: lockDir() })!;
+    writeFileSync(socketPath(num), '');
+    expect(cleanOwnedSocket({ num, token: tok, socketExistedBefore: true, xvfbPidAlive: true }, { lockDir: lockDir() })).toBe(false);
+    expect(cleanOwnedSocket({ num, token: tok, socketExistedBefore: false, xvfbPidAlive: false }, { lockDir: lockDir() })).toBe(false);
+    expect(existsSync(socketPath(num))).toBe(true);
   });
 });
 
-describe('shouldCleanSocket (ownership before deletion)', () => {
-  it('allows cleanup when socket did NOT exist before and our Xvfb came up', () => {
-    expect(shouldCleanSocket({ num: 1, socketExistedBefore: false, xvfbPidAlive: true })).toBe(true);
+describe('shouldCleanSocket (start-time precondition)', () => {
+  it('allows cleanup only when socket did NOT pre-exist AND our Xvfb came up', () => {
+    expect(shouldCleanSocket({ socketExistedBefore: false, xvfbPidAlive: true })).toBe(true);
+    expect(shouldCleanSocket({ socketExistedBefore: true, xvfbPidAlive: true })).toBe(false);
+    expect(shouldCleanSocket({ socketExistedBefore: false, xvfbPidAlive: false })).toBe(false);
+  });
+});
+
+describe('findFreeDisplay / claimExplicit (return token handles)', () => {
+  it('findFreeDisplay returns { num, token } for a free display', () => {
+    const h = findFreeDisplay({ min: 530, max: 540, lockDir: lockDir() });
+    expect(h).not.toBeNull();
+    expect(h!.token).not.toBeNull();
+    expect(existsSync(lockPath(h!.num, { lockDir: lockDir() }))).toBe(true);
   });
 
-  it('FORBIDS cleanup when the socket pre-existed (someone else created it)', () => {
-    expect(shouldCleanSocket({ num: 1, socketExistedBefore: true, xvfbPidAlive: true })).toBe(false);
+  it('findFreeDisplay skips a display already locked by another', () => {
+    expect(acquireDisplay(541, { lockDir: lockDir() })!).not.toBeNull();
+    const h = findFreeDisplay({ min: 541, max: 543, lockDir: lockDir() });
+    expect(h!.num).not.toBe(541);
   });
 
-  it('FORBIDS cleanup when our Xvfb did NOT come up (can\'t prove we made the socket)', () => {
-    expect(shouldCleanSocket({ num: 1, socketExistedBefore: false, xvfbPidAlive: false })).toBe(false);
+  it('claimExplicit returns null when the explicit display is already locked', () => {
+    expect(acquireDisplay(550, { lockDir: lockDir() })!).not.toBeNull();
+    expect(claimExplicit(550, { lockDir: lockDir() })).toBeNull();
   });
 
-  it('forbids cleanup when both signals are absent/uncertain', () => {
-    expect(shouldCleanSocket({ num: 1, socketExistedBefore: true, xvfbPidAlive: false })).toBe(false);
+  it('claimExplicit returns { num, token } for a free explicit display', () => {
+    const h = claimExplicit(551, { lockDir: lockDir() });
+    expect(h).not.toBeNull();
+    expect(h!.num).toBe(551);
+  });
+});
+
+describe('acquireStale (reclaim dead-owner lock, never a live one)', () => {
+  it('reclaims a lock whose owner pid is dead', () => {
+    // Write a lock with a dead pid.
+    writeFileSync(lockPath(560, { lockDir: lockDir() }), 'oldtoken\npid=999999\n');
+    const tok = acquireStale(560, { lockDir: lockDir() }, () => false); // pid is dead
+    expect(tok).not.toBeNull();
+    expect(readOwner(560, { lockDir: lockDir() })!.token).toBe(tok);
+  });
+
+  it('refuses to reclaim a lock whose owner is still alive', () => {
+    writeFileSync(lockPath(561, { lockDir: lockDir() }), 'oldtoken\npid=999999\n');
+    const tok = acquireStale(561, { lockDir: lockDir() }, () => true); // pid alive
+    expect(tok).toBeNull();
+    // Lock untouched (live owner).
+    expect(readOwner(561, { lockDir: lockDir() })!.token).toBe('oldtoken');
   });
 });

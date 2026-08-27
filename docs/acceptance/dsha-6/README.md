@@ -49,17 +49,22 @@ process-tree behaviour is covered by `tests/launcher-integration.test.ts`
 and asserts every pid is gone afterward — on both the timeout and normal-exit
 paths).
 
-Conflict-free display ownership (no shared-resource clobbering): the launcher
-NEVER uses a fixed display number and NEVER unconditionally `rm`s
-`/tmp/.X11-unix/X<display>` — it atomically claims a free display (lockfile
-`O_EXCL` + socket-absent via `xvfb-display.mjs`), and removes a socket only
-when this run PROVED it created it (socket absent before start + this run's
-Xvfb pid came up). An explicit `DSH_XVFB_DISPLAY` already in use fails CLOSED
-rather than clobbering the existing server. Two concurrent captures therefore
-get DISTINCT displays; a stale socket from a prior run is never mistaken for
-ownership. Real-Xvfb allocation/confluence is covered by
-`tests/xvfb-display.integration.test.ts`; pure ownership helpers by
-`tests/xvfb-display.test.ts`.
+Conflict-free, token-based display ownership (no cleanup race): the launcher
+NEVER uses a fixed display and NEVER unconditionally `rm`s a shared
+`/tmp/.X11-unix/X<display>`. It claims a display with an UNFORGEABLE owner
+token (UUID written into an `O_EXCL` lockfile via `xvfb-display.mjs`). Cleanup
+is a **compare-and-release critical section**: the X11 socket is unlinked ONLY
+IF the lockfile STILL carries our token (re-verified at unlink time by
+`cleanOwnedSocket`), and the lock is released AFTER the socket unlink
+(`releaseOwned`, compare-and-release). So a concurrent run B cannot win the
+freed lock and create its socket before our unlink completes, and a LATE /
+duplicate cleanup whose token no longer matches the lockfile is a no-op (it
+cannot delete a new owner's lock/socket). An explicit `DSH_XVFB_DISPLAY`
+already in use fails CLOSED. Stale locks whose owner pid is dead are
+reclaimable. Pure helpers are unit-tested by `tests/xvfb-display.test.ts`;
+real allocation by `tests/xvfb-display.integration.test.ts`; the adversarial
+cleanup race (A paused mid-cleanup while B competes for the same display) by
+`tests/xvfb-cleanup-race.integration.test.ts`.
 
 **Scope / honesty note:** these are **Xvfb/headless captures** of the real
 built renderer. They verify layout bounds, focus placement, no page-level
@@ -154,13 +159,24 @@ plus the viewport size.
   both the timeout path and the normal-exit path (where descendants are
   re-parented to init). Proves the process-tree reaper leaves no orphans.
   Reliable cleanup even on failure.
-- `tests/xvfb-display.test.ts` (12): the display-ownership pure helpers —
-  atomic lockfile (O_EXCL) claim, second-claim-fails, auto-allocation skips
-  locked displays, and `shouldCleanSocket` forbids deleting a pre-existing
-  socket. Pure node.
+- `tests/xvfb-display.test.ts` (16): the token-based display-ownership pure
+  helpers — atomic `O_EXCL` claim returns a fresh UUID token; `releaseOwned`
+  is compare-and-release (only the token-holder releases; a stale/wrong token
+  is a no-op); `cleanOwnedSocket` re-verifies ownership at unlink time (the
+  core cleanup-race fix); `acquireStale` reclaims a dead-owner lock but never
+  a live one. Pure node.
 - `tests/xvfb-display.integration.test.ts` (4): ACTUALLY starts real Xvfb
   processes — two concurrent starts get DISTINCT displays; an explicit
   display already in use fails CLOSED and leaves the existing server/socket
-  usable; cleanup only removes a socket THIS run created, never a
-  pre-existing one. Skips cleanly when `Xvfb` is absent.
+  usable; `cleanOwnedSocket` only removes a socket THIS run still owns, never
+  a pre-existing or taken-over one. Skips cleanly when `Xvfb` is absent.
+- `tests/xvfb-cleanup-race.integration.test.ts` (1): the ADVERSARIAL cleanup
+  race — two launchers sharing the SAME production lockDir and SAME explicit
+  display, truly concurrent. A is driven into cleanup fast and PAUSED
+  mid-cleanup (`DSH_CLEANUP_BARRIER`) after killing its Xvfb; B then tries the
+  same display and must FAIL CLOSED (A still owns the lock). After A's
+  barrier is released A finishes (compare-and-release socket unlink + lock
+  release); a LATE/duplicate cleanup with A's stale token is a no-op (does NOT
+  delete B's later-acquired lock/socket); B can then claim and start. Covers
+  the success/fail/timeout paths with no leftover processes.
 - Existing suites unchanged and still green (see full run below).

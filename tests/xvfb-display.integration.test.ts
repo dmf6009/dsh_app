@@ -18,16 +18,18 @@
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
 
 import {
   claimExplicit,
+  cleanOwnedSocket,
   displayOccupied,
   findFreeDisplay,
-  releaseDisplay,
+  readOwner,
+  releaseOwned,
   socketPath,
   shouldCleanSocket
 } from '../scripts/capture/xvfb-display.mjs';
@@ -77,16 +79,15 @@ async function waitForSocket(displayNum: number, pid: number | undefined, deadli
   return false;
 }
 
-/** All Xvfb processes we started, for reliable cleanup. `ownedSocket` is true
- * for Xvfb processes THIS test started on a display whose socket did not exist
- * before — those sockets are ours and must be cleaned to avoid polluting the
- * shared /tmp/.X11-unix namespace for later runs. */
+/** All Xvfb processes we started, for reliable cleanup. Each carries the
+ * owner TOKEN for its display so cleanup uses compare-and-release — a test
+ * never deletes a socket/lock whose token it no longer holds. */
 const started: Array<{
   child: { pid?: number | null } | null;
   tmpDir?: string;
   displayNum?: number;
+  token?: string;
   lockDir?: string;
-  ownedSocket?: boolean;
 }> = [];
 
 function reapHandle(h: (typeof started)[number]) {
@@ -104,21 +105,18 @@ function reapHandle(h: (typeof started)[number]) {
       /* best effort */
     }
   }
-  if (h.displayNum !== undefined && h.lockDir) {
+  // Compare-and-release cleanup using THIS test's token. cleanOwnedSocket
+  // removes the socket ONLY IF our token still owns the lock; releaseOwned
+  // removes the lock ONLY IF our token still matches. A foreign/overwritten
+  // token is a no-op — we never touch another owner's socket/lock.
+  if (h.displayNum !== undefined && h.token && h.lockDir) {
+    const xvfbPidAlive = !!(h.child && h.child.pid && isPidAliveSync(h.child.pid));
     try {
-      releaseDisplay(h.displayNum, { lockDir: h.lockDir });
-    } catch {
-      /* best effort */
-    }
-  }
-  // Remove THIS test's own X11 socket (we started the Xvfb → we own it). We do
-  // NOT remove sockets we did not create (ownedSocket=false). This keeps the
-  // shared /tmp/.X11-unix namespace clean after the suite, without ever
-  // touching a foreign server.
-  if (h.ownedSocket && h.displayNum !== undefined) {
-    try {
-      const sock = socketPath(h.displayNum);
-      if (existsSync(sock)) unlinkSync(sock);
+      cleanOwnedSocket(
+        { num: h.displayNum, token: h.token, socketExistedBefore: false, xvfbPidAlive },
+        { lockDir: h.lockDir }
+      );
+      releaseOwned(h.displayNum, h.token, { lockDir: h.lockDir });
     } catch {
       /* best effort */
     }
@@ -134,84 +132,93 @@ afterEach(() => {
 
 describe('real Xvfb — conflict-free display allocation', { skip: skipNoXvfb() }, () => {
   it('two concurrent Xvfb starts get DISTINCT displays (no socket clash)', async () => {
-    // Run A: allocate a display and start Xvfb on it.
+    // Run A: allocate a display (with token) and start Xvfb on it.
     const lockDirA = mkdtempSync(join(tmpdir(), 'dsh-xvfb-A-'));
-    const numA = findFreeDisplay({ min: 620, max: 660, lockDir: lockDirA });
-    expect(numA).not.toBeNull();
-    const a = startXvfb(numA!);
-    started.push({ child: a.child, tmpDir: a.tmpDir, displayNum: numA!, lockDir: lockDirA, ownedSocket: true });
-    expect(await waitForSocket(numA!, a.child.pid)).toBe(true);
-    expect(displayOccupied(numA!)).toBe(true);
+    const hA = findFreeDisplay({ min: 620, max: 660, lockDir: lockDirA });
+    expect(hA).not.toBeNull();
+    const a = startXvfb(hA!.num);
+    started.push({ child: a.child, tmpDir: a.tmpDir, displayNum: hA!.num, token: hA!.token, lockDir: lockDirA });
+    expect(await waitForSocket(hA!.num, a.child.pid)).toBe(true);
 
-    // Run B: concurrently allocate ANOTHER display — must not pick numA.
+    // Run B: concurrently allocate ANOTHER display — must not pick hA.num.
     const lockDirB = mkdtempSync(join(tmpdir(), 'dsh-xvfb-B-'));
-    const numB = findFreeDisplay({ min: 620, max: 660, lockDir: lockDirB });
-    expect(numB).not.toBeNull();
-    expect(numB).not.toBe(numA);
-    const b = startXvfb(numB!);
-    started.push({ child: b.child, tmpDir: b.tmpDir, displayNum: numB!, lockDir: lockDirB, ownedSocket: true });
-    expect(await waitForSocket(numB!, b.child.pid)).toBe(true);
-    expect(displayOccupied(numB!)).toBe(true);
+    const hB = findFreeDisplay({ min: 620, max: 660, lockDir: lockDirB });
+    expect(hB).not.toBeNull();
+    expect(hB!.num).not.toBe(hA!.num);
+    expect(hB!.token).not.toBe(hA!.token);
+    const b = startXvfb(hB!.num);
+    started.push({ child: b.child, tmpDir: b.tmpDir, displayNum: hB!.num, token: hB!.token, lockDir: lockDirB });
+    expect(await waitForSocket(hB!.num, b.child.pid)).toBe(true);
 
     // Both sockets coexist — run A's socket is NOT removed by run B.
-    expect(existsSync(socketPath(numA!))).toBe(true);
+    expect(existsSync(socketPath(hA!.num))).toBe(true);
   }, 20000);
 
   it('explicit DSH_XVFB_DISPLAY already in use → second claim fails CLOSED, existing socket survives', async () => {
     const lockDirA = mkdtempSync(join(tmpdir(), 'dsh-xvfb-exp-A-'));
     const num = 670;
-    // Run A occupies num: socket comes up + lock held.
-    expect(claimExplicit(num, { lockDir: lockDirA })).toBe(true);
+    // Run A occupies num: lock held with A's token, socket comes up.
+    const hA = claimExplicit(num, { lockDir: lockDirA });
+    expect(hA).not.toBeNull();
     const a = startXvfb(num);
-    started.push({ child: a.child, tmpDir: a.tmpDir, displayNum: num, lockDir: lockDirA, ownedSocket: true });
+    started.push({ child: a.child, tmpDir: a.tmpDir, displayNum: num, token: hA!.token, lockDir: lockDirA });
     expect(await waitForSocket(num, a.child.pid)).toBe(true);
-    expect(displayOccupied(num)).toBe(true);
 
-    // Run B tries the SAME explicit display. displayOccupied sees the live
-    // socket → claimExplicit must fail (false), NOT clobber the existing server.
+    // Run B tries the SAME explicit display → claimExplicit must return null
+    // (fail-closed), NOT clobber the existing server/lock.
     const lockDirB = mkdtempSync(join(tmpdir(), 'dsh-xvfb-exp-B-'));
-    expect(claimExplicit(num, { lockDir: lockDirB })).toBe(false);
+    expect(claimExplicit(num, { lockDir: lockDirB })).toBeNull();
     // The existing X server / socket is untouched and still up.
-    expect(displayOccupied(num)).toBe(true);
     expect(existsSync(socketPath(num))).toBe(true);
-    // B holds no lock for num.
-    expect(existsSync(join(lockDirB, `dsh-capture-xvfb-${num}.lock`))).toBe(false);
-    // Clean up B's temp lock dir.
+    // A's lock still carries A's token (B did not take over).
+    expect(readOwner(num, { lockDir: lockDirA })!.token).toBe(hA!.token);
     rmSync(lockDirB, { recursive: true, force: true });
   }, 20000);
 
-  it('cleanup only removes a socket THIS run created — never a pre-existing one', async () => {
-    // A pre-existing X server on num (run "other") — socket present.
+  it('cleanOwnedSocket only removes a socket THIS run still owns — never a pre-existing or taken-over one', async () => {
+    // A pre-existing X server on num (run "other") — socket present + locked.
     const lockDirOther = mkdtempSync(join(tmpdir(), 'dsh-xvfb-pre-'));
     const num = 680;
-    expect(claimExplicit(num, { lockDir: lockDirOther })).toBe(true);
+    const hOther = claimExplicit(num, { lockDir: lockDirOther });
+    expect(hOther).not.toBeNull();
     const other = startXvfb(num);
-    started.push({ child: other.child, tmpDir: other.tmpDir, displayNum: num, lockDir: lockDirOther, ownedSocket: true });
+    started.push({ child: other.child, tmpDir: other.tmpDir, displayNum: num, token: hOther!.token, lockDir: lockDirOther });
     expect(await waitForSocket(num, other.child.pid)).toBe(true);
 
     // A second run sees the socket already exists → socketExistedBefore=true.
+    // shouldCleanSocket forbids removal; cleanOwnedSocket with a FOREIGN token
+    // (a second run's hypothetical token) must NOT delete the pre-existing socket.
     const existedBefore = displayOccupied(num); // true
-    // shouldCleanSocket must forbid removal: we did not create this socket.
-    expect(shouldCleanSocket({ num, socketExistedBefore: existedBefore, xvfbPidAlive: true })).toBe(false);
-    // Simulating the "second run's cleanup" must NOT delete the pre-existing socket.
-    // (The launcher only calls cleanup with a displayNum when shouldCleanSocket=true.)
+    expect(shouldCleanSocket({ socketExistedBefore: existedBefore, xvfbPidAlive: true })).toBe(false);
+    // Even with shouldCleanSocket precondition passing, a FOREIGN token fails
+    // the lockfile compare → no unlink. Use a random foreign token:
+    const foreignTok = '00000000-0000-0000-0000-000000000000';
+    expect(
+      cleanOwnedSocket({ num, token: foreignTok, socketExistedBefore: false, xvfbPidAlive: true }, { lockDir: lockDirOther })
+    ).toBe(false);
     expect(existsSync(socketPath(num))).toBe(true);
   }, 20000);
 
-  it('a run that owns its socket may clean it; success/fail paths leave no this-run residue', async () => {
+  it('a run that owns its socket may clean it (compare-and-release); no this-run residue', async () => {
     // Run owns its display: socket absent before, our Xvfb came up.
     const lockDir = mkdtempSync(join(tmpdir(), 'dsh-xvfb-own-'));
-    const num = findFreeDisplay({ min: 690, max: 710, lockDir });
-    expect(num).not.toBeNull();
-    const before = displayOccupied(num!); // false (we just claimed a free one)
-    const a = startXvfb(num!);
-    started.push({ child: a.child, tmpDir: a.tmpDir, displayNum: num!, lockDir, ownedSocket: true });
-    expect(await waitForSocket(num!, a.child.pid)).toBe(true);
-    // Ownership proven → cleanup is allowed.
-    expect(shouldCleanSocket({ num: num!, socketExistedBefore: before, xvfbPidAlive: !!a.child.pid })).toBe(true);
-    // After tree-killing our Xvfb, no Xvfb process from this run remains.
+    const h = findFreeDisplay({ min: 690, max: 710, lockDir });
+    expect(h).not.toBeNull();
+    const before = displayOccupied(h!.num); // false
+    const a = startXvfb(h!.num);
+    started.push({ child: a.child, tmpDir: a.tmpDir, displayNum: h!.num, token: h!.token, lockDir });
+    expect(await waitForSocket(h!.num, a.child.pid)).toBe(true);
+    // Kill our Xvfb, then compare-and-release cleanup.
     if (a.child.pid) treeKill({ pid: a.child.pid, signal: 'SIGKILL', graceMs: 500 });
     await new Promise((r) => setTimeout(r, 200));
+    const xvfbPidAlive = !!(a.child.pid && isPidAliveSync(a.child.pid));
+    // cleanOwnedSocket re-verifies ownership (token still ours) → removes socket.
+    cleanOwnedSocket({ num: h!.num, token: h!.token, socketExistedBefore: before, xvfbPidAlive }, { lockDir });
+    // releaseOwned (compare-and-release) → removes our lock.
+    expect(releaseOwned(h!.num, h!.token, { lockDir })).toBe(true);
+    // Stale duplicate cleanup with our now-released token is a no-op.
+    expect(releaseOwned(h!.num, h!.token, { lockDir })).toBe(false);
+    // No Xvfb from this run remains.
     if (a.child.pid) expect(isPidAliveSync(a.child.pid)).toBe(false);
   }, 20000);
 });

@@ -20,13 +20,18 @@
  *  - on every exit path (success, timeout, error) it tree-kills Electron then
  *    kills Xvfb, so no descendants are orphaned.
  *
- * Conflict-free display ownership (no shared-resource clobbering): the
- * launcher NEVER uses a fixed display number and NEVER unconditionally `rm`s
- * `/tmp/.X11-unix/X<display>` — it atomically claims a free display (lockfile
- * O_EXCL + socket-absent), and removes a socket only when this run PROVED it
- * created it (socket absent before start + this run's Xvfb pid came up). An
- * explicit DSH_XVFB_DISPLAY already in use fails CLOSED rather than clobbering
- * the existing server. See scripts/capture/xvfb-display.mjs.
+ * Conflict-free, token-based display ownership (no cleanup race): the launcher
+ * NEVER uses a fixed display and NEVER unconditionally `rm`s a shared
+ * `/tmp/.X11-unix/X<display>`. It claims a display with an UNFORGEABLE owner
+ * token (UUID written into the lockfile via O_EXCL). Cleanup is a
+ * compare-and-release critical section: the X11 socket is unlinked ONLY IF the
+ * lockfile STILL carries our token (re-verified at unlink time), and the lock
+ * is released AFTER the socket unlink — so no concurrent run B can win the
+ * freed lock and create its socket before our unlink. A late/duplicate cleanup
+ * whose token no longer matches the lockfile is a no-op (cannot delete B's
+ * lock/socket). An explicit DSH_XVFB_DISPLAY already in use fails CLOSED.
+ * Stale locks whose owner pid is dead are reclaimable. See
+ * scripts/capture/xvfb-display.mjs.
  *
  * Fail-closed: if the Electron binary, the built renderer entry, or Xvfb (on a
  * display-less Linux box) is missing, the command exits NON-ZERO — never a
@@ -49,10 +54,10 @@ import { exitCodeFor, isPidAliveSync, runChild, treeKill } from './proc-tree.mjs
 import {
   findFreeDisplay,
   claimExplicit,
-  releaseDisplay,
+  releaseOwned,
+  cleanOwnedSocket,
   socketExistedBefore,
-  shouldCleanSocket,
-  socketPath as xvfbSocketPath
+  shouldCleanSocket
 } from './xvfb-display.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -110,19 +115,22 @@ const timeoutMs = (() => {
 })();
 const childArgs = [mainCjs, ...extraElectronArgs];
 
-// ---- Managed Xvfb (headless Linux, conflict-free display ownership) ---------
-// Allocate a display we PROVE we own (atomic lockfile + socket-didn't-exist-
-// before-start), start our own Xvfb, wait for readiness, then export DISPLAY.
-// We never use a fixed display and never rm a shared socket we didn't create.
+// ---- Managed Xvfb (headless Linux, token-based display ownership) -----------
+// Claim a display with an UNFORGEABLE owner token (lockfile), start our Xvfb,
+// wait for readiness, export DISPLAY. Cleanup is a compare-and-release critical
+// section: the socket is unlinked ONLY while our token still owns the lockfile
+// (re-verified at unlink time), and the lock is released AFTER the socket
+// unlink — so no concurrent run B can win the lock and create its own socket
+// in the window before our unlink. We never rm a shared socket.
 let xvfbChild = null;
 let display = null;
 let displayNum = null;
+let ownerToken = null; // unforgeable claim handle; null = no claim
 let authFile = null;
-let xvfbOwnedSocket = false; // true only if THIS run created the X11 socket
+let socketExisted = false; // did the X11 socket exist BEFORE we started our Xvfb?
 if (useXvfb) {
-  // 1. Claim a display. DSH_XVFB_DISPLAY is honored ONLY if free (socket absent
-  //    AND lock acquirable) — otherwise fail-closed instead of clobbering an
-  //    existing server. No explicit value → auto-allocate a free one.
+  // 1. Claim a display with a token. DSH_XVFB_DISPLAY is honored ONLY if free
+  //    (socket absent AND lock acquirable) — otherwise fail-closed.
   const explicit = process.env.DSH_XVFB_DISPLAY != null ? parseInt(process.env.DSH_XVFB_DISPLAY, 10) : NaN;
   let claimed;
   if (Number.isFinite(explicit)) {
@@ -134,20 +142,19 @@ if (useXvfb) {
       );
       process.exit(1);
     }
-    displayNum = explicit;
   } else {
     claimed = findFreeDisplay();
-    if (claimed === null) {
+    if (!claimed) {
       console.error('[capture] FAIL — could not allocate a free X display in the scan range (fail-closed).');
       process.exit(1);
     }
-    displayNum = claimed;
   }
+  displayNum = claimed.num;
+  ownerToken = claimed.token;
   display = `:${displayNum}`;
 
   // 2. Snapshot whether the socket ALREADY existed before we start our Xvfb.
-  //    If it did, we did NOT create it → we must never delete it on cleanup.
-  const socketExisted = socketExistedBefore(displayNum);
+  socketExisted = socketExistedBefore(displayNum);
 
   // 3. Private Xauthority in a private temp dir (never touch the user's).
   const tmpDir = execFileSync('mktemp', ['-d', '-t', 'dsh-capture.Xvfb.XXXXXX'], { encoding: 'utf8' }).trim();
@@ -172,26 +179,17 @@ if (useXvfb) {
   if (!ready) {
     console.error(`[capture] FAIL — Xvfb did not become ready on ${display} within 8s (fail-closed).`);
     if (xvfbChild.pid) treeKill({ pid: xvfbChild.pid, signal: 'SIGTERM', graceMs: 1500 });
-    // Ownership cleanup: release OUR lock; only remove the socket if we
-    // proved we created it (didn't exist before, and our Xvfb was the one
-    // that came up). A failed start where the socket pre-existed leaves it.
-    releaseDisplay(displayNum);
-    const owned = shouldCleanSocket({
-      num: displayNum,
-      socketExistedBefore: socketExisted,
-      xvfbPidAlive: !!(xvfbChild.pid && isPidAliveSync(xvfbChild.pid))
-    });
-    cleanupResources(authFile ? path.dirname(authFile) : null, owned ? displayNum : null);
+    // OWNERSHIP cleanup (compare-and-release): kill Xvfb, then unlink the
+    // socket ONLY IF our token still owns the lock (re-verified at unlink
+    // time), THEN release the lock. Order matters — no release before unlink.
+    const xvfbPidAlive = !!(xvfbChild.pid && isPidAliveSync(xvfbChild.pid));
+    cleanOwnedSocket(
+      { num: displayNum, token: ownerToken, socketExistedBefore: socketExisted, xvfbPidAlive }
+    );
+    releaseOwned(displayNum, ownerToken);
+    cleanupAuthDir(authFile ? path.dirname(authFile) : null);
     process.exit(1);
   }
-
-  // 5. Confirm ownership: our Xvfb came up on a socket that didn't exist
-  //    before → this run owns that socket and may clean it later.
-  xvfbOwnedSocket = shouldCleanSocket({
-    num: displayNum,
-    socketExistedBefore: socketExisted,
-    xvfbPidAlive: !!(xvfbChild.pid && isPidAliveSync(xvfbChild.pid))
-  });
 }
 
 env.DISPLAY = display ?? env.DISPLAY ?? '';
@@ -206,7 +204,7 @@ const result = await runChild(electronPath, childArgs, {
   stdio: 'inherit'
 });
 
-// ---- Cleanup: reap Electron tree, then Xvfb; release only OWNED resources --
+// ---- Cleanup: reap Electron tree, then Xvfb; COMPARE-AND-RELEASE owned X11 --
 if (result.pid) {
   // runChild already tree-kills on finish, but be explicit/belt-and-suspenders.
   treeKill({ pid: result.pid, signal: 'SIGTERM', graceMs: 1500 });
@@ -214,12 +212,31 @@ if (result.pid) {
 if (xvfbChild && xvfbChild.pid) {
   treeKill({ pid: xvfbChild.pid, signal: 'SIGTERM', graceMs: 1500 });
 }
-// Release OUR display lock (we created it). Remove the X11 socket ONLY if we
-// proved ownership (xvfbOwnedSocket) — never rm a shared socket we didn't
-// create. Xvfb normally removes its own socket on clean termination; this is
-// a best-effort residual sweep for our own socket only.
-if (displayNum !== null) releaseDisplay(displayNum);
-cleanupResources(authFile ? path.dirname(authFile) : null, xvfbOwnedSocket ? displayNum : null);
+// Test hook: if DSH_CLEANUP_BARRIER is set to a path, block here (after killing
+// Xvfb, before socket unlink / lock release) until that file exists. This lets
+// the adversarial integration test pause run A mid-cleanup and have run B
+// attempt to claim the same display concurrently. No-op in production (env
+// unset). Bounded so a wedged test cannot hang forever.
+const barrierPath = process.env.DSH_CLEANUP_BARRIER;
+if (barrierPath) {
+  await waitForBarrier(barrierPath, 30000);
+}
+// OWNERSHIP cleanup (the critical race fix): the X11 socket is unlinked ONLY
+// IF our owner token STILL owns the lockfile at unlink time (re-verified by
+// cleanOwnedSocket). The lockfile is released AFTER the socket unlink via
+// compare-and-release, so a concurrent run B cannot win the lock and create
+// its own socket before our unlink completes. A late/duplicate cleanup whose
+// token no longer matches the lockfile is a no-op — it cannot delete B's lock
+// or B's socket. Xvfb normally removes its own socket on clean termination;
+// cleanOwnedSocket is a best-effort residual sweep for our own socket only.
+if (displayNum !== null && ownerToken) {
+  const xvfbPidAlive = !!(xvfbChild && xvfbChild.pid && isPidAliveSync(xvfbChild.pid));
+  cleanOwnedSocket(
+    { num: displayNum, token: ownerToken, socketExistedBefore: socketExisted, xvfbPidAlive }
+  );
+  releaseOwned(displayNum, ownerToken);
+}
+cleanupAuthDir(authFile ? path.dirname(authFile) : null);
 
 const code = exitCodeFor(result);
 if (isTimeoutErrorShape(result)) {
@@ -230,6 +247,18 @@ if (isTimeoutErrorShape(result)) {
 process.exit(code);
 
 // ---- helpers ---------------------------------------------------------------
+
+/** Test hook: wait until `barrierPath` exists (bounded by deadlineMs). Used by
+ * the adversarial cleanup-race test to pause run A mid-cleanup. No-op when the
+ * path is never created (bounded timeout returns false). */
+async function waitForBarrier(barrierPath, deadlineMs) {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    if (existsSync(barrierPath)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return false;
+}
 
 /** Probe Xvfb readiness WITHOUT external X tools (xset/xdpyinfo may be
  * absent). Xvfb binds a Unix socket at /tmp/.X11-unix/X<display> once it is
@@ -268,25 +297,14 @@ async function waitForXvfb(disp, xvfbPid, deadlineMs) {
   return false;
 }
 
-/** Remove the private Xauthority temp dir, and — ONLY when the caller passes
- * a display number they have PROVEN this run owns — the X11 socket for it.
- * Never unconditionally rm a shared /tmp/.X11-unix socket; ownership is
- * established by the caller via shouldCleanSocket before this is called with
- * a non-null dispNum. Best-effort; never throws. */
-function cleanupResources(tmpDir, dispNum) {
+/** Remove the private Xauthority temp dir. The X11 socket is NOT touched here
+ * — socket cleanup is the responsibility of cleanOwnedSocket (compare-and-
+ * release, ownership-gated), called before this. Best-effort; never throws. */
+function cleanupAuthDir(tmpDir) {
   if (tmpDir) {
     try {
       execFileSync('rm', ['-rf', tmpDir], { stdio: 'ignore' });
     } catch { /* best effort */ }
-  }
-  if (dispNum !== null && dispNum !== undefined) {
-    const num = typeof dispNum === 'number' ? dispNum : parseInt(String(dispNum).replace(/^:/, ''), 10);
-    if (Number.isFinite(num)) {
-      try {
-        const sock = xvfbSocketPath(num);
-        if (existsSync(sock)) execFileSync('rm', ['-f', sock], { stdio: 'ignore' });
-      } catch { /* best effort */ }
-    }
   }
 }
 

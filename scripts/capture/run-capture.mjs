@@ -20,6 +20,14 @@
  *  - on every exit path (success, timeout, error) it tree-kills Electron then
  *    kills Xvfb, so no descendants are orphaned.
  *
+ * Conflict-free display ownership (no shared-resource clobbering): the
+ * launcher NEVER uses a fixed display number and NEVER unconditionally `rm`s
+ * `/tmp/.X11-unix/X<display>` — it atomically claims a free display (lockfile
+ * O_EXCL + socket-absent), and removes a socket only when this run PROVED it
+ * created it (socket absent before start + this run's Xvfb pid came up). An
+ * explicit DSH_XVFB_DISPLAY already in use fails CLOSED rather than clobbering
+ * the existing server. See scripts/capture/xvfb-display.mjs.
+ *
  * Fail-closed: if the Electron binary, the built renderer entry, or Xvfb (on a
  * display-less Linux box) is missing, the command exits NON-ZERO — never a
  * green-looking SKIP. The pure decision logic lives in launcher.mjs and
@@ -38,6 +46,14 @@ import { createRequire } from 'node:module';
 
 import { preflightErrors, spawnPlan, DEFAULT_TIMEOUT_MS } from './launcher.mjs';
 import { exitCodeFor, isPidAliveSync, runChild, treeKill } from './proc-tree.mjs';
+import {
+  findFreeDisplay,
+  claimExplicit,
+  releaseDisplay,
+  socketExistedBefore,
+  shouldCleanSocket,
+  socketPath as xvfbSocketPath
+} from './xvfb-display.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const require = createRequire(import.meta.url);
@@ -94,42 +110,88 @@ const timeoutMs = (() => {
 })();
 const childArgs = [mainCjs, ...extraElectronArgs];
 
-// ---- Managed Xvfb (headless Linux) -----------------------------------------
-// Start Xvfb directly as a detached process-group leader, wait for it to be
-// ready (probe the display), then export DISPLAY for the Electron child. We
-// keep its pid so we can tree-kill it on every exit path.
+// ---- Managed Xvfb (headless Linux, conflict-free display ownership) ---------
+// Allocate a display we PROVE we own (atomic lockfile + socket-didn't-exist-
+// before-start), start our own Xvfb, wait for readiness, then export DISPLAY.
+// We never use a fixed display and never rm a shared socket we didn't create.
 let xvfbChild = null;
 let display = null;
+let displayNum = null;
 let authFile = null;
+let xvfbOwnedSocket = false; // true only if THIS run created the X11 socket
 if (useXvfb) {
-  // Use a private Xauthority so we don't touch the user's; mirror xvfb-run.
+  // 1. Claim a display. DSH_XVFB_DISPLAY is honored ONLY if free (socket absent
+  //    AND lock acquirable) — otherwise fail-closed instead of clobbering an
+  //    existing server. No explicit value → auto-allocate a free one.
+  const explicit = process.env.DSH_XVFB_DISPLAY != null ? parseInt(process.env.DSH_XVFB_DISPLAY, 10) : NaN;
+  let claimed;
+  if (Number.isFinite(explicit)) {
+    claimed = claimExplicit(explicit);
+    if (!claimed) {
+      console.error(
+        `[capture] FAIL — explicit DSH_XVFB_DISPLAY=:${explicit} is already in use (socket/lock held); ` +
+          'refusing to clobber an existing X server (fail-closed).'
+      );
+      process.exit(1);
+    }
+    displayNum = explicit;
+  } else {
+    claimed = findFreeDisplay();
+    if (claimed === null) {
+      console.error('[capture] FAIL — could not allocate a free X display in the scan range (fail-closed).');
+      process.exit(1);
+    }
+    displayNum = claimed;
+  }
+  display = `:${displayNum}`;
+
+  // 2. Snapshot whether the socket ALREADY existed before we start our Xvfb.
+  //    If it did, we did NOT create it → we must never delete it on cleanup.
+  const socketExisted = socketExistedBefore(displayNum);
+
+  // 3. Private Xauthority in a private temp dir (never touch the user's).
   const tmpDir = execFileSync('mktemp', ['-d', '-t', 'dsh-capture.Xvfb.XXXXXX'], { encoding: 'utf8' }).trim();
   authFile = path.join(tmpDir, 'Xauthority');
   try {
     execFileSync('touch', [authFile], { stdio: 'ignore' });
   } catch { /* best effort */ }
-  // Use a high display number to avoid colliding with stale sockets left by
-  // other runs (the ready-probe also requires pid-alive, but a high number
-  // reduces collision risk further).
-  display = `:${process.env.DSH_XVFB_DISPLAY ?? 219}`;
   const mcookie = execFileSync('mcookie', [], { encoding: 'utf8' }).trim() || '0'.repeat(32);
   try {
     execFileSync('xauth', ['-f', authFile, 'add', display, '.', mcookie], { stdio: 'ignore' });
   } catch { /* xauth optional; Xvfb may allow without */ }
+
   xvfbChild = spawn(
     xvfbBin,
     [display, '-screen', '0', '1920x1080x24', '-nolisten', 'tcp', '-auth', authFile],
     { detached: true, stdio: 'ignore', env: { ...env, XAUTHORITY: authFile } }
   );
   xvfbChild.unref?.();
-  // Wait for Xvfb readiness (bounded; fail-closed if it never comes up).
+
+  // 4. Wait for readiness (bounded; fail-closed if it never comes up).
   const ready = await waitForXvfb(display, xvfbChild.pid, 8000);
   if (!ready) {
     console.error(`[capture] FAIL — Xvfb did not become ready on ${display} within 8s (fail-closed).`);
     if (xvfbChild.pid) treeKill({ pid: xvfbChild.pid, signal: 'SIGTERM', graceMs: 1500 });
-    cleanupAuth(authFile ? path.dirname(authFile) : null, display);
+    // Ownership cleanup: release OUR lock; only remove the socket if we
+    // proved we created it (didn't exist before, and our Xvfb was the one
+    // that came up). A failed start where the socket pre-existed leaves it.
+    releaseDisplay(displayNum);
+    const owned = shouldCleanSocket({
+      num: displayNum,
+      socketExistedBefore: socketExisted,
+      xvfbPidAlive: !!(xvfbChild.pid && isPidAliveSync(xvfbChild.pid))
+    });
+    cleanupResources(authFile ? path.dirname(authFile) : null, owned ? displayNum : null);
     process.exit(1);
   }
+
+  // 5. Confirm ownership: our Xvfb came up on a socket that didn't exist
+  //    before → this run owns that socket and may clean it later.
+  xvfbOwnedSocket = shouldCleanSocket({
+    num: displayNum,
+    socketExistedBefore: socketExisted,
+    xvfbPidAlive: !!(xvfbChild.pid && isPidAliveSync(xvfbChild.pid))
+  });
 }
 
 env.DISPLAY = display ?? env.DISPLAY ?? '';
@@ -144,7 +206,7 @@ const result = await runChild(electronPath, childArgs, {
   stdio: 'inherit'
 });
 
-// ---- Cleanup: reap Electron tree, then Xvfb (no orphans on any path) ------
+// ---- Cleanup: reap Electron tree, then Xvfb; release only OWNED resources --
 if (result.pid) {
   // runChild already tree-kills on finish, but be explicit/belt-and-suspenders.
   treeKill({ pid: result.pid, signal: 'SIGTERM', graceMs: 1500 });
@@ -152,7 +214,12 @@ if (result.pid) {
 if (xvfbChild && xvfbChild.pid) {
   treeKill({ pid: xvfbChild.pid, signal: 'SIGTERM', graceMs: 1500 });
 }
-cleanupAuth(authFile ? path.dirname(authFile) : null, display);
+// Release OUR display lock (we created it). Remove the X11 socket ONLY if we
+// proved ownership (xvfbOwnedSocket) — never rm a shared socket we didn't
+// create. Xvfb normally removes its own socket on clean termination; this is
+// a best-effort residual sweep for our own socket only.
+if (displayNum !== null) releaseDisplay(displayNum);
+cleanupResources(authFile ? path.dirname(authFile) : null, xvfbOwnedSocket ? displayNum : null);
 
 const code = exitCodeFor(result);
 if (isTimeoutErrorShape(result)) {
@@ -201,20 +268,22 @@ async function waitForXvfb(disp, xvfbPid, deadlineMs) {
   return false;
 }
 
-/** Remove the private Xauthority temp dir and the Xvfb socket for our display;
- * best-effort. Called after Xvfb is tree-killed so we don't leave socket/
- * auth residue for a future run's ready-probe to trip on. */
-function cleanupAuth(tmpDir, disp) {
+/** Remove the private Xauthority temp dir, and — ONLY when the caller passes
+ * a display number they have PROVEN this run owns — the X11 socket for it.
+ * Never unconditionally rm a shared /tmp/.X11-unix socket; ownership is
+ * established by the caller via shouldCleanSocket before this is called with
+ * a non-null dispNum. Best-effort; never throws. */
+function cleanupResources(tmpDir, dispNum) {
   if (tmpDir) {
     try {
       execFileSync('rm', ['-rf', tmpDir], { stdio: 'ignore' });
     } catch { /* best effort */ }
   }
-  if (disp) {
-    const num = parseInt(String(disp).replace(/^:/, ''), 10);
+  if (dispNum !== null && dispNum !== undefined) {
+    const num = typeof dispNum === 'number' ? dispNum : parseInt(String(dispNum).replace(/^:/, ''), 10);
     if (Number.isFinite(num)) {
       try {
-        const sock = `/tmp/.X11-unix/X${num}`;
+        const sock = xvfbSocketPath(num);
         if (existsSync(sock)) execFileSync('rm', ['-f', sock], { stdio: 'ignore' });
       } catch { /* best effort */ }
     }

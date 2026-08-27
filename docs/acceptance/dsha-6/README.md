@@ -49,6 +49,18 @@ process-tree behaviour is covered by `tests/launcher-integration.test.ts`
 and asserts every pid is gone afterward — on both the timeout and normal-exit
 paths).
 
+Conflict-free display ownership (no shared-resource clobbering): the launcher
+NEVER uses a fixed display number and NEVER unconditionally `rm`s
+`/tmp/.X11-unix/X<display>` — it atomically claims a free display (lockfile
+`O_EXCL` + socket-absent via `xvfb-display.mjs`), and removes a socket only
+when this run PROVED it created it (socket absent before start + this run's
+Xvfb pid came up). An explicit `DSH_XVFB_DISPLAY` already in use fails CLOSED
+rather than clobbering the existing server. Two concurrent captures therefore
+get DISTINCT displays; a stale socket from a prior run is never mistaken for
+ownership. Real-Xvfb allocation/confluence is covered by
+`tests/xvfb-display.integration.test.ts`; pure ownership helpers by
+`tests/xvfb-display.test.ts`.
+
 **Scope / honesty note:** these are **Xvfb/headless captures** of the real
 built renderer. They verify layout bounds, focus placement, no page-level
 horizontal scroll, and busy-gating in a synthetic DOM. They are **NOT** a
@@ -142,4 +154,13 @@ plus the viewport size.
   both the timeout path and the normal-exit path (where descendants are
   re-parented to init). Proves the process-tree reaper leaves no orphans.
   Reliable cleanup even on failure.
+- `tests/xvfb-display.test.ts` (12): the display-ownership pure helpers —
+  atomic lockfile (O_EXCL) claim, second-claim-fails, auto-allocation skips
+  locked displays, and `shouldCleanSocket` forbids deleting a pre-existing
+  socket. Pure node.
+- `tests/xvfb-display.integration.test.ts` (4): ACTUALLY starts real Xvfb
+  processes — two concurrent starts get DISTINCT displays; an explicit
+  display already in use fails CLOSED and leaves the existing server/socket
+  usable; cleanup only removes a socket THIS run created, never a
+  pre-existing one. Skips cleanly when `Xvfb` is absent.
 - Existing suites unchanged and still green (see full run below).

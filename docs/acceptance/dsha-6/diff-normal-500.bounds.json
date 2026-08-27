@@ -37,21 +37,24 @@
       "x": 20,
       "y": 313,
       "w": 119,
-      "h": 28
+      "h": 28,
+      "visible": true
     },
     {
       "text": "↓ 下一个",
       "x": 195,
       "y": 313,
       "w": 119,
-      "h": 28
+      "h": 28,
+      "visible": true
     },
     {
       "text": "恢复此文件…",
       "x": 320,
       "y": 313,
       "w": 145,
-      "h": 28
+      "h": 28,
+      "visible": true
     }
   ],
   "activeText": "DSH DesktopHomeWorkspaceDiff ViewerRunti",

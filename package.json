@@ -20,7 +20,7 @@
     "smoke:dsh": "node scripts/smoke-dsh-desktop.mjs",
     "smoke:app": "node scripts/smoke-electron.mjs",
     "test:responsive": "node scripts/measure-responsive.mjs",
-    "capture:diff": "node scripts/capture/main.cjs"
+    "capture:diff": "node scripts/capture/run-capture.mjs"
   },
   "dependencies": {
     "monaco-editor": "^0.52.2",

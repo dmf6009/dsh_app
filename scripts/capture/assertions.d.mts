@@ -12,6 +12,7 @@ export interface ActionBtn {
   y: number;
   w: number;
   h: number;
+  visible: boolean;
 }
 
 export interface Bounds {
@@ -24,8 +25,8 @@ export interface Bounds {
 }
 
 export function rectVisible(rect: Rect | null): boolean;
-export function rectInViewport(rect: Rect | null, vw: number): boolean;
+export function rectInViewport(rect: Rect | null, vw: number, vh?: number): boolean;
 export function noHScrollErrors(b: Bounds): string[];
 export function toolbarErrors(b: Bounds): string[];
-export function overlapErrors(btns: Array<Pick<ActionBtn, 'x' | 'y' | 'w' | 'h'>>): string[];
+export function overlapErrors(btns: Array<Pick<ActionBtn, 'x' | 'y' | 'w' | 'h' | 'text'>>): string[];
 export function actionsBarErrors(b: Bounds, expectedLabels?: string[]): string[];

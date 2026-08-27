@@ -9,8 +9,11 @@ Electron harness in `scripts/capture/` against the BUILT renderer with a stub
 just record bounds — for every scenario it runs explicit assertions and exits
 **non-zero** if ANY requirement is unmet, reporting the scenario and the
 field/values. `gate-summary.json` records the run: `21/21` scenarios pass with
-an empty `failures` array. A deliberately injected failure was verified to flip
-the gate to `FAIL` with exit code 1.
+an empty `failures` array. The gate verifies the **identity** of each action
+button (label must match, not merely the count), containment on **both axes**
+(horizontal AND vertical viewport bounds), and each button's real **`visible`**
+flag (captured from the element box), so a hidden / mislabelled /
+out-of-viewport button fails — not merely an injected constant-false condition.
 
 **Scope / honesty note:** these are **Xvfb/headless captures** of the real
 built renderer. They verify layout bounds, focus placement, no page-level
@@ -23,7 +26,9 @@ before final UI/UE sign-off.
 
 ```
 npm run build
-xvfb-run -a npm run capture:diff   # exit 0 only if every assertion passes
+npm run capture:diff   # exit 0 only if every assertion passes
+                      # (scripts/capture/run-capture.mjs resolves the Electron
+                      #  binary and wraps it in xvfb-run when no DISPLAY is set)
 ```
 
 ## Coverage matrix (each at 500×400, 700×500, 1280×800)
@@ -36,19 +41,25 @@ xvfb-run -a npm run capture:diff   # exit 0 only if every assertion passes
 
 ## Assertions enforced per scenario
 
-- **All**: `noPageHScroll === true` (page-level horizontal scroll forbidden;
-  Monaco scrolls only inside its `overflow:hidden` host), recorded via
-  `pageScrollWidth`/`clientWidth`.
 The predicate logic lives in `scripts/capture/assertions.mjs` (pure, ESM) and
-is unit-tested by `tests/capture-gate.test.ts` so the gate cannot false-green:
+is unit-tested by `tests/capture-gate.test.ts` so the gate cannot false-green.
 
 - **All**: `noPageHScroll === true` (page-level horizontal scroll forbidden;
   Monaco scrolls only inside its `overflow:hidden` host), recorded via
   `pageScrollWidth`/`clientWidth`.
-- **Toolbar scenes (normal / binary / every Revert state)**: the `.diff-toolbar`
-  rect exists AND `visible === true` with non-zero size and is inside the
-  viewport; the `.diff-actions` bar has **exactly 3** expected buttons, each
-  non-zero-sized and in-viewport, and all pairs are non-overlapping.
+- **Toolbar scenes (normal / binary / every Revert state)**:
+  - the `.diff-toolbar` rect exists AND `visible === true` with non-zero size
+    and lies entirely within the viewport on **both** axes (horizontal AND
+    vertical);
+  - the `.diff-actions` bar contains **exactly 3** buttons whose **labels**
+    match the expected set (`↑ 上一个` / `↓ 下一个` / `恢复此文件…`) in order —
+    a wrong, missing, surplus or reordered label fails (identity, not count);
+  - each button's real `visible` flag is `true` with positive size
+    (`visible` is captured from the element box, so `display:none` / zero-box
+    cannot pass on a stale w/h);
+  - each button lies entirely within the viewport on **both** axes, including
+    top/bottom vertical bounds;
+  - all button pairs are non-overlapping.
 - **binary**: binary placeholder (`.diff-status`) shown.
 - **empty**: empty state (`.diff-empty`) shown; no toolbar/action-bar required.
 - **revert-stage1**: dialog open AND `activeIsCancel === true` (focus on 取消).
@@ -61,19 +72,21 @@ is unit-tested by `tests/capture-gate.test.ts` so the gate cannot false-green:
   the trigger button (`activeText === "恢复此文件…"`).
 
 `tests/capture-gate.test.ts` proves the gate FAILS on the real regressions:
-zero-size toolbar, missing/zero-size action buttons, overlapping button pairs,
-out-of-viewport buttons, and page horizontal scroll — not merely an injected
-constant-false condition.
+zero-size toolbar, missing/zero-size/invisible action buttons, **wrong or
+reordered button labels**, **top/bottom vertical overflow**, overlapping
+button pairs, out-of-viewport buttons, and page horizontal scroll — not merely
+an injected constant-false condition.
 
-`.bounds.json` records every `.diff-actions` button rect for the non-overlap
-assertion plus the viewport size.
+`.bounds.json` records every `.diff-actions` button rect (with `visible`) plus
+the viewport size.
 
 ## Regression tests
 
 - `tests/dialog-focus.test.ts` (11): focus-trap Tab/Shift+Tab cycling with hard
   wrap, stage-1 safe-action initial focus selection, busy-close gating, and the
   focusable-selector contract — pure node, no DOM.
-- `tests/capture-gate.test.ts` (11): the assertion predicates must FAIL on
-  zero-size toolbar, missing/zero-size buttons, overlapping pairs, out-of-view
-  and page-horizontal-scroll — proves the gate is not false-green.
+- `tests/capture-gate.test.ts` (20): the assertion predicates must FAIL on
+  zero-size toolbar, missing/surplus/zero-size/invisible buttons, wrong or
+  reordered labels, top/bottom/right viewport overflow, overlapping pairs, and
+  page-horizontal-scroll — proves the gate is not false-green.
 - Existing suites unchanged and still green (see full run below).

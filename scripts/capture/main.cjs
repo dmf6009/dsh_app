@@ -39,7 +39,17 @@ const BOUNDS_JS = `(() => {
   const de = document.documentElement;
   const actionBtns = [...document.querySelectorAll('.diff-actions button')].map((b) => {
     const r = b.getBoundingClientRect();
-    return { text: (b.textContent || '').trim(), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+    return {
+      text: (b.textContent || '').trim(),
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+      // Real element-box visibility (display:none / zero box ⇒ invisible), so
+      // the assertion gate can fail on a hidden button instead of trusting
+      // a stale positive w/h.
+      visible: r.width > 0 && r.height > 0
+    };
   });
   const ae = document.activeElement;
   const confirmBtn = [...document.querySelectorAll('.confirm-actions button')].find((b) =>

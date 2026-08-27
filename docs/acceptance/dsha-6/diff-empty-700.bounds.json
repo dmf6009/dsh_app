@@ -1,0 +1,30 @@
+{
+  "viewport": {
+    "w": 700,
+    "h": 500
+  },
+  "noPageHScroll": true,
+  "pageScrollWidth": 700,
+  "pageClientWidth": 700,
+  "bodyScrollWidth": 700,
+  "toolbar": null,
+  "fileList": null,
+  "monacoHost": null,
+  "empty": {
+    "x": 20,
+    "y": 105,
+    "w": 507,
+    "h": 204,
+    "visible": true
+  },
+  "diffStatus": false,
+  "dialog": null,
+  "actionBtns": [],
+  "activeText": "DSH DesktopHomeWorkspaceDiff ViewerRunti",
+  "activeClass": null,
+  "activeIsCancel": false,
+  "dialogOpen": false,
+  "dialogBusy": false,
+  "confirmDisabled": null,
+  "hasSpinner": false
+}

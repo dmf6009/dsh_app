@@ -1,0 +1,73 @@
+{
+  "viewport": {
+    "w": 500,
+    "h": 400
+  },
+  "noPageHScroll": true,
+  "pageScrollWidth": 500,
+  "pageClientWidth": 500,
+  "bodyScrollWidth": 500,
+  "toolbar": {
+    "x": 20,
+    "y": 292,
+    "w": 445,
+    "h": 49,
+    "visible": true
+  },
+  "fileList": {
+    "x": 20,
+    "y": 178,
+    "w": 445,
+    "h": 106,
+    "visible": true
+  },
+  "monacoHost": {
+    "x": 20,
+    "y": 347,
+    "w": 445,
+    "h": 260,
+    "visible": true
+  },
+  "empty": null,
+  "diffStatus": false,
+  "dialog": {
+    "x": 16,
+    "y": 74,
+    "w": 468,
+    "h": 251,
+    "visible": true
+  },
+  "actionBtns": [
+    {
+      "text": "↑ 上一个",
+      "x": 20,
+      "y": 313,
+      "w": 119,
+      "h": 28,
+      "visible": true
+    },
+    {
+      "text": "↓ 下一个",
+      "x": 195,
+      "y": 313,
+      "w": 119,
+      "h": 28,
+      "visible": true
+    },
+    {
+      "text": "恢复此文件…",
+      "x": 320,
+      "y": 313,
+      "w": 145,
+      "h": 28,
+      "visible": true
+    }
+  ],
+  "activeText": "确认丢弃我的修改",
+  "activeClass": "btn btn-danger",
+  "activeIsCancel": false,
+  "dialogOpen": true,
+  "dialogBusy": false,
+  "confirmDisabled": false,
+  "hasSpinner": false
+}

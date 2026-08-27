@@ -56,19 +56,30 @@ export function spawnPlan(o) {
 }
 
 /**
- * Resolve the final process exit code from a spawnSync result.
- * Fail-closed: any error, timeout, or kill signal ⇒ 1 (never 0 when the gate
- * did not run cleanly to a clean status). A child that crashed on a missing
- * entry file (ERR_FILE_NOT_FOUND) surfaces as error/status null and must exit
- * non-zero — callers must also preflight, but this is the backstop.
- * @param {{ status: number|null, signal: string|null, error?: { message?: string }|null, timedOut?: boolean }} r
+ * Resolve the final process exit code from a child result (spawnSync shape or
+ * the async runChild result). Fail-closed: any timeout, error, or kill signal
+ * ⇒ 1 (never 0 when the gate did not run cleanly to a clean status). A child
+ * that crashed on a missing entry file (ERR_FILE_NOT_FOUND) surfaces as
+ * error/status null and must exit non-zero — callers must also preflight, but
+ * this is the backstop.
+ *
+ * Timeout detection uses the REAL spawnSync shape: `error.code === 'ETIMEDOUT'`
+ * (spawnSync sets this and `signal === 'SIGTERM'`; it does NOT set a
+ * `timedOut` field — the prior code read a non-existent field). The async
+ * runChild path sets its own `timedOut: true` when its wall-clock deadline
+ * fires; both are recognised via isTimeoutError.
+ * @param {{ status: number|null, signal: string|null, error?: { code?: string, message?: string }|null, timedOut?: boolean }} r
  * @returns {number}
  */
 export function exitCode(r) {
-  if (r.timedOut) return 1;
-  if (r.error) return 1;
-  if (r.signal) return 1;
-  if (typeof r.status !== 'number') return 1;
+  // Real spawnSync timeout: error.code ETIMEDOUT (+ signal SIGTERM). The
+  // `timedOut` boolean does NOT exist on spawnSync results; only runChild sets
+  // it. isTimeoutError accepts both.
+  if (r && r.timedOut === true) return 1;
+  if (r && r.error && r.error.code === 'ETIMEDOUT') return 1;
+  if (r && r.error) return 1;
+  if (r && r.signal) return 1;
+  if (!r || typeof r.status !== 'number') return 1;
   return r.status;
 }
 

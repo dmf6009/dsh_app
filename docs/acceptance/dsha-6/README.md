@@ -19,17 +19,35 @@ with a positive box, or a missing/`null`/`undefined` field, fails (the boolean
 out-of-viewport button therefore fails — not merely an injected
 constant-false condition.
 
-**Fail-closed launcher:** `scripts/capture/run-capture.mjs` resolves the
-Electron binary and spawns `main.cjs` as the app entry (plain `node` cannot
-run it — `require('electron')` returns the path string, not the runtime). It
-is **fail-closed**: if the Electron binary, the built renderer entry
-(`dist/renderer/index.html`), or `xvfb-run` (on a display-less Linux box) is
+**Fail-closed launcher with process-tree ownership:** `scripts/capture/run-capture.mjs`
+resolves the Electron binary and spawns `main.cjs` as the app entry (plain
+`node` cannot run it — `require('electron')` returns the path string, not the
+runtime). It is **fail-closed**: if the Electron binary, the built renderer
+entry (`dist/renderer/index.html`), or `Xvfb` (on a display-less Linux box) is
 missing, the command exits **non-zero** — never a green-looking SKIP. The
 Electron child runs under a bounded timeout (`DSH_CAPTURE_TIMEOUT_MS`, default
-180 s) with full error/signal propagation, so a wedged child (e.g.
-`ERR_FILE_NOT_FOUND`) cannot hang CI or leak a process. The pure decision logic
-(`preflightErrors` / `spawnPlan` / `exitCode`) lives in `launcher.mjs` and is
-unit-tested by `tests/launcher.test.ts`.
+180 s).
+
+Process-tree reaping (no orphaned processes on ANY path): the launcher does
+NOT use the `xvfb-run` shell wrapper (it traps only `EXIT`, not `SIGTERM`, and
+Node's `spawnSync` only reaps the direct child — so a timeout could orphan
+Xvfb + Electron grandchildren). Instead it starts `Xvfb` directly (owning its
+pid, probing the `/tmp/.X11-unix/X<display>` socket for readiness), sets
+`DISPLAY`, spawns Electron as a detached process-group leader, and — on every
+exit path (success, timeout, error) — tree-kills the whole tree via
+`proc-tree.mjs`. `treeKill` enumerates descendants explicitly (Linux
+`/proc/<pid>/task/<pid>/children`, `pgrep -P` fallback) rather than relying on
+the process group, so a `detached` grandchild that leads its own group is still
+reaped; `runChild` snapshots descendant pids while the child is alive so even
+the normal-exit path (where the child dies and descendants get re-parented to
+init) reaps orphans. Timeout detection uses the REAL `spawnSync` shape
+(`error.code === 'ETIMEDOUT'` + `signal === 'SIGTERM'`); `runChild` also sets a
+real `timedOut` flag. The pure decision logic lives in `launcher.mjs` and
+`proc-tree.mjs`, unit-tested by `tests/launcher.test.ts`; the actual
+process-tree behaviour is covered by `tests/launcher-integration.test.ts`
+(spawns a SIGTERM-ignoring 3-level descendant tree, triggers a short timeout,
+and asserts every pid is gone afterward — on both the timeout and normal-exit
+paths).
 
 **Scope / honesty note:** these are **Xvfb/headless captures** of the real
 built renderer. They verify layout bounds, focus placement, no page-level
@@ -44,9 +62,10 @@ before final UI/UE sign-off.
 npm run build
 npm run capture:diff   # exit 0 ONLY if every assertion passes
                       # (scripts/capture/run-capture.mjs resolves the Electron
-                      #  binary and wraps it in xvfb-run when no DISPLAY is set;
-                      #  it exits NON-ZERO if the Electron binary, the built
-                      #  renderer entry, or xvfb-run is missing — never a SKIP)
+                      #  binary, starts its own Xvfb when no DISPLAY is set,
+                      #  and owns the whole process tree; it exits NON-ZERO if
+                      #  the Electron binary, the built renderer entry, or Xvfb
+                      #  is missing — never a SKIP)
 ```
 
 ## Coverage matrix (each at 500×400, 700×500, 1280×800)
@@ -111,8 +130,16 @@ plus the viewport size.
   `null`/`undefined`/loose-typed `visible` field, wrong or reordered labels,
   top/bottom/right viewport overflow, overlapping pairs, and
   page-horizontal-scroll — proves the gate is not false-green.
-- `tests/launcher.test.ts` (18): the launcher is fail-closed — a missing
-  Electron binary, missing build artifact, or missing `xvfb-run` produces a
+- `tests/launcher.test.ts` (19): the launcher is fail-closed — a missing
+  Electron binary, missing build artifact, or missing `Xvfb` produces a
   non-zero exit (never a green SKIP); a timeout / kill-signal / spawn error
-  from the Electron child propagates as non-zero. Pure node, no fs or spawn.
+  from the Electron child propagates as non-zero; the REAL `spawnSync`
+  `ETIMEDOUT` shape (`error.code === 'ETIMEDOUT'`, NO `timedOut` field) is
+  detected. Pure node, no fs or spawn.
+- `tests/launcher-integration.test.ts` (5): ACTUALLY spawns a 3-level
+  SIGTERM-ignoring descendant tree, triggers a short timeout, and asserts
+  every pid (child + grandchild + great-grandchild) is gone afterward — on
+  both the timeout path and the normal-exit path (where descendants are
+  re-parented to init). Proves the process-tree reaper leaves no orphans.
+  Reliable cleanup even on failure.
 - Existing suites unchanged and still green (see full run below).

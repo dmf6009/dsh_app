@@ -258,4 +258,3 @@ describe('actionsBarErrors — strict visible === true (no missing-field green)'
     expect(errs.join(' ')).toMatch(/not visible.*false/);
   });
 });
-

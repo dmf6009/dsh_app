@@ -20,7 +20,7 @@ export interface SpawnPlan {
 export interface ExitCodeInput {
   status: number | null;
   signal: string | null;
-  error?: { message?: string } | null;
+  error?: { code?: string; message?: string } | null;
   timedOut?: boolean;
 }
 

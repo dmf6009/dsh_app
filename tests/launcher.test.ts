@@ -107,6 +107,20 @@ describe('exitCode (fail-closed propagation)', () => {
     expect(exitCode({ status: 0, signal: null, error: null, timedOut: true })).toBe(1);
   });
 
+  it('returns 1 on the REAL spawnSync timeout shape (error.code ETIMEDOUT, NO timedOut field)', () => {
+    // The review established that spawnSync sets error.code === 'ETIMEDOUT'
+    // and signal === 'SIGTERM', and does NOT set a `timedOut` field (it is
+    // undefined). The gate must detect this shape, not the phantom field.
+    const realSpawnSyncTimeout = {
+      status: null,
+      signal: 'SIGTERM',
+      error: { code: 'ETIMEDOUT', message: 'Command timed out' },
+      timedOut: undefined as boolean | undefined
+    };
+    expect(exitCode(realSpawnSyncTimeout)).toBe(1);
+    expect(realSpawnSyncTimeout.timedOut).toBeUndefined();
+  });
+
   it('returns 1 on a kill signal (SIGTERM/SIGKILL)', () => {
     expect(exitCode({ status: null, signal: 'SIGTERM', error: null, timedOut: false })).toBe(1);
     expect(exitCode({ status: null, signal: 'SIGKILL', error: null, timedOut: false })).toBe(1);

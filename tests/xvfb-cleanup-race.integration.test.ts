@@ -90,11 +90,13 @@ afterEach(() => {
     }
   }
   started.length = 0;
-  // Clean any leftover test lock FILES / sockets in our display range. The
-  // lock is now a single FILE (contents = owner identity); rmSync -f removes
-  // it whether it is a file or a stale dir from a prior test.
-  for (const n of [770, 771, 772, 773, 774]) {
+  // Clean any leftover test lock FILES / mutex FILES / sockets in our display
+  // range. The lock is a single FILE (owner identity); the mutex is `<num>.mut`.
+  // 775/776 are used by the public-wrapper flock tests and must be cleaned too
+  // (release test leaves C's lock; clean test leaves a lock/socket).
+  for (const n of [770, 771, 772, 773, 774, 775, 776]) {
     try { rmSync(lockPath(n), { force: true }); } catch { /* ignore */ }
+    try { rmSync(join('/tmp', `dsh-capture-xvfb-${n}.mut`), { force: true }); } catch { /* ignore */ }
     try { unlinkSync(socketPath(n)); } catch { /* ignore */ }
     try { unlinkSync(`/tmp/.X${n}-lock`); } catch { /* ignore */ }
   }
@@ -606,7 +608,21 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
     `], { env: bEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     b.unref();
     started.push({ child: b as unknown as ReturnType<typeof spawnLauncher>, pid: b.pid });
-    drain(b as unknown as ReturnType<typeof spawnLauncher>);
+    const bOut = drain(b as unknown as ReturnType<typeof spawnLauncher>);
+
+    // DETERMINISTIC PROOF B has reached the SAME flock target and is BLOCKED
+    // while A still holds the mutex (not merely Node-bootstrapping). We wait
+    // for mutWaiterBlocked(775, releaseOwned, b.pid) — a flock process
+    // attributed to B's ancestry, targeting dsh-capture-xvfb-775.mut, with
+    // ANOTHER process (A) on the same target — BEFORE releasing A's b1.
+    let bBlocked = false;
+    for (let i = 0; i < 80 && !bBlocked; i += 1) {
+      if (mutWaiterBlocked(num, 'releaseOwned', b.pid!)) bBlocked = true;
+      else await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(bBlocked).toBe(true); // B reached the flock target and is blocked on A
+    // While A still holds, B has NOT completed (no stdout yet, still running).
+    expect(b.exitCode).toBeNull();
 
     // Release A's b1 → A unlinks the lock + exits → releases the flock.
     writeFileSync(b1, 'go');
@@ -629,6 +645,11 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
     writeFileSync(b0B, 'go');
     const bExit = await waitExit(b as unknown as ReturnType<typeof spawnLauncher>, 30000);
     expect(bExit).not.toBeNull();
+    // B's wrapper output is "false" (no-op against C's generation). The child's
+    // stdout is `String(r)`; stderr carries Node boot warnings, so extract the
+    // boolean token rather than asserting the whole buffer.
+    const bResultB = (bOut().match(/\b(true|false)\b/g) || []).pop() || '';
+    expect(bResultB).toBe('false');
     // C's lock SURVIVES B's late release.
     expect(readOwner(num, { lockDir })!.token).toBe(tokC);
     expect(existsSync(lockPath(num, { lockDir }))).toBe(true);
@@ -683,11 +704,18 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
     `], { env: bEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     b.unref();
     started.push({ child: b as unknown as ReturnType<typeof spawnLauncher>, pid: b.pid });
-    drain(b as unknown as ReturnType<typeof spawnLauncher>);
+    const bOut = drain(b as unknown as ReturnType<typeof spawnLauncher>);
 
-    // Give B a moment to be blocked on the flock.
-    await new Promise((r) => setTimeout(r, 800));
-    // B should still be running (blocked on the flock A holds).
+    // DETERMINISTIC PROOF B has reached the SAME flock target and is BLOCKED
+    // while A still holds the mutex (not merely Node-bootstrapping). Wait for
+    // mutWaiterBlocked(776, cleanOwnedSocket, b.pid) before releasing A's b1.
+    let bBlocked = false;
+    for (let i = 0; i < 80 && !bBlocked; i += 1) {
+      if (mutWaiterBlocked(num, 'cleanOwnedSocket', b.pid!)) bBlocked = true;
+      else await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(bBlocked).toBe(true); // B reached the flock target and is blocked on A
+    // While A still holds, B has NOT completed.
     expect(b.exitCode).toBeNull();
 
     // Release A's b1 → A unlinks the socket + exits → releases the flock.
@@ -698,6 +726,10 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
     // public wrapper serialized B behind A under flock.)
     const bExit = await waitExit(b as unknown as ReturnType<typeof spawnLauncher>, 30000);
     expect(bExit).not.toBeNull();
+    // B serialized behind A, returned false. Extract the boolean token (child
+    // stdout is `String(r)`; stderr carries Node boot warnings).
+    const bResult = (bOut().match(/\b(true|false)\b/g) || []).pop() || '';
+    expect(bResult).toBe('false');
     const aExit = await waitExit(a as unknown as ReturnType<typeof spawnLauncher>, 5000);
     void aExit;
   }, 90000);
@@ -762,19 +794,58 @@ function mutCriticalHeld(num: number, op?: string, parentPid?: number): boolean 
     })();
     if (holderPid === null) return false;
     if (parentPid === undefined) return true;
-    // Check the flock holder's ancestry includes parentPid.
-    // The flock process's parent chain: flock's parent is the launcher node,
-    // which is the test's spawnLauncher child (parentPid) OR a descendant.
-    try {
-      const ppid = parseInt(execFileSync('ps', ['-o', 'ppid=', '-p', String(holderPid)], { encoding: 'utf8' }).trim(), 10);
-      if (ppid === parentPid) return true;
-      // walk up one more level (flock may exec under a shell)
-      const ppid2 = parseInt(execFileSync('ps', ['-o', 'ppid=', '-p', String(ppid)], { encoding: 'utf8' }).trim(), 10);
-      return ppid2 === parentPid;
-    } catch {
-      return false;
-    }
+    return isDescendantOf(holderPid, parentPid);
   } catch {
     return false; // pgrep exit 1 = no match
   }
+}
+
+/** True if `descendantPid`'s process-group ancestry (parent chain up to 2 hops)
+ * includes `ancestorPid`. Used to attribute a flock process to the launcher pid
+ * that spawned it (distinguishing A's flock from B's). */
+function isDescendantOf(descendantPid: number, ancestorPid: number): boolean {
+  try {
+    const ppid = parseInt(execFileSync('ps', ['-o', 'ppid=', '-p', String(descendantPid)], { encoding: 'utf8' }).trim(), 10);
+    if (ppid === ancestorPid) return true;
+    // walk up one more level (flock may exec under an intermediate shell)
+    const ppid2 = parseInt(execFileSync('ps', ['-o', 'ppid=', '-p', String(ppid)], { encoding: 'utf8' }).trim(), 10);
+    return ppid2 === ancestorPid;
+  } catch {
+    return false;
+  }
+}
+
+/** True if a WAITER (a process BLOCKED on the per-display flock, attributed to
+ * `waiterParentPid`) has reached the SAME flock target as display `num` for op
+ * `op`. This is the deterministic signal that B has STARTED and reached the
+ * flock (not merely Node-bootstrapping): a `flock <mutPath> node mut-op.mjs
+ * <op> <num>` process exists, attributed to `waiterParentPid`, AND another
+ * (non-waiter) process is on the same target (A holding) — so B is genuinely
+ * blocked on A's held mutex, not alone acquiring. */
+function mutWaiterBlocked(num: number, op: string, waiterParentPid: number): boolean {
+  const needle = `mut-op.mjs ${op} ${num}`;
+  const mutNeedle = `dsh-capture-xvfb-${num}.mut`;
+  let out: string;
+  try {
+    out = execFileSync('pgrep', ['-af', 'flock'], { encoding: 'utf8' });
+  } catch {
+    return false;
+  }
+  let waiterFound = false;
+  let otherOnTarget = false;
+  for (const line of out.split('\n')) {
+    if (!line.includes(needle) || !line.includes(mutNeedle)) continue;
+    const m = /^\s*(\d+)/.exec(line);
+    if (!m || !m[1]) continue;
+    const flockPid = parseInt(m[1], 10);
+    if (isDescendantOf(flockPid, waiterParentPid)) {
+      waiterFound = true;
+    } else {
+      otherOnTarget = true; // another process (A) holds or also waits
+    }
+  }
+  // B is blocked only if B reached the flock AND another process is on the
+  // same target (A holding). A purely-alone waiter would be acquiring, not
+  // blocked. This proves B reached the SAME flock target and is blocked.
+  return waiterFound && otherOnTarget;
 }

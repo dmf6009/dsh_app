@@ -1,57 +1,90 @@
 /**
  * Token-based X display ownership for the capture gate.
  *
- * Earlier iterations had a cleanup race: the launcher released the display
- * lockfile BEFORE unlinking the X11 socket. A run B that won the freed lock
- * could start its Xvfb and create the same-named socket in the window between
- * A's release and A's socket unlink — then A's late cleanup would delete B's
- * live socket. The historical "I created this socket" boolean was only proof
- * AT START TIME, not at unlink time.
+ * A claim is an UNFORGEABLE owner token (a UUID written into the lockfile).
+ * Only the run holding the current token is the owner. The hard problem is
+ * TOCTOU: every prior iteration either (a) released the lock BEFORE unlinking
+ * the X11 socket (letting run B win the freed lock and create the same-named
+ * socket in the window before A's unlink deleted it), or (b) used a
+ * read-verify-then-unlinkSync critical section — which has a window between the
+ * verify and the unlink in which a concurrent reclaimer can unlink+recreate the
+ * lockfile AT THE SAME PATH, so the now-stale unlinkSync deletes the NEW owner's
+ * LIVE lock. A second O_EXCL "mutation lock" did NOT fix this: its own stale
+ * reclamation reproduced the identical read-verify-then-unlink window, so two
+ * reclaimers could both hold the "mutex". inode numbers are recycled on the CI
+ * filesystem, so stat-identity cannot detect replacement either.
  *
- * This module models a claim as an UNFORGEABLE owner token (a UUID written into
- * the lockfile) and makes cleanup a COMPARE-AND-RELEASE critical section:
+ * This module has NO read-verify-then-unlinkSync window anywhere. It uses two
+ * kernel-atomic primitives only:
  *
- *  - acquireDisplay returns a token (the claim handle). Only the run holding
- *    the current token is the owner.
- *  - cleanOwnedSocket re-reads the lockfile and unlinks the X11 socket ONLY IF
- *    the lock still carries OUR token — i.e. we still own the claim at unlink
- *    time. Because releaseOwned happens AFTER cleanOwnedSocket, no run B can
- *    win the lock (and start its Xvfb) until our socket cleanup is done.
- *  - releaseOwned is compare-and-release: it deletes the lockfile ONLY IF its
- *    current token still matches ours. A late/duplicate cleanup whose token no
- *    longer matches (a new owner took over) is a no-op — it cannot delete the
- *    new owner's lock.
- *  - Stale-lock reclamation: if a lockfile exists but its recorded pid is dead
- *    (crashed run), a new run may reclaim the display with a fresh token
- *    (acquireStale), verifying the old owner is truly gone first.
+ * 1. `O_EXCL` open (`openSync(path, 'wx')`) — atomic create-if-absent. Used by
+ *    acquireDisplay for a fresh lock. One winner; losers get EEXIST.
+ * 2. `rename(2)` (`renameSync`) — atomic REPLACE of an existing directory
+ *    entry. POSIX guarantees rename over an existing file atomically swaps the
+ *    directory entry to the source inode; there is no instant at which the path
+ *    is absent or points at "half" a file. Used by acquireStale to atomically
+ *    replace a dead-owner lock's CONTENTS with our token — no unlink of the path
+ *    is ever issued during reclaim, so no live lock is ever deleted by a
+ *    mis-targeted unlinkSync.
  *
- * ── TOCTOU hardening (the read-verify-then-unlink race) ──────────────────────
- * A naive compare-and-release reads the token, then unlinks the path. Between
- * the read and the unlink a CONCURRENT stale-reclaimer can unlink the lockfile
- * and O_EXCL-create its own at the SAME path; our now-stale `unlinkSync(path)`
- * then deletes the new owner's LIVE lock. The same window affects acquireStale:
- * two reclaimers both read a dead-owner lock, one unlinks+creates, the other's
- * queued unlinkSync deletes the just-created live lock. inode numbers are NOT a
- * reliable identity (filesystems recycle them, verified on the CI FS), so we
- * cannot detect replacement by stat alone.
+ * ── releaseOwned / cleanOwnedSocket: the fd-anchored rename-to-tombstone CAS ──
+ * Deletion is the operation that cannot be done with O_EXCL or rename directly:
+ * "delete the lock ONLY if it is still mine" is a compare-and-delete, and a
+ * path-based unlink after a path-based read has the TOCTOU window. We instead
+ * ANCHOR identity to an open file descriptor (fd), which cannot be replaced:
  *
- * Fix: every mutation of a display's lockfile/socket is serialized through a
- * per-display MUTATION LOCK — a second O_EXCL lockfile (`<lock>.mut`). While a
- * compliant process holds it, no other compliant process can unlink/recreate the
- * ownership lockfile in the verify→unlink window, so `unlinkSync(path)` always
- * hits the file whose token we just verified. O_EXCL is atomic on a single local
- * filesystem (the same primitive acquireDisplay relies on). The mutation lock is
- * bounded-retry for reclaimers (fail-closed → scan another display) and held for
- * microseconds; a stale mutation lock whose holder pid is dead is itself
- * reclaimable. Tests cover two concurrent reclaimers on the SAME stale lock
- * (only one wins, the winner's lock survives) and a new owner's lock/socket
- * surviving the previous owner's late/duplicate cleanup.
+ *  1. `openSync(lockPath, 'r')` → fd. The fd is bound to the inode that was at
+ *     `lockPath` at open time; EVEN IF another process later unlinks+recreates
+ *     `lockPath`, this fd still refers to OUR (now-unlinked) inode. (Verified
+ *     on the CI FS: fstat(fd).ino stays the original inode while stat(path).ino
+ *     changes after a replace.)
+ *  2. Read the token THROUGH THE FD (readSync) — we read the inode we anchored,
+ *     not "whatever is at the path now".
+ *  3. If the token is not ours → abort (already released / new owner). No unlink.
+ *  4. `renameSync(lockPath, tombstone)` — ATOMIC: whatever directory entry is at
+ *     `lockPath` RIGHT NOW is moved to `tombstone`. After this, `lockPath` is
+ *     empty (until some other process creates a new file there).
+ *  5. Compare `fstatSync(fd).ino === statSync(tombstone).ino`:
+ *     - EQUAL → the rename moved OUR inode (the one the fd anchors, whose token
+ *       we verified). It is safe to `unlinkSync(tombstone)` (our file, reachable
+ *       only via the tombstone we just created). Done — we released our lock.
+ *       (If `lockPath` was freshly created by another process between our open
+ *       and rename, that new file is at `lockPath`, untouched; we never unlink
+ *       the path, only the tombstone that holds our own inode.)
+ *     - NOT EQUAL → between our open and rename, another process replaced the
+ *       lock at `lockPath` (their inode differs from our fd's inode). The rename
+ *       moved THEIR file to `tombstone` — we must NOT delete it. Restore it:
+ *       `renameSync(tombstone, lockPath)` puts their lock back at the canonical
+ *       path, then abort. (A reclaimer that races this restore gets a token
+ *       mismatch on re-read and bails; no false owner.)
+ *
+ * No `unlinkSync` is ever issued against `lockPath` itself — only against a
+ * tombstone whose inode we PROVED (via fd anchor) is ours. The read-verify and
+ * the destructive op are bound to the SAME inode through the fd, with rename
+ * providing the atomic "snapshot the current directory entry" step. There is no
+ * window in which a path-based unlink hits a file whose token we did not just
+ * verify against the same inode.
+ *
+ *  - cleanOwnedSocket runs the same fd-anchored ownership re-verify, then
+ *    unlinks the X11 SOCKET (a different path) only while our token still owns
+ *    the lock inode. releaseOwned is called AFTER, releasing the lock.
  *
  * Pure helpers are unit-tested without Xvfb; real allocation/concurrency is
  * covered by tests/xvfb-display.test.ts and tests/xvfb-display.integration.test.ts.
  */
 
-import { openSync, closeSync, unlinkSync, existsSync, readFileSync, writeSync } from 'node:fs';
+import {
+  openSync,
+  closeSync,
+  unlinkSync,
+  existsSync,
+  readFileSync,
+  writeSync,
+  readSync,
+  fstatSync,
+  statSync,
+  renameSync
+} from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import process from 'node:process';
 
@@ -69,12 +102,11 @@ export function lockPath(num, opts = {}) {
   return `${dir}/dsh-capture-xvfb-${num}.lock`;
 }
 
-/** The per-display MUTATION LOCK path (coarse-grained mutex serializing all
- * lockfile/socket mutations for one display). Held only while a compliant
- * process verifies+mutates; never held across I/O. Same dir as the lock. */
-export function mutPath(num, opts = {}) {
+/** A scratch tombstone path (same dir as the lock so rename is same-FS / atomic)
+ * used by releaseOwned's rename-to-tombstone CAS. Unique per call. */
+function tombstonePath(num, opts = {}) {
   const dir = opts.lockDir || '/tmp';
-  return `${dir}/dsh-capture-xvfb-${num}.mut`;
+  return `${dir}/dsh-capture-xvfb-${num}.tomb-${process.pid}-${randomUUID()}`;
 }
 
 /** True if a display appears IN USE: its X11 socket exists. Point-in-time probe;
@@ -92,128 +124,51 @@ export function newOwnerToken() {
   return randomUUID();
 }
 
-/** Read the current owner of a display's lockfile. Returns
- * `{ token, pid } | null` (null if no lockfile or unreadable). Never throws. */
+/** Read the current owner of a display's lockfile BY PATH. Returns
+ * `{ token, pid } | null` (null if no lockfile or unreadable). Never throws.
+ * NOTE: this is a point-in-time path read; it does NOT prove the path still
+ * refers to the same inode later. The CAS operations (releaseOwned/
+ * cleanOwnedSocket) use readOwnerViaFd for fd-anchored identity. */
 export function readOwner(num, opts = {}) {
+  return readOwnerPath(lockPath(num, opts));
+}
+
+/** Read `{ token, pid } | null` from a path. Never throws. */
+function readOwnerPath(p) {
   try {
-    const txt = readFileSync(lockPath(num, opts), 'utf8');
-    // Lines: first line = token, "pid=<n>" line = owner pid.
-    const lines = txt.split('\n');
-    const token = (lines[0] || '').trim();
-    let pid = null;
-    for (const l of lines) {
-      const m = /^pid=(\d+)$/.exec(l);
-      if (m) pid = parseInt(m[1], 10);
-    }
-    if (!token) return null;
-    return { token, pid };
+    const txt = readFileSync(p, 'utf8');
+    return parseOwner(txt);
   } catch {
     return null;
   }
 }
 
-/** Read the holder pid recorded in a mutation lockfile. Returns a pid (number)
- * or null. Never throws. */
-function readMutHolder(num, opts = {}) {
+/** Parse owner `{ token, pid } | null` from lockfile text. */
+function parseOwner(txt) {
+  const lines = txt.split('\n');
+  const token = (lines[0] || '').trim();
+  let pid = null;
+  for (const l of lines) {
+    const m = /^pid=(\d+)$/.exec(l);
+    if (m) pid = parseInt(m[1], 10);
+  }
+  if (!token) return null;
+  return { token, pid };
+}
+
+/** Read the owner through an OPEN FD (fd-anchored identity). The token is read
+ * from the inode the fd is bound to, NOT "whatever is at the path now". Returns
+ * `{ token, pid } | null`. Never throws; closes the fd. */
+function readOwnerViaFd(fd) {
   try {
-    const txt = readFileSync(mutPath(num, opts), 'utf8');
-    const m = /^pid=(\d+)$/m.exec(txt);
-    return m ? parseInt(m[1], 10) : null;
+    // Read up to 256 bytes (token + pid line fit easily).
+    const buf = Buffer.alloc(256);
+    const n = readSync(fd, buf, 0, 256, 0);
+    const txt = buf.subarray(0, n).toString('utf8');
+    return parseOwner(txt);
   } catch {
     return null;
   }
-}
-
-/** Acquire the per-display MUTATION LOCK (O_EXCL). Returns an fd on success,
- * or null if held by another live compliant process. If a STALE mutation lock
- * (holder pid dead) is found, it is reclaimed (safe: holder is provably dead)
- * and re-acquired. Never throws on EEXIST; rethrows unexpected errors. */
-function acquireMut(num, opts = {}, isPidAlive = defaultIsPidAlive) {
-  let fd;
-  try {
-    fd = openSync(mutPath(num, opts), 'wx');
-  } catch (err) {
-    if (err && err.code === 'EEXIST') {
-      // Held. If the holder is DEAD, reclaim the stale mutation lock (the only
-      // legitimate reclaim path — holder crashed mid-mutation). Otherwise fail.
-      const holder = readMutHolder(num, opts);
-      if (holder !== null && !isPidAlive(holder)) {
-        try {
-          unlinkSync(mutPath(num, opts));
-        } catch {
-          return null; // someone else cleaned it; let caller retry
-        }
-        try {
-          fd = openSync(mutPath(num, opts), 'wx');
-        } catch (e2) {
-          if (e2 && e2.code === 'EEXIST') return null;
-          throw e2;
-        }
-        if (fd === undefined) return null;
-      } else {
-        return null; // held by a live process — contention, fail-closed
-      }
-    } else {
-      throw err;
-    }
-  }
-  try {
-    try {
-      writeSync(fd, `pid=${process.pid}\n`);
-    } catch { /* best effort; lock still held by fd */ }
-  } finally {
-    // NOTE: do NOT close here — the fd is released by releaseMut so we keep
-    // ownership semantics tied to the open handle + the path's pid record.
-  }
-  return fd;
-}
-
-/** Release (delete) the per-display mutation lock. Best-effort; never throws. */
-function releaseMut(num, opts = {}, fd) {
-  if (fd !== undefined && fd !== null) {
-    try { closeSync(fd); } catch { /* ignore */ }
-  }
-  try {
-    unlinkSync(mutPath(num, opts));
-  } catch { /* already gone */ }
-}
-
-/**
- * Run `fn` while holding the per-display mutation lock. `fn` receives no args
- * and may return a value, which is returned to the caller. The lock is ALWAYS
- * released (even on throw). Returns null when the mutation lock could not be
- * acquired after `opts.mutRetries` bounded retries (default 8) — callers treat
- * this as contention and fail-closed / scan another display. A retry is needed
- * only around reclaims that may briefly contend; normal release/clean paths
- * acquire on the first try.
- */
-function withMut(num, opts, fn, isPidAlive = defaultIsPidAlive) {
-  const retries = opts.mutRetries ?? 8;
-  let lastErr = null;
-  for (let i = 0; i < retries; i += 1) {
-    let fd;
-    try {
-      fd = acquireMut(num, opts, isPidAlive);
-    } catch (err) {
-      lastErr = err;
-      fd = null;
-    }
-    if (fd === null || fd === undefined) {
-      // Brief backoff only when contended. Math.random is unavailable in some
-      // sandboxed runtimes; use a deterministic micro-jitter from the counter.
-      const jitter = 1 + (i % 3);
-      const start = Date.now();
-      while (Date.now() - start < jitter) { /* spin briefly */ }
-      continue;
-    }
-    try {
-      return fn();
-    } finally {
-      releaseMut(num, opts, fd);
-    }
-  }
-  if (lastErr) throw lastErr;
-  return null;
 }
 
 /** Atomically acquire the ownership lockfile for `num` with a fresh token.
@@ -242,48 +197,75 @@ export function acquireDisplay(num, opts = {}) {
 
 /**
  * Reclaim a STALE lockfile whose owner pid is dead (a crashed prior run).
- * Reclaims ONLY if: the lockfile exists, its recorded pid is set and is NOT
- * alive, and we can atomically replace it with our own token. Returns the new
- * token or null. We NEVER reclaim a lock whose owner is still alive — that
- * would steal a live run's claim.
+ * Reclaims ONLY if the lockfile exists, its recorded pid is set and is NOT
+ * alive. Returns the new token or null. We NEVER reclaim a lock whose owner is
+ * still alive — that would steal a live run's claim.
  *
- * TOCTOU-safe: the read-verify-dead → unlink → O_EXCL-create sequence runs
- * UNDER the per-display mutation lock, so two concurrent reclaimers cannot
- * race — only one holds the mutation lock at a time, and the second, after
- * waiting, re-reads a lock that now carries the first reclaimer's LIVE token
- * and bails out (token differs from "stale"). No compliant process ever
- * `unlinkSync`s a live owner's lockfile.
+ * TOCTOU-safe (no read-verify-then-unlink): we do NOT unlink the stale lock and
+ * re-create it. We atomically REPLACE the lockfile's contents with our token
+ * via `rename(temp, lockPath)` — POSIX rename over an existing file is an
+ * atomic directory-entry swap; there is no instant the path is absent or refers
+ * to a half-written file. Two concurrent reclaimers both rename; rename is
+ * last-writer-wins, and the resulting lockfile carries EXACTLY ONE token. Each
+ * reclaimer then re-reads the path; if it carries OUR token we won, else we lost
+ * and bail (no unlink, no live lock deleted). Because a dead pid cannot become
+ * alive, the "owner is dead" fact cannot be invalidated between the check and
+ * the rename; and a reclaimer that loses the rename race reads the winner's LIVE
+ * token and bails. No compliant process ever `unlinkSync`s the lock path.
+ *
+ * Test hook: `DSH_RECLAIM_BARRIER` (a path) pauses us HERE — AFTER the
+ * dead-owner check and the rename, BEFORE the re-read that decides win/lose —
+ * letting the adversarial test deterministically force a second reclaimer onto
+ * the same stale lock and prove (via the re-read) that only one wins. No-op in
+ * production (env unset). Bounded so a wedged test cannot hang forever.
  */
 export function acquireStale(num, opts = {}, isPidAlive = defaultIsPidAlive) {
-  const result = withMut(
-    num,
-    opts,
-    () => {
-      const owner = readOwner(num, opts);
-      if (!owner) return null; // no lockfile — caller should use acquireDisplay
-      if (owner.pid === null) return null; // can't prove owner dead — leave it
-      if (isPidAlive(owner.pid)) return null; // owner still alive — do NOT steal
-      // Owner is dead: safe to reclaim. We hold the mutation lock, so no other
-      // compliant reclaimer is unlinking/recreating concurrently.
-      //
-      // Test hook: DSH_RECLAIM_BARRIER (a path) pauses us HERE — after the
-      // dead-owner check, BEFORE the unlink, WHILE still holding the mutation
-      // lock. This lets the adversarial test deterministically prove that a
-      // SECOND reclaimer on the same stale lock cannot enter its verify→unlink
-      // critical section (the mutation lock blocks it) until we release. No-op
-      // in production (env unset). Bounded so a wedged test cannot hang forever.
-      const reclaimBarrier = process.env.DSH_RECLAIM_BARRIER;
-      if (reclaimBarrier) waitForFile(reclaimBarrier, 30000);
-      try {
-        unlinkSync(lockPath(num, opts));
-      } catch {
-        return null; // someone else removed it; let caller retry acquireDisplay
-      }
-      return acquireDisplay(num, opts);
-    },
-    isPidAlive
-  );
-  return result;
+  const lockP = lockPath(num, opts);
+  const owner = readOwner(num, opts);
+  if (!owner) return null; // no lockfile — caller should use acquireDisplay
+  if (owner.pid === null) return null; // can't prove owner dead — leave it
+  if (isPidAlive(owner.pid)) return null; // owner still alive — do NOT steal
+  // Owner is dead. Atomically replace the lockfile's contents with our token.
+  // We write our claim to a temp file in the SAME dir (same filesystem → rename
+  // is atomic) then rename it over the stale lock path.
+  const myToken = newOwnerToken();
+  const tmpName = `${lockP}.reclaim-${process.pid}-${randomUUID()}`;
+  let tmpFd;
+  try {
+    tmpFd = openSync(tmpName, 'wx');
+  } catch {
+    return null; // could not stage temp; let caller retry acquireDisplay
+  }
+  try {
+    try {
+      writeSync(tmpFd, `${myToken}\npid=${process.pid}\n`);
+    } catch { /* best effort */ }
+  } finally {
+    try { closeSync(tmpFd); } catch { /* ignore */ }
+  }
+  // Atomic replace. If a concurrent reclaimer raced us, last rename wins; the
+  // lockfile ends up carrying exactly one token. We then re-read to find out
+  // if it was ours.
+  try {
+    renameSync(tmpName, lockP);
+  } catch {
+    // rename failed (e.g. the lock vanished between read and rename) — clean
+    // up our temp and bail so the caller retries acquireDisplay.
+    try { unlinkSync(tmpName); } catch { /* ignore */ }
+    return null;
+  }
+  // Test hook: pause after the atomic replace, before the win/lose re-read.
+  const reclaimBarrier = process.env.DSH_RECLAIM_BARRIER;
+  if (reclaimBarrier) waitForFile(reclaimBarrier, 30000);
+  // Re-read to determine if WE won the atomic replace.
+  const after = readOwner(num, opts);
+  if (!after || after.token !== myToken) {
+    // We lost the rename race (a concurrent reclaimer's rename was last). The
+    // lockfile now carries the WINNER's token, not ours. We did NOT unlink the
+    // lock path; the winner's live lock is intact. Bail.
+    return null;
+  }
+  return myToken;
 }
 
 /** Test hook: wait until `p` exists (bounded). No-op when p is never created. */
@@ -309,29 +291,63 @@ function defaultIsPidAlive(pid) {
 }
 
 /**
- * Compare-and-release: delete the lockfile for `num` ONLY IF its current owner
- * token still equals `token`. If the lock was already released, or a NEW owner
- * took over (token differs), this is a NO-OP — we must not delete the new
- * owner's lock. Best-effort; never throws. Returns true if we released it.
+ * fd-anchored compare-and-delete of the lockfile for `num` ONLY IF its current
+ * owner token still equals `token`. Returns true if WE released OUR lock, false
+ * otherwise (already gone / new owner took over / contention). Never throws.
  *
- * TOCTOU-safe: the read-token-then-unlink runs UNDER the per-display mutation
- * lock, so a concurrent stale-reclaimer cannot unlink+recreate the lockfile in
- * the verify→unlink window. Our `unlinkSync` therefore always hits the file
- * whose token we just verified.
+ * TOCTOU-safe via the rename-to-tombstone CAS (see module header): the token is
+ * read THROUGH an open fd anchored to the inode that was at lockPath at open
+ * time; the destructive unlink targets a TOMBSTONE whose inode we prove (via
+ * fstat(fd) === stat(tombstone)) is the same inode whose token we verified. No
+ * path-based unlink is issued against lockPath. A late/duplicate cleanup whose
+ * token no longer matches reads a foreign token through its fd and aborts; a
+ * concurrent reclaimer that replaced the lock between our open and rename makes
+ * fstat(fd) !== stat(tombstone), so we RESTORE their lock and abort.
  */
 export function releaseOwned(num, token, opts = {}) {
   if (!token) return false;
-  return withMut(num, opts, () => {
-    const owner = readOwner(num, opts);
-    if (!owner) return false; // lock gone — nothing to release
-    if (owner.token !== token) return false; // a new owner took over — NOT ours
+  const lockP = lockPath(num, opts);
+  let fd;
+  try {
+    fd = openSync(lockP, 'r');
+  } catch {
+    return false; // lock gone — nothing to release
+  }
+  try {
+    // Read the token THROUGH the fd (fd-anchored identity, not a path re-read).
+    const owner = readOwnerViaFd(fd);
+    if (!owner || owner.token !== token) return false; // not ours — leave it
+    // Atomic: move whatever directory entry is at lockP RIGHT NOW to a tombstone.
+    const tomb = tombstonePath(num, opts);
     try {
-      unlinkSync(lockPath(num, opts));
+      renameSync(lockP, tomb);
     } catch {
+      return false; // lock vanished between open and rename — nothing to release
+    }
+    // Did the rename move OUR inode (the fd's inode) or a REPLACED file?
+    let fdIno, tombIno;
+    try {
+      fdIno = fstatSync(fd).ino;
+      tombIno = statSync(tomb).ino;
+    } catch {
+      // Tombstone stat failed (someone removed it already) — best-effort: if we
+      // can't prove it was ours, leave it rather than risk deleting another's.
+      try { renameSync(tomb, lockP); } catch { /* best effort restore */ }
       return false;
     }
-    return true;
-  });
+    if (fdIno === tombIno) {
+      // The tombstone holds OUR inode (whose token we verified). Safe to unlink.
+      try { unlinkSync(tomb); } catch { /* best effort */ }
+      return true;
+    }
+    // The tombstone holds a file whose inode differs from our fd — i.e. another
+    // process replaced the lock at lockPath between our open and rename. Restore
+    // their lock to the canonical path and abort. Do NOT unlink.
+    try { renameSync(tomb, lockP); } catch { /* best effort restore */ }
+    return false;
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -350,30 +366,36 @@ export function shouldCleanSocket({ socketExistedBefore, xvfbPidAlive }) {
 
 /**
  * Remove the X11 socket for `num` ONLY IF we STILL own the claim at unlink
- * time. This is the critical race fix: we re-read the lockfile and require its
- * current token to equal `token`. Because releaseOwned is called AFTER this,
- * no concurrent run B can have won the lock and started its own Xvfb on this
- * display yet (the lock still carries our token). A late/duplicate cleanup
- * whose token no longer matches the lockfile is a no-op and must not unlink
- * the socket (B may own it now).
+ * time. Because releaseOwned is called AFTER this, no concurrent run B can have
+ * won the lock and started its own Xvfb on this display yet (the lock still
+ * carries our token). A late/duplicate cleanup whose token no longer matches is
+ * a no-op and must not unlink the socket (B may own it now).
  *
- * TOCTOU-safe: the verify-token-then-unlink-socket runs UNDER the per-display
- * mutation lock. A concurrent stale-reclaimer cannot replace the ownership
- * lockfile between our token check and the socket unlink, so we never unlink a
- * socket a new owner now owns.
+ * Ownership re-verify uses the same fd-anchored CAS as releaseOwned: read the
+ * token through an open fd anchored to the lock inode, then unlink the X11
+ * socket only if that token is still ours. The socket is a DIFFERENT path from
+ * the lockfile, so unlinking it cannot race a lockfile path replacement; the
+ * fd-anchored token read is what proves we still own the claim at unlink time.
  *
  * Precondition: shouldCleanSocket(...) was true at start time (we created it).
- * Returns true if the socket was removed by us.
+ * Returns true if the socket was removed by us; ALWAYS a boolean.
  */
 export function cleanOwnedSocket({ num, token, socketExistedBefore, xvfbPidAlive }, opts = {}) {
   if (!shouldCleanSocket({ socketExistedBefore, xvfbPidAlive })) return false;
   if (!token) return false;
-  return withMut(num, opts, () => {
-    // Re-verify ownership at unlink time: the lock must still carry OUR token.
-    const owner = readOwner(num, opts);
-    if (!owner) return false; // our lock is gone — a new owner could be
-    // mid-claim. Do NOT unlink.
-    if (owner.token !== token) return false; // a new owner took over — their socket now
+  const lockP = lockPath(num, opts);
+  let fd;
+  try {
+    fd = openSync(lockP, 'r');
+  } catch {
+    return false; // lock gone — a new owner could be mid-claim. Do NOT unlink.
+  }
+  try {
+    const owner = readOwnerViaFd(fd);
+    if (!owner || owner.token !== token) return false; // new owner took over
+    // We still own the claim (fd-anchored token matches). Because releaseOwned
+    // runs AFTER cleanOwnedSocket in the launcher, no run B has won the lock
+    // and started its own Xvfb on this display yet.
     try {
       const sock = socketPath(num);
       if (!existsSync(sock)) return false; // Xvfb already removed it
@@ -382,7 +404,9 @@ export function cleanOwnedSocket({ num, token, socketExistedBefore, xvfbPidAlive
     } catch {
       return false;
     }
-  });
+  } finally {
+    try { closeSync(fd); } catch { /* ignore */ }
+  }
 }
 
 /**

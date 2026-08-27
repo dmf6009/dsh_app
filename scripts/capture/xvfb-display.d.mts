@@ -2,9 +2,6 @@ export interface DisplayOpts {
   min?: number;
   max?: number;
   lockDir?: string;
-  /** Bounded retries for the per-display mutation lock (fail-closed on
-   * contention). Defaults to 8. */
-  mutRetries?: number;
 }
 
 export interface OwnerInfo {
@@ -34,9 +31,6 @@ export const DEFAULT_MAX_DISPLAY: number;
 
 export function socketPath(num: number): string;
 export function lockPath(num: number, opts?: DisplayOpts): string;
-/** The per-display mutation-lock path (coarse-grained mutex serializing all
- * lockfile/socket mutations for one display). */
-export function mutPath(num: number, opts?: DisplayOpts): string;
 export function displayOccupied(num: number): boolean;
 export function newOwnerToken(): string;
 export function readOwner(num: number, opts?: DisplayOpts): OwnerInfo | null;
@@ -46,8 +40,14 @@ export function acquireStale(
   opts?: DisplayOpts,
   isPidAlive?: (pid: number) => boolean
 ): string | null;
+/** Compare-and-release the lockfile for `num` ONLY IF its current owner token
+ * still equals `token`. ALWAYS returns a boolean (never null): true iff we
+ * released OUR lock. fd-anchored rename-to-tombstone CAS — no read-verify-then-
+ * unlink TOCTOU window. */
 export function releaseOwned(num: number, token: string, opts?: DisplayOpts): boolean;
 export function shouldCleanSocket(input: ShouldCleanInput): boolean;
+/** Remove the X11 socket for `num` ONLY IF we STILL own the claim. ALWAYS
+ * returns a boolean (never null). */
 export function cleanOwnedSocket(input: CleanSocketInput, opts?: DisplayOpts): boolean;
 export function findFreeDisplay(opts?: DisplayOpts): ClaimHandle | null;
 export function claimExplicit(num: number, opts?: DisplayOpts): ClaimHandle | null;

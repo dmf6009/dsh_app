@@ -24,13 +24,13 @@
 
 import { describe, expect, it, afterEach } from 'vitest';
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, writeFileSync, unlinkSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { lockPath, mutPath, readOwner, releaseOwned, cleanOwnedSocket, socketPath } from '../scripts/capture/xvfb-display.mjs';
+import { lockPath, readOwner, releaseOwned, cleanOwnedSocket, socketPath } from '../scripts/capture/xvfb-display.mjs';
 import { treeKill } from '../scripts/capture/proc-tree.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)); // → dsh_app/
@@ -90,23 +90,22 @@ afterEach(() => {
     }
   }
   started.length = 0;
-  // Clean any leftover test locks/sockets/mutation-locks in our display range.
+  // Clean any leftover test locks/sockets/tombstones/reclaim-temps in our
+  // display range. (No .mut mutation lock exists in the new fd-anchored
+  // design; tomb-* / reclaim-* are scratch files from releaseOwned/acquireStale
+  // that should be gone on the happy path but may linger if a test was killed.)
   for (const n of [770, 771, 772]) {
-    try {
-      unlinkSync(lockPath(n));
-    } catch {
-      /* ignore */
+    for (const p of [lockPath(n), socketPath(n)]) {
+      try { unlinkSync(p); } catch { /* ignore */ }
     }
+    // Sweep scratch files for this display (tomb-/reclaim- prefixed).
     try {
-      unlinkSync(mutPath(n));
-    } catch {
-      /* ignore */
-    }
-    try {
-      unlinkSync(socketPath(n));
-    } catch {
-      /* ignore */
-    }
+      for (const f of readdirSync('/tmp')) {
+        if (f.startsWith(`dsh-capture-xvfb-${n}.tomb-`) || f.startsWith(`dsh-capture-xvfb-${n}.lock.reclaim-`)) {
+          try { unlinkSync(join('/tmp', f)); } catch { /* ignore */ }
+        }
+      }
+    } catch { /* ignore */ }
   }
 });
 
@@ -232,23 +231,34 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
 
   // ── REVIEW FIX: two concurrent reclaimers on the SAME stale lock ──────────
   // The review flagged that acquireStale had a TOCTOU: two reclaimers could
-  // both read a dead-owner lock, one unlinks+creates, the other's queued
-  // unlinkSync deletes the just-created LIVE lock. The fix is the per-display
-  // MUTATION LOCK: only one reclaimer's verify→unlink→create critical section
-  // can run at a time for a display.
+  // both read a dead-owner lock and race — the prior "mutation lock" fix
+  // reproduced the SAME window inside the mutex's own stale reclamation. The
+  // new design eliminates the read-verify-then-unlink window ENTIRELY:
+  // acquireStale never unlinks the lock path — it atomically REPLACEs the
+  // lockfile's contents via `rename(temp, lockPath)` (a POSIX-atomic directory-
+  // entry swap; no instant the path is absent). The very first reclaimer to
+  // rename installs a LIVE owner (its own pid); any second reclaimer that then
+  // reads the owner sees that LIVE pid and bails — it can NEVER race into the
+  // unlink/recreate window because there is no unlink, and the atomic rename
+  // has already flipped the owner from "dead" to "live".
   //
   // We FORCE the interleaving deterministically with DSH_RECLAIM_BARRIER, which
-  // pauses reclaimer A INSIDE acquireStale's critical section — after the dead-
-  // owner check, BEFORE the unlink, WHILE HOLDING the mutation lock. With A
-  // paused there, reclaimer B (started against the SAME stale lock on the SAME
-  // shared /tmp lockDir) cannot enter its own acquireStale critical section
-  // (the mutation lock is held by A) → claimExplicit returns null → B exits
-  // non-zero. B's verify→unlink NEVER runs while A is mid-reclaim, so B can
-  // never unlink a live lock A is about to install. Then we release A's
-  // barrier; A completes (unlinks stale S, installs tokenA), boots Xvfb, and on
-  // exit self-cleans its OWN lock. Exactly one winner; the loser deleted
-  // nothing.
-  it('reclaimer A paused mid-acquireStale holds the mutation lock; B cannot reclaim the same stale lock', async () => {
+  // pauses reclaimer A AFTER its atomic rename, BEFORE the win/lose re-read:
+  //  - Seed a dead-owner stale lock S on shared /tmp.
+  //  - A enters acquireStale, renames tokenA over S (lock now carries tokenA
+  //    with A's LIVE pid), and pauses at the barrier.
+  //  - B enters claimExplicit on the SAME display: acquireDisplay fails (lock
+  //    exists) → acquireStale reads the owner → A's pid is LIVE → acquireStale
+  //    returns null → claimExplicit returns null → B exits non-zero. B NEVER
+  //    renamed/unlinked anything; A's live lock is untouched.
+  //  - Release A: A re-reads → tokenA == A's → A WINS → A boots Xvfb and on
+  //    exit self-cleans its OWN lock.
+  // Invariant: EXACTLY ONE owner at all times; the second reclaimer cannot
+  // reclaim once the first has atomically installed a live pid; no live lock is
+  // ever unlinked. (Pre-fix, A would have unlinked S + O_EXCL-created, and B
+  // could race a queued unlinkSync that deleted A's fresh live lock — the test
+  // asserts that does NOT happen: A's token survives B's attempt.)
+  it('reclaimer A paused after atomic rename; B sees A live and cannot reclaim the same lock', async () => {
     const num = 771;
     const lockDir = '/tmp'; // shared production lockDir — real contention
     const reclaimBarrier = join(tmpdir(), `dsh-reclaim-barrier-${num}-${Date.now()}`);
@@ -272,8 +282,9 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
       /* ignore */
     }
 
-    // A pauses INSIDE acquireStale (holding the mutation lock). A also pauses at
-    // its cleanup barrier so we can inspect state before A self-cleans.
+    // A pauses after its atomic rename (tokenA installed, A's pid live), before
+    // the win/lose re-read. A also pauses at its cleanup barrier so we can
+    // inspect before A self-cleans.
     const cleanupBarrier = join(tmpdir(), `dsh-cleanup-barrier-${num}-${Date.now()}`);
     try {
       unlinkSync(cleanupBarrier);
@@ -293,57 +304,57 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
     started.push({ child: a, pid: a.pid });
     drain(a);
 
-    // Wait for A to reach the reclaim barrier (it is now paused inside
-    // acquireStale, holding the mutation lock, BEFORE unlinking S). The lockfile
-    // still carries the stale seed (A has not unlinked/recreated yet).
-    await new Promise((r) => setTimeout(r, 800));
-    expect(readOwner(num, { lockDir })!.token).toBe('stale-seed'); // A not yet won
-    // The mutation lock is held by A.
-    expect(existsSync(mutPath(num, { lockDir }))).toBe(true);
+    // Wait for A to reach the reclaim barrier: A has renamed tokenA over S and
+    // is paused. The lock now carries A's FRESH token + A's LIVE pid (not the
+    // stale seed).
+    let aOwner = readOwner(num, { lockDir });
+    for (let i = 0; i < 40 && (!aOwner || aOwner!.token === 'stale-seed'); i += 1) {
+      await new Promise((r) => setTimeout(r, 200));
+      aOwner = readOwner(num, { lockDir });
+    }
+    expect(aOwner).not.toBeNull();
+    expect(aOwner!.token).not.toBe('stale-seed'); // A's atomic rename installed a fresh token
+    expect(aOwner!.pid).toBe(a.pid); // ...with A's LIVE pid
+    const aToken = aOwner!.token;
 
-    // --- While A is paused mid-reclaim holding the mutation lock, B reclaims. ---
-    // B's acquireStale cannot acquire the mutation lock → returns null →
-    // claimExplicit returns null → B exits non-zero. B NEVER unlinks S, and B
-    // NEVER installs a token. This is the exact window the TOCTOU would let B
-    // delete A's live lock in the unfixed code; here B cannot enter at all.
-    const bEnv = {
+    // --- B reclaims the SAME display while A is paused (A live). ---
+    // B's acquireStale reads A's pid → LIVE → returns null → claimExplicit
+    // returns null → B exits non-zero. B NEVER renamed/unlinked; A's lock
+    // survives with A's token.
+    const b = spawnLauncher({
       ...process.env,
       DSH_XVFB_DISPLAY: String(num),
       DSH_CAPTURE_TIMEOUT_MS: '1500',
       DISPLAY: '',
       ELECTRON_ENABLE_LOGGING: '0'
-      // No DSH_RECLAIM_BARRIER — B must NOT pause; it should fail fast.
-    };
-    const b = spawnLauncher(bEnv);
+      // No DSH_RECLAIM_BARRIER / DSH_CLEANUP_BARRIER — B should fail fast.
+    });
     started.push({ child: b, pid: b.pid });
     drain(b);
     const bExit = await waitExit(b, 30000);
-    expect(bExit).not.toBe(0); // B failed to claim — could not enter critical section
-    // While A is still paused, the lock STILL carries the stale seed — B did not
-    // unlink it and did not install its own token. (A hasn't unlinked yet.)
-    expect(readOwner(num, { lockDir })!.token).toBe('stale-seed');
+    expect(bExit).not.toBe(0); // B could NOT reclaim — A is live
+    // A's lock is UNTOUCHED by B: still A's token, still A's pid.
+    const afterB = readOwner(num, { lockDir });
+    expect(afterB!.token).toBe(aToken);
+    expect(afterB!.pid).toBe(a.pid);
 
-    // --- Release A's RECLAIM barrier: A unlinks S, installs tokenA, boots Xvfb. ---
+    // --- Release A: A re-reads → tokenA == A's → A wins, boots Xvfb. ---
     writeFileSync(reclaimBarrier, 'go');
-    // Wait for A to win the lock (fresh token, A's pid) and reach its CLEANUP
-    // barrier (Xvfb killed, paused before self-release).
-    let owner = readOwner(num, { lockDir });
-    for (let i = 0; i < 60 && (!owner || owner!.token === 'stale-seed' || owner!.pid !== a.pid); i += 1) {
-      await new Promise((r) => setTimeout(r, 200));
-      owner = readOwner(num, { lockDir });
+    // Wait for A to win and bring up its Xvfb socket.
+    const sock = socketPath(num);
+    let aSockUp = false;
+    for (let i = 0; i < 60 && !aSockUp; i += 1) {
+      if (existsSync(sock)) aSockUp = true;
+      else await new Promise((r) => setTimeout(r, 200));
     }
-    expect(owner).not.toBeNull();
-    expect(owner!.token).not.toBe('stale-seed');
-    expect(owner!.pid).toBe(a.pid); // A is the sole winner
-    // Give A time to hit its 1500ms timeout + reach the cleanup barrier.
-    await new Promise((r) => setTimeout(r, 2500));
+    expect(aSockUp).toBe(true); // A won and started its Xvfb
+    // A's lock still carries A's token (B never clobbered it).
+    expect(readOwner(num, { lockDir })!.token).toBe(aToken);
 
-    // --- Release A's CLEANUP barrier: A self-cleans its OWN lock. ---
+    // Release A's cleanup barrier so A self-cleans its OWN lock; no leaks.
     writeFileSync(cleanupBarrier, 'go');
     const aExit = await waitExit(a, 30000);
     expect(aExit).not.toBeNull();
-    // A released its OWN lock; no lock leaks. B never touched it.
-    expect(existsSync(staleP)).toBe(false);
-    expect(existsSync(mutPath(num, { lockDir }))).toBe(false);
+    expect(existsSync(staleP)).toBe(false); // A released its own lock
   }, 90000);
 });

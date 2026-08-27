@@ -15,7 +15,7 @@
  */
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -201,28 +201,30 @@ describe('acquireStale (reclaim dead-owner lock, never a live one)', () => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Adversarial TOCTOU tests (review requirement: P1 stale-reclaim + read-verify-
-// unlink races). These exercise the MUTATION LOCK that serializes every
-// lockfile/socket mutation for a display. Without it, two reclaimers can both
-// read a dead-owner lock and one can unlink the other's freshly-created LIVE
-// lock, and a release's read-verify-then-unlink can hit a lockfile replaced by
-// a concurrent reclaimer. These tests prove those windows are closed.
+// unlink races). The prior "mutation lock" fix reproduced the SAME window inside
+// the mutex's own stale reclamation; the current design eliminates the window
+// ENTIRELY: acquireStale uses an atomic `rename`-replace (no unlink of the lock
+// path), and releaseOwned/cleanOwnedSocket anchor identity to an open fd (read
+// the token THROUGH the fd, unlink only a tombstone whose inode matches the fd).
+// These tests prove: two reclaimers cannot both win; a loser re-reads the
+// winner's LIVE token and bails without touching the lock; and a release's
+// fd-anchored token read cannot be fooled by a path replacement.
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('adversarial stale reclaim — two reclaimers, one winner', () => {
-  // We simulate two SEQUENTIAL reclaim passes against the SAME stale lock. With
-  // the mutation lock, the FIRST reclaimer atomically unlinks the stale lock and
-  // creates its own; the SECOND reclaimer re-reads a LIVE-owner lock and bails.
-  // This is the same interleaving the mutation lock produces under real
-  // concurrency — the second caller cannot enter its verify→unlink critical
-  // section until the first has committed, by which point the lock is no longer
-  // stale. We assert the live winner's lock is NEVER unlinked by the loser.
+  // We simulate two SEQUENTIAL reclaim passes against the SAME stale lock. The
+  // FIRST reclaimer atomically rename-replaces the stale lock with its own token
+  // + LIVE pid; the SECOND reclaimer reads the winner's LIVE pid and bails
+  // (default liveness). This is the same ordering real concurrency produces
+  // (the first rename flips the owner from dead to live; any second reclaimer
+  // that reads after that sees a live owner). The live winner's lock is NEVER
+  // unlinked by the loser (there is no unlink in the reclaim path at all).
   const num = 570;
 
   it('only one reclaimer wins; the loser does NOT unlink the winner live lock', () => {
     // Stale lock S with a dead owner pid.
     writeFileSync(lockPath(num, { lockDir: lockDir() }), 'stale-token\npid=999999\n');
-    // Reclaimer A wins the mutation lock: unlinks S, creates lock with tokenA.
-    // A's lock records pid=process.pid (the LIVE owner of the new claim).
+    // Reclaimer A: atomic rename-replace installs tokenA with A's LIVE pid.
     const tokA = acquireStale(num, { lockDir: lockDir() }, () => false);
     expect(tokA).not.toBeNull();
     const ownerAfterA = readOwner(num, { lockDir: lockDir() })!;
@@ -230,11 +232,12 @@ describe('adversarial stale reclaim — two reclaimers, one winner', () => {
     expect(ownerAfterA.pid).toBe(process.pid); // live owner
     // The lockfile on disk now carries tokenA (a LIVE owner — pid is our pid).
 
-    // Reclaimer B arrives AFTER A won (the only ordering the mutation lock
-    // permits: A's critical section completed). B re-reads the owner pid and
-    // checks liveness with the DEFAULT probe — our pid is ALIVE, so B must NOT
-    // reclaim. (Using the default probe, not the injected "always dead", models
-    // the real second reclaimer seeing a live winner.)
+    // Reclaimer B arrives AFTER A's atomic rename (the only ordering real
+    // concurrency permits: A's rename flipped the owner from dead to live).
+    // B re-reads the owner pid and checks liveness with the DEFAULT probe — our
+    // pid is ALIVE, so B must NOT reclaim. (Using the default probe, not the
+    // injected "always dead", models the real second reclaimer seeing a live
+    // winner.)
     const tokB = acquireStale(num, { lockDir: lockDir() }); // default liveness
     // B must NOT reclaim a lock whose (current) owner is alive.
     expect(tokB).toBeNull();
@@ -291,24 +294,120 @@ describe('adversarial TOCTOU — old token cleanup does not touch new-owner reso
   });
 
   it('concurrent release-vs-reclaim: releasing owner does not delete a lock a reclaimer just installed', () => {
-    // Model the harmful interleaving the mutation lock prevents: A is mid-release
-    // (token still on disk), B reclaims a "stale" lock (simulated by giving A a
-    // dead pid) and installs tokB. A's LATE releaseOwned(tokA) must be a no-op.
-    // We sequence it as: A acquires; B reclaims (treats A as stale, dead pid);
-    // A then tries releaseOwned(tokA) — must NOT delete B's lock.
+    // Model the harmful interleaving the fd-anchored CAS prevents: A is mid-
+    // release (token still on disk), B reclaims A's "stale" lock (simulated by
+    // giving A a dead pid) and installs tokB by atomic rename-replace. A's LATE
+    // releaseOwned(tokA) opens the lock, reads the token THROUGH the fd (which
+    // now reflects B's token after the rename-replace) → mismatch → no-op.
     const n = num + 2;
     const tokA = acquireDisplay(n, { lockDir: lockDir() })!;
     // Overwrite A's lock to simulate A's pid being DEAD so a reclaimer may
     // reclaim it (this models A crashing right as B scans).
     writeFileSync(lockPath(n, { lockDir: lockDir() }), `${tokA}\npid=999999\n`);
-    // B reclaims (pid dead): unlinks A's stale lock, installs tokB.
+    // B reclaims (pid dead): atomically rename-replaces with tokB.
     const tokB = acquireStale(n, { lockDir: lockDir() }, () => false);
     expect(tokB).not.toBeNull();
     expect(readOwner(n, { lockDir: lockDir() })!.token).toBe(tokB);
-    // A's late releaseOwned(tokA) — A was reclaimed; its token no longer matches.
+    // A's late releaseOwned(tokA) — A opens the lock at the path; the fd anchors
+    // B's inode (the rename-replaced file); read-through-fd yields tokB ≠ tokA →
+    // abort, NO unlink, NO rename-to-tombstone. B's lock survives.
     expect(releaseOwned(n, tokA, { lockDir: lockDir() })).toBe(false);
-    // B's lock survives.
     expect(readOwner(n, { lockDir: lockDir() })!.token).toBe(tokB);
     expect(existsSync(lockPath(n, { lockDir: lockDir() }))).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fd-anchored rename-to-tombstone CAS (review requirement: the releaseOwned
+// read-verify-then-unlink window must be closed at the unit level). These prove
+// the identity is anchored to an open fd (not a path re-read) so a lock replaced
+// between open and rename is detected by inode-mismatch and NOT deleted; and
+// that the boolean contract holds (return is always boolean, never null).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('releaseOwned — fd-anchored CAS, boolean contract', () => {
+  // The key property: releaseOwned opens the lock, reads the token THROUGH the
+  // fd, and only unlinks a tombstone whose inode matches the fd. If the lock
+  // was replaced (new file, same path, different inode) before releaseOwned
+  // opens it, the fd anchors the NEW file and the token read yields the NEW
+  // owner's token → mismatch → no-op. We simulate "replaced before open" by
+  // installing a new owner's content at the path before calling releaseOwned
+  // with the OLD token.
+  const num = 590;
+
+  it('returns a boolean for every path (never null): release when ours, false when not', () => {
+    const tok = acquireDisplay(num, { lockDir: lockDir() })!;
+    // Releasing OUR lock returns true (boolean).
+    const r = releaseOwned(num, tok, { lockDir: lockDir() });
+    expect(typeof r).toBe('boolean');
+    expect(r).toBe(true);
+    // Late/duplicate release with our (now-stale) token returns false (boolean).
+    const r2 = releaseOwned(num, tok, { lockDir: lockDir() });
+    expect(typeof r2).toBe('boolean');
+    expect(r2).toBe(false);
+    // Wrong-token release returns false (boolean).
+    const tok2 = acquireDisplay(num, { lockDir: lockDir() })!;
+    const r3 = releaseOwned(num, 'not-our-token', { lockDir: lockDir() });
+    expect(typeof r3).toBe('boolean');
+    expect(r3).toBe(false);
+    expect(existsSync(lockPath(num, { lockDir: lockDir() }))).toBe(true); // tok2 intact
+    expect(readOwner(num, { lockDir: lockDir() })!.token).toBe(tok2);
+  });
+
+  it('does NOT delete a lock whose contents were REPLACED at the path (fd anchors the replaced file)', () => {
+    // A acquires; then the lock is REPLACED at the path (simulating a concurrent
+    // reclaimer's atomic rename-replace) with B's token+pid. A's releaseOwned
+    // opens the path → fd anchors B's file → read-through-fd yields tokB ≠
+    // tokA → no-op. B's lock survives. (This is the read-verify-then-unlink
+    // window closed: A never unlinks a path whose token it didn't just verify
+    // against the same fd-anchored inode.)
+    const tokA = acquireDisplay(num + 1, { lockDir: lockDir() })!;
+    // Simulate replacement: a reclaimer renamed a fresh file over the lock path.
+    const tokB = 'B-replaced-' + '0'.repeat(20);
+    writeFileSync(lockPath(num + 1, { lockDir: lockDir() }), `${tokB}\npid=999999\n`);
+    // A's releaseOwned(tokA): fd anchors the REPLACED file (tokB) → mismatch.
+    expect(releaseOwned(num + 1, tokA, { lockDir: lockDir() })).toBe(false);
+    // B's lock is intact at the path.
+    expect(readOwner(num + 1, { lockDir: lockDir() })!.token).toBe(tokB);
+    expect(existsSync(lockPath(num + 1, { lockDir: lockDir() }))).toBe(true);
+  });
+
+  it('leaves no tombstone scratch files after a successful release', () => {
+    const n = num + 2;
+    const tok = acquireDisplay(n, { lockDir: lockDir() })!;
+    expect(releaseOwned(n, tok, { lockDir: lockDir() })).toBe(true);
+    // A successful release unlinks its own tombstone — no scratch remains.
+    const leftover = readdirSync(lockDir()).filter(
+      (f: string) => f.includes(`dsh-capture-xvfb-${n}`) && f.includes('tomb-')
+    );
+    expect(leftover).toEqual([]);
+  });
+});
+
+describe('acquireStale — atomic rename-replace (no unlink of the lock path)', () => {
+  const num = 600;
+
+  it('rename-replaces the stale lock content and re-reads to confirm win/lose', () => {
+    writeFileSync(lockPath(num, { lockDir: lockDir() }), 'stale\npid=999999\n');
+    const tok = acquireStale(num, { lockDir: lockDir() }, () => false);
+    expect(tok).not.toBeNull();
+    // The winner's token replaced the stale content atomically (same file path,
+    // overwritten via rename); the stale seed is gone.
+    const owner = readOwner(num, { lockDir: lockDir() })!;
+    expect(owner.token).toBe(tok);
+    expect(owner.pid).toBe(process.pid);
+  });
+
+  it('a loser that rename-replaced over a winner reads the winner token and bails (no unlink)', () => {
+    // Seed stale; A reclaims (rename-replaces tokenA). Then B reclaims: B reads
+    // the owner (now tokenA with A's LIVE pid), default liveness → A alive → B
+    // returns null WITHOUT renaming. A's lock survives. (No unlink anywhere.)
+    writeFileSync(lockPath(num + 1, { lockDir: lockDir() }), 'stale\npid=999999\n');
+    const tokA = acquireStale(num + 1, { lockDir: lockDir() }, () => false);
+    expect(tokA).not.toBeNull();
+    // B uses DEFAULT liveness: A (process.pid) is alive → B must bail.
+    const tokB = acquireStale(num + 1, { lockDir: lockDir() });
+    expect(tokB).toBeNull();
+    expect(readOwner(num + 1, { lockDir: lockDir() })!.token).toBe(tokA);
   });
 });

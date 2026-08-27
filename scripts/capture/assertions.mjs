@@ -12,9 +12,11 @@
  *    verified by label — a wrong or reordered label fails (not just a count);
  *  - viewport bounds: containment covers BOTH horizontal (x/w) and vertical
  *    (y/h) axes against the full viewport rect;
- *  - button visibility: each button's real `visible` flag (captured from the
- *    element box) is asserted, so a `display:none`/zero-box button cannot pass
- *    even if its recorded w/h were stale.
+ *  - button visibility: each button's real `visible` flag (captured from rect
+ *    AND computed style — display/visibility/opacity) is asserted with strict
+ *    `=== true`, so a missing/undefined/null field or a `visibility:hidden`
+ *    element with a positive box cannot pass — the captured value must be the
+ *    strict boolean `true`.
  */
 
 export function rectVisible(rect) {
@@ -68,7 +70,9 @@ export function overlapErrors(btns) {
  * For every expected label:
  *  - a button MUST exist at that position;
  *  - its `text` MUST equal the expected label (wrong/mislabelled → FAIL);
- *  - it MUST be `visible` with positive size (hidden/zero-box → FAIL);
+ *  - its `visible` MUST be the strict boolean `true` (missing/undefined/null/
+ *    false all FAIL) — the captured value must assert real rendered visibility;
+ *  - it MUST have positive size;
  *  - it MUST lie entirely within the viewport on BOTH axes.
  * Finally all button pairs must be non-overlapping. Any surplus/missing button
  * also fails so a 2- or 4-button bar cannot slip through as a 3-button pass.
@@ -95,9 +99,11 @@ export function actionsBarErrors(b, expectedLabels = []) {
     if (actual !== expected) {
       errs.push(`action button #${i + 1} label mismatch: expected "${expected}", got "${actual}"`);
     }
-    // Visibility: a hidden/zero-box button is a false-green if unchecked.
-    if (btn.visible === false) {
-      errs.push(`action button "${expected}" is not visible (visible=false)`);
+    // Visibility: the captured flag must be strict `true`. Missing/undefined/
+    // null (e.g. capture dropped the field) or false all fail — the gate must
+    // never be green when the real rendered-visibility evidence is absent.
+    if (btn.visible !== true) {
+      errs.push(`action button "${expected}" is not visible (visible=${JSON.stringify(btn.visible)})`);
     }
     if (!(btn.w > 0 && btn.h > 0)) {
       errs.push(`action button "${expected}" has zero size (w=${btn.w} h=${btn.h})`);

@@ -190,3 +190,72 @@ describe('actionsBarErrors — identity, visibility, viewport, overlap', () => {
     expect(errs.join(' ')).toMatch(/overlap|↔/);
   });
 });
+
+describe('actionsBarErrors — strict visible === true (no missing-field green)', () => {
+  // The reviewer flagged that `visible` absent/undefined/null must FAIL, not
+  // only `visible === false`. The capture contract is a strict boolean `true`;
+  // a JSON/capture field drop must surface as a gate failure, not a pass.
+
+  it('fails when the `visible` field is OMITTED entirely (positive box present)', () => {
+    // Cast: these intentionally lack the `visible` field to model a captured
+    // JSON record that dropped it — the TS type is satisfied via the boundary
+    // cast, but the runtime value is the point of the test.
+    const btns = [
+      { text: '↑ 上一个', x: 0, y: 360, w: 80, h: 28 },
+      { text: '↓ 下一个', x: 90, y: 360, w: 80, h: 28 },
+      { text: '恢复此文件…', x: 180, y: 360, w: 90, h: 28 }
+    ] as unknown as ActionBtn[];
+    const errs = actionsBarErrors({ ...base, actionBtns: btns }, LABELS);
+    expect(errs.length).toBe(3); // every button missing visible
+    expect(errs.join(' ')).toMatch(/not visible.*undefined/);
+  });
+
+  it('fails when `visible` is null', () => {
+    const btns = [
+      { ...base.actionBtns[0]!, visible: null as unknown as boolean },
+      ...base.actionBtns.slice(1)
+    ] as unknown as ActionBtn[];
+    const errs = actionsBarErrors({ ...base, actionBtns: btns }, LABELS);
+    expect(errs.length).toBeGreaterThan(0);
+    expect(errs.join(' ')).toMatch(/not visible.*null/);
+  });
+
+  it('fails when `visible` is undefined (explicit)', () => {
+    const btns = [
+      { ...base.actionBtns[0]!, visible: undefined as unknown as boolean },
+      ...base.actionBtns.slice(1)
+    ] as unknown as ActionBtn[];
+    const errs = actionsBarErrors({ ...base, actionBtns: btns }, LABELS);
+    expect(errs.length).toBeGreaterThan(0);
+    expect(errs.join(' ')).toMatch(/not visible.*undefined/);
+  });
+
+  it('fails when `visible` is the string "true" (loose type, not strict boolean)', () => {
+    const btns = [
+      ...base.actionBtns.slice(0, 2),
+      { ...base.actionBtns[2]!, visible: 'true' as unknown as boolean }
+    ] as unknown as ActionBtn[];
+    const errs = actionsBarErrors({ ...base, actionBtns: btns }, LABELS);
+    expect(errs.length).toBeGreaterThan(0);
+    expect(errs.join(' ')).toMatch(/not visible/);
+  });
+
+  it('still passes when all three buttons are strictly visible === true', () => {
+    // Sanity: the strict contract does not false-NEGATIVE the clean fixture.
+    expect(actionsBarErrors(base, LABELS)).toEqual([]);
+  });
+
+  // The capture side (BOUNDS_JS) computes `visible` from rect + computed
+  // style (display/visibility/opacity). A visibility:hidden element keeps a
+  // positive box but must be captured as not visible; this test pins the
+  // contract that the captured boolean reflects computed style, not box alone.
+  // (The DOM integration of that computation is exercised by the capture run;
+  // here we assert the predicate treats any non-true value as fail, which is
+  // the property the capture side's computed-style branch relies on.)
+  it('treats a positive-box button with visible=false as not visible', () => {
+    const btns = mapBtns((b, i) => (i === 0 ? { ...b, visible: false } : b));
+    const errs = actionsBarErrors({ ...base, actionBtns: btns }, LABELS);
+    expect(errs.join(' ')).toMatch(/not visible.*false/);
+  });
+});
+

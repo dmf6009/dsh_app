@@ -16,7 +16,10 @@
  * 100%/125% DPI manual walkthrough — that stays an explicit regression
  * boundary. No real runtime, no git, no writes outside docs/acceptance/dsha-6/.
  *
- * Run:  xvfb-run -a node scripts/capture/main.cjs   (or npm run capture:diff)
+ * This file is the Electron APP ENTRY — it must be launched BY the Electron
+ * binary (via scripts/capture/run-capture.mjs), never with plain `node` (under
+ * plain node `require('electron')` returns the path string, not the runtime).
+ * Run:  npm run capture:diff   (exit 0 only if every assertion passes)
  */
 
 const { app, BrowserWindow } = require('electron');
@@ -30,11 +33,25 @@ const PRELOAD = path.join(__dirname, 'preload.cjs');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const BOUNDS_JS = `(() => {
+  // Strict rendered visibility: a positive bounding box is necessary but not
+  // sufficient. We also require the computed style to actually render the
+  // element — display !== 'none', visibility !== 'hidden'/'collapse', and a
+  // non-zero opacity. A visibility:hidden button keeps a positive box but is
+  // not actually visible; the gate must fail on it. Returns a strict boolean
+  // (true only), so a missing/null value at the assertion layer cannot pass.
+  const isVisible = (el, r) => {
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none') return false;
+    if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
+    if (parseFloat(cs.opacity) <= 0) return false;
+    return true;
+  };
   const rect = (sel) => {
     const el = document.querySelector(sel);
     if (!el) return null;
     const r = el.getBoundingClientRect();
-    return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), visible: r.width > 0 && r.height > 0 };
+    return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), visible: isVisible(el, r) };
   };
   const de = document.documentElement;
   const actionBtns = [...document.querySelectorAll('.diff-actions button')].map((b) => {
@@ -45,10 +62,10 @@ const BOUNDS_JS = `(() => {
       y: Math.round(r.y),
       w: Math.round(r.width),
       h: Math.round(r.height),
-      // Real element-box visibility (display:none / zero box ⇒ invisible), so
-      // the assertion gate can fail on a hidden button instead of trusting
-      // a stale positive w/h.
-      visible: r.width > 0 && r.height > 0
+      // Strict rendered visibility: rect box AND computed display/visibility/
+      // opacity, so visibility:hidden with a positive box fails the gate rather
+      // than false-green on a stale positive w/h.
+      visible: isVisible(b, r)
     };
   });
   const ae = document.activeElement;

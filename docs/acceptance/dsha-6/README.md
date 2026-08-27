@@ -11,9 +11,25 @@ just record bounds — for every scenario it runs explicit assertions and exits
 field/values. `gate-summary.json` records the run: `21/21` scenarios pass with
 an empty `failures` array. The gate verifies the **identity** of each action
 button (label must match, not merely the count), containment on **both axes**
-(horizontal AND vertical viewport bounds), and each button's real **`visible`**
-flag (captured from the element box), so a hidden / mislabelled /
-out-of-viewport button fails — not merely an injected constant-false condition.
+(horizontal AND vertical viewport bounds), and each button's **strict `visible
+=== true`** — the captured value is computed from the rect box AND the computed
+style (`display` / `visibility` / `opacity`), so a `visibility:hidden` button
+with a positive box, or a missing/`null`/`undefined` field, fails (the boolean
+`true` is required, not merely "not false"). A hidden / mislabelled /
+out-of-viewport button therefore fails — not merely an injected
+constant-false condition.
+
+**Fail-closed launcher:** `scripts/capture/run-capture.mjs` resolves the
+Electron binary and spawns `main.cjs` as the app entry (plain `node` cannot
+run it — `require('electron')` returns the path string, not the runtime). It
+is **fail-closed**: if the Electron binary, the built renderer entry
+(`dist/renderer/index.html`), or `xvfb-run` (on a display-less Linux box) is
+missing, the command exits **non-zero** — never a green-looking SKIP. The
+Electron child runs under a bounded timeout (`DSH_CAPTURE_TIMEOUT_MS`, default
+180 s) with full error/signal propagation, so a wedged child (e.g.
+`ERR_FILE_NOT_FOUND`) cannot hang CI or leak a process. The pure decision logic
+(`preflightErrors` / `spawnPlan` / `exitCode`) lives in `launcher.mjs` and is
+unit-tested by `tests/launcher.test.ts`.
 
 **Scope / honesty note:** these are **Xvfb/headless captures** of the real
 built renderer. They verify layout bounds, focus placement, no page-level
@@ -26,9 +42,11 @@ before final UI/UE sign-off.
 
 ```
 npm run build
-npm run capture:diff   # exit 0 only if every assertion passes
+npm run capture:diff   # exit 0 ONLY if every assertion passes
                       # (scripts/capture/run-capture.mjs resolves the Electron
-                      #  binary and wraps it in xvfb-run when no DISPLAY is set)
+                      #  binary and wraps it in xvfb-run when no DISPLAY is set;
+                      #  it exits NON-ZERO if the Electron binary, the built
+                      #  renderer entry, or xvfb-run is missing — never a SKIP)
 ```
 
 ## Coverage matrix (each at 500×400, 700×500, 1280×800)
@@ -54,9 +72,11 @@ is unit-tested by `tests/capture-gate.test.ts` so the gate cannot false-green.
   - the `.diff-actions` bar contains **exactly 3** buttons whose **labels**
     match the expected set (`↑ 上一个` / `↓ 下一个` / `恢复此文件…`) in order —
     a wrong, missing, surplus or reordered label fails (identity, not count);
-  - each button's real `visible` flag is `true` with positive size
-    (`visible` is captured from the element box, so `display:none` / zero-box
-    cannot pass on a stale w/h);
+  - each button's `visible` is the **strict boolean `true`** with positive size
+    (`visible` is computed from the rect box AND computed style —
+    `display`/`visibility`/`opacity` — so `visibility:hidden` with a positive
+    box, or a missing/`null`/`undefined` field, fails; the boolean `true` is
+    required, not merely "not false");
   - each button lies entirely within the viewport on **both** axes, including
     top/bottom vertical bounds;
   - all button pairs are non-overlapping.
@@ -72,21 +92,27 @@ is unit-tested by `tests/capture-gate.test.ts` so the gate cannot false-green.
   the trigger button (`activeText === "恢复此文件…"`).
 
 `tests/capture-gate.test.ts` proves the gate FAILS on the real regressions:
-zero-size toolbar, missing/zero-size/invisible action buttons, **wrong or
-reordered button labels**, **top/bottom vertical overflow**, overlapping
-button pairs, out-of-viewport buttons, and page horizontal scroll — not merely
-an injected constant-false condition.
+zero-size toolbar, missing/zero-size/invisible action buttons, **a missing or
+`null`/`undefined`/string `visible` field**, **`visibility:hidden` with a
+positive box**, **wrong or reordered button labels**, **top/bottom vertical
+overflow**, overlapping button pairs, out-of-viewport buttons, and page
+horizontal scroll — not merely an injected constant-false condition.
 
-`.bounds.json` records every `.diff-actions` button rect (with `visible`) plus
-the viewport size.
+`.bounds.json` records every `.diff-actions` button rect (with `visible`)
+plus the viewport size.
 
 ## Regression tests
 
 - `tests/dialog-focus.test.ts` (11): focus-trap Tab/Shift+Tab cycling with hard
   wrap, stage-1 safe-action initial focus selection, busy-close gating, and the
   focusable-selector contract — pure node, no DOM.
-- `tests/capture-gate.test.ts` (20): the assertion predicates must FAIL on
-  zero-size toolbar, missing/surplus/zero-size/invisible buttons, wrong or
-  reordered labels, top/bottom/right viewport overflow, overlapping pairs, and
+- `tests/capture-gate.test.ts` (26): the assertion predicates must FAIL on
+  zero-size toolbar, missing/surplus/zero-size/invisible buttons, a missing or
+  `null`/`undefined`/loose-typed `visible` field, wrong or reordered labels,
+  top/bottom/right viewport overflow, overlapping pairs, and
   page-horizontal-scroll — proves the gate is not false-green.
+- `tests/launcher.test.ts` (18): the launcher is fail-closed — a missing
+  Electron binary, missing build artifact, or missing `xvfb-run` produces a
+  non-zero exit (never a green SKIP); a timeout / kill-signal / spawn error
+  from the Electron child propagates as non-zero. Pure node, no fs or spawn.
 - Existing suites unchanged and still green (see full run below).

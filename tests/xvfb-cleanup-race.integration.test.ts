@@ -24,7 +24,7 @@
 
 import { describe, expect, it, afterEach } from 'vitest';
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync, unlinkSync, readdirSync } from 'node:fs';
+import { existsSync, writeFileSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -90,22 +90,11 @@ afterEach(() => {
     }
   }
   started.length = 0;
-  // Clean any leftover test locks/sockets/tombstones/reclaim-temps in our
-  // display range. (No .mut mutation lock exists in the new fd-anchored
-  // design; tomb-* / reclaim-* are scratch files from releaseOwned/acquireStale
-  // that should be gone on the happy path but may linger if a test was killed.)
-  for (const n of [770, 771, 772]) {
-    for (const p of [lockPath(n), socketPath(n)]) {
-      try { unlinkSync(p); } catch { /* ignore */ }
-    }
-    // Sweep scratch files for this display (tomb-/reclaim- prefixed).
-    try {
-      for (const f of readdirSync('/tmp')) {
-        if (f.startsWith(`dsh-capture-xvfb-${n}.tomb-`) || f.startsWith(`dsh-capture-xvfb-${n}.lock.reclaim-`)) {
-          try { unlinkSync(join('/tmp', f)); } catch { /* ignore */ }
-        }
-      }
-    } catch { /* ignore */ }
+  // Clean any leftover test lock DIRS / sockets in our display range. The lock
+  // is now a DIRECTORY (owner.<pid> files inside); rmSync removes it wholesale.
+  for (const n of [770, 771, 772, 773]) {
+    try { rmSync(lockPath(n), { recursive: true, force: true }); } catch { /* ignore */ }
+    try { unlinkSync(socketPath(n)); } catch { /* ignore */ }
   }
 });
 
@@ -229,73 +218,203 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
     expect(readOwner(num)!.token).toBe(cToken);
   }, 90000);
 
-  // ── REVIEW FIX: two concurrent reclaimers on the SAME stale lock ──────────
-  // The review flagged that acquireStale had a TOCTOU: two reclaimers could
-  // both read a dead-owner lock and race — the prior "mutation lock" fix
-  // reproduced the SAME window inside the mutex's own stale reclamation. The
-  // new design eliminates the read-verify-then-unlink window ENTIRELY:
-  // acquireStale never unlinks the lock path — it atomically REPLACEs the
-  // lockfile's contents via `rename(temp, lockPath)` (a POSIX-atomic directory-
-  // entry swap; no instant the path is absent). The very first reclaimer to
-  // rename installs a LIVE owner (its own pid); any second reclaimer that then
-  // reads the owner sees that LIVE pid and bails — it can NEVER race into the
-  // unlink/recreate window because there is no unlink, and the atomic rename
-  // has already flipped the owner from "dead" to "live".
+  // ── REVIEW FIX (round 3): two reclaimers both judged dead → at most one wins
+  // The prior rename-replace design let A and B BOTH rename then each read back
+  // their own token and BOTH return success (last-writer-wins + path re-read is
+  // NOT a CAS). The directory + `owner.<pid>` design makes reclaim a TRUE CAS:
+  // the success point is `mkdir` (O_EXCL — one winner, EEXIST for the loser), and
+  // a reclaimer unlinks ONLY `owner.<deadpid>` files (filename gating — it can
+  // NEVER unlink a live owner's `owner.<livepid>` file). After A wins the mkdir
+  // and installs `owner.<A-pid>`, the dir is non-empty, so B's rmdir fails and
+  // B's mkdir fails EEXIST → B returns null.
   //
-  // We FORCE the interleaving deterministically with DSH_RECLAIM_BARRIER, which
-  // pauses reclaimer A AFTER its atomic rename, BEFORE the win/lose re-read:
-  //  - Seed a dead-owner stale lock S on shared /tmp.
-  //  - A enters acquireStale, renames tokenA over S (lock now carries tokenA
-  //    with A's LIVE pid), and pauses at the barrier.
-  //  - B enters claimExplicit on the SAME display: acquireDisplay fails (lock
-  //    exists) → acquireStale reads the owner → A's pid is LIVE → acquireStale
-  //    returns null → claimExplicit returns null → B exits non-zero. B NEVER
-  //    renamed/unlinked anything; A's live lock is untouched.
-  //  - Release A: A re-reads → tokenA == A's → A WINS → A boots Xvfb and on
-  //    exit self-cleans its OWN lock.
-  // Invariant: EXACTLY ONE owner at all times; the second reclaimer cannot
-  // reclaim once the first has atomically installed a live pid; no live lock is
-  // ever unlinked. (Pre-fix, A would have unlinked S + O_EXCL-created, and B
-  // could race a queued unlinkSync that deleted A's fresh live lock — the test
-  // asserts that does NOT happen: A's token survives B's attempt.)
-  it('reclaimer A paused after atomic rename; B sees A live and cannot reclaim the same lock', async () => {
+  // We FORCE the exact interleaving the review flagged with TWO reclaim
+  // barriers (A and B each get their own barrier path via per-process env):
+  //  1. Seed a dead-owner lock (dir + owner.999999) on shared /tmp.
+  //  2. Start A and B; BOTH pause at their reclaim barrier AFTER scanning
+  //     owners and judging 999999 dead, BEFORE unlinking/installing. (Both
+  //     have completed the stale judgment — the window the review said the
+  //     prior test evaded.)
+  //  3. Release A: A unlinks owner.999999, rmdir, mkdir CAS → A WINS, installs
+  //     owner.<A-pid>. A proceeds to boot Xvfb (A "returned success").
+  //  4. NOW release B (after A has installed + returned): B unlinks owner.999999
+  //     (ENOENT — A already did), B's rmdir fails (A's owner.<A-pid> present),
+  //     B's mkdir fails EEXIST → B returns null → claimExplicit returns null →
+  //     B exits non-zero.
+  // Invariant: AT MOST ONE of {A, B} returned a token (A won, B lost). A's
+  // live lock is never unlinked by B (filename gating). This test FAILS on
+  // 4b02f02 (rename-replace: both A and B would return a token) and PASSES
+  // here.
+  it('two reclaimers both judged dead: A installs+returns success, then B → at most one returns token', async () => {
     const num = 771;
     const lockDir = '/tmp'; // shared production lockDir — real contention
-    const reclaimBarrier = join(tmpdir(), `dsh-reclaim-barrier-${num}-${Date.now()}`);
-    try {
-      unlinkSync(reclaimBarrier);
-    } catch {
-      /* ignore */
+    const barrierA = join(tmpdir(), `dsh-reclaim-A-${num}-${Date.now()}`);
+    const barrierB = join(tmpdir(), `dsh-reclaim-B-${num}-${Date.now()}`);
+    const cleanupBarrier = join(tmpdir(), `dsh-cleanup-${num}-${Date.now()}`);
+    for (const b of [barrierA, barrierB, cleanupBarrier]) {
+      try { unlinkSync(b); } catch { /* ignore */ }
     }
-    // Seed a STALE lock (dead-owner pid) so a reclaimer enters acquireStale.
-    const staleP = lockPath(num, { lockDir });
-    try {
-      writeFileSync(staleP, 'stale-seed\npid=999999\n');
-    } catch {
-      /* ignore */
-    }
-    // No stale socket — displayOccupied() must be false so claimExplicit
-    // proceeds to acquireDisplay (fails, lock exists) → acquireStale.
-    try {
-      unlinkSync(socketPath(num));
-    } catch {
-      /* ignore */
-    }
+    // Seed a STALE lock: DIRECTORY + owner.999999 (dead pid).
+    const staleDir = lockPath(num, { lockDir });
+    try { rmSync(staleDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    mkdirSync(staleDir, { recursive: true });
+    writeFileSync(join(staleDir, 'owner.999999'), 'stale-seed\npid=999999\n');
+    // No stale socket — displayOccupied() false so claimExplicit → acquireStale.
+    try { unlinkSync(socketPath(num)); } catch { /* ignore */ }
 
-    // A pauses after its atomic rename (tokenA installed, A's pid live), before
-    // the win/lose re-read. A also pauses at its cleanup barrier so we can
-    // inspect before A self-cleans.
-    const cleanupBarrier = join(tmpdir(), `dsh-cleanup-barrier-${num}-${Date.now()}`);
-    try {
-      unlinkSync(cleanupBarrier);
-    } catch {
-      /* ignore */
-    }
-    const aEnv = {
+    // Both A and B pause at their OWN reclaim barrier (per-process env) after
+    // judging 999999 dead, before unlinking/installing.
+    const baseEnv = {
       ...process.env,
       DSH_XVFB_DISPLAY: String(num),
       DSH_CAPTURE_TIMEOUT_MS: '1500',
-      DSH_RECLAIM_BARRIER: reclaimBarrier,
+      DSH_CLEANUP_BARRIER: cleanupBarrier,
+      DISPLAY: '',
+      ELECTRON_ENABLE_LOGGING: '0'
+    };
+    const a = spawnLauncher({ ...baseEnv, DSH_RECLAIM_BARRIER: barrierA });
+    const b = spawnLauncher({ ...baseEnv, DSH_RECLAIM_BARRIER: barrierB });
+    started.push({ child: a, pid: a.pid });
+    started.push({ child: b, pid: b.pid });
+    drain(a);
+    drain(b);
+
+    // Wait for BOTH to be paused at their reclaim barriers (the dead-pid
+    // judgment is done for both). Give them time to boot to acquireStale.
+    await new Promise((r) => setTimeout(r, 1000));
+
+    // --- Release A FIRST: A unlinks owner.999999, rmdir, mkdir CAS → WINS. ---
+    writeFileSync(barrierA, 'go');
+    // Wait for A to win (owner.<A-pid> present, dir carries A's token+pid) and
+    // boot Xvfb (A "returned success" and proceeded).
+    const sock = socketPath(num);
+    let aWon = false;
+    for (let i = 0; i < 60 && !aWon; i += 1) {
+      const o = readOwner(num, { lockDir });
+      if (o && o.pid === a.pid && existsSync(sock)) aWon = true;
+      else await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(aWon).toBe(true); // A installed its lock AND booted Xvfb (returned success)
+    const aOwner = readOwner(num, { lockDir });
+    expect(aOwner!.pid).toBe(a.pid);
+    const aToken = aOwner!.token;
+
+    // --- NOW release B (A has already installed + returned). ---
+    // B: unlinks owner.999999 (ENOENT — A did it), rmdir FAILS (A's owner.<A-pid>
+    // makes dir non-empty), mkdir FAILS EEXIST → acquireStale returns null →
+    // claimExplicit returns null → B exits non-zero. B never touched A's lock.
+    writeFileSync(barrierB, 'go');
+    const bExit = await waitExit(b, 30000);
+    expect(bExit).not.toBe(0); // B LOST — claimExplicit returned null
+    // A's lock is intact: A's token, A's pid. B did not unlink owner.<A-pid>.
+    const afterB = readOwner(num, { lockDir });
+    expect(afterB!.token).toBe(aToken);
+    expect(afterB!.pid).toBe(a.pid);
+    // A's socket is still up (B did not delete it).
+    expect(existsSync(sock)).toBe(true);
+
+    // --- Release A's cleanup barrier so A self-cleans its OWN lock; no leaks. ---
+    writeFileSync(cleanupBarrier, 'go');
+    const aExit = await waitExit(a, 30000);
+    expect(aExit).not.toBeNull();
+    expect(existsSync(staleDir)).toBe(false); // A released its own lock dir
+  }, 90000);
+
+  // ── REVIEW FIX (round 3): cleanOwnedSocket fd-verify → socket-unlink window
+  // The review flagged: A fd-verifies ownership, then B takes over (new lock +
+  // socket), then A's socket unlink deletes B's socket. In THIS design, B can
+  // only take over via acquireStale, which REFUSES while A is live — and A is
+  // live while running cleanOwnedSocket. We prove it deterministically: pause A
+  // AFTER the fd ownership verify (DSH_CLEANSOCK_BARRIER), have B attempt to
+  // take the SAME display, and assert B FAILS (A live) and A's later socket
+  // unlink does NOT delete any B-installed socket (there is none, because B
+  // could not install one). B's lock (A's, actually) and the socket survive.
+  it('cleanOwnedSocket: A paused after fd-verify, B cannot take over (A live) — no socket race', async () => {
+    const num = 772;
+    const cleansockBarrier = join(tmpdir(), `dsh-cleansock-${num}-${Date.now()}`);
+    try { unlinkSync(cleansockBarrier); } catch { /* ignore */ }
+    // A owns the display normally (fresh acquireDisplay), boots Xvfb, and is
+    // driven to cleanOwnedSocket where it pauses after the fd verify.
+    const env = {
+      ...process.env,
+      DSH_XVFB_DISPLAY: String(num),
+      DSH_CAPTURE_TIMEOUT_MS: '1200', // drive A into cleanup fast
+      DSH_CLEANSOCK_BARRIER: cleansockBarrier,
+      DISPLAY: '',
+      ELECTRON_ENABLE_LOGGING: '0'
+    };
+    const a = spawnLauncher(env);
+    started.push({ child: a, pid: a.pid });
+    drain(a);
+
+    // Wait for A's Xvfb socket to come up, then A times out and pauses at the
+    // cleansock barrier (after fd-verifying ownership, before socket unlink).
+    const sock = socketPath(num);
+    let aSockUp = false;
+    for (let i = 0; i < 60 && !aSockUp; i += 1) {
+      if (existsSync(sock)) aSockUp = true;
+      else await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(aSockUp).toBe(true);
+    // Give A time to hit the 1200ms timeout → cleanup → cleanOwnedSocket →
+    // fd-verify → pause at cleansock barrier. (Xvfb is killed in cleanup BEFORE
+    // cleanOwnedSocket; the socket may be removed by Xvfb's clean termination —
+    // that's fine; the point is A is PAUSED holding ownership, A live.)
+    await new Promise((r) => setTimeout(r, 2200));
+    // A is paused in cleanOwnedSocket. A is LIVE and still owns the lock (A's
+    // owner.<A-pid> file is present). B attempts the SAME display:
+    const b = spawnLauncher({
+      ...process.env,
+      DSH_XVFB_DISPLAY: String(num),
+      DSH_CAPTURE_TIMEOUT_MS: '1500',
+      DISPLAY: '',
+      ELECTRON_ENABLE_LOGGING: '0'
+      // No barriers — B should fail fast.
+    });
+    started.push({ child: b, pid: b.pid });
+    drain(b);
+    const bExit = await waitExit(b, 20000);
+    // B must FAIL: claimExplicit → acquireDisplay (EEXIST, A's dir) → acquireStale
+    // reads A's LIVE pid → refuses → null → B exits non-zero. B never installed
+    // a lock or socket.
+    expect(bExit).not.toBe(0);
+    // A's lock is intact (A's owner file present, A's token).
+    const aOwner = readOwner(num);
+    expect(aOwner).not.toBeNull();
+    expect(aOwner!.pid).toBe(a.pid);
+    // Release A's cleansock barrier: A unlinks the socket (its OWN, or Xvfb
+    // already did) and releases its OWN lock. No B socket existed to be wrongly
+    // deleted.
+    writeFileSync(cleansockBarrier, 'go');
+    const aExit = await waitExit(a, 30000);
+    expect(aExit).not.toBeNull();
+    expect(existsSync(lockPath(num))).toBe(false); // A released its own lock
+  }, 90000);
+
+  // ── REVIEW FIX (round 3): tombstone-free release — no window covers a 3rd lock
+  // The review flagged: the prior tombstone-restore could cover a 3rd party C's
+  // lock acquired in the empty-dir window, leaving C a lock-less false owner.
+  // This design has NO restore-rename: release unlinks owner.<mypid> and
+  // best-effort rmdirs; C's mkdir CAS is independent and never touched by A's
+  // release. We prove: A removes its owner file (mid-release, dir empty); C
+  // acquires via acquireDisplay (which uses mkdir CAS — but the dir still
+  // exists, so C goes through acquireStale: empty dir, no live owner → rmdir +
+  // mkdir CAS → C wins); A's release resumes (rmdir fails — C's owner file
+  // present) → C's lock survives, C is NOT a false owner, A touched nothing of
+  // C's. (This is the integration-level version of the unit tombstone test; it
+  // uses real processes for A and C.)
+  it('release leaves no window: a 3rd party C that wins mkdir after A removed its owner is not covered', async () => {
+    const num = 773;
+    const cleanupBarrier = join(tmpdir(), `dsh-tomb-${num}-${Date.now()}`);
+    try { unlinkSync(cleanupBarrier); } catch { /* ignore */ }
+    // A acquires normally, boots Xvfb, times out, and pauses at the CLEANUP
+    // barrier AFTER killing Xvfb but BEFORE cleanOwnedSocket/releaseOwned. We
+    // then manually remove A's owner file (simulating A mid-release: owner file
+    // gone, dir empty, rmdir pending) and let C acquire.
+    const aEnv = {
+      ...process.env,
+      DSH_XVFB_DISPLAY: String(num),
+      DSH_CAPTURE_TIMEOUT_MS: '1200',
       DSH_CLEANUP_BARRIER: cleanupBarrier,
       DISPLAY: '',
       ELECTRON_ENABLE_LOGGING: '0'
@@ -303,58 +422,75 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
     const a = spawnLauncher(aEnv);
     started.push({ child: a, pid: a.pid });
     drain(a);
-
-    // Wait for A to reach the reclaim barrier: A has renamed tokenA over S and
-    // is paused. The lock now carries A's FRESH token + A's LIVE pid (not the
-    // stale seed).
-    let aOwner = readOwner(num, { lockDir });
-    for (let i = 0; i < 40 && (!aOwner || aOwner!.token === 'stale-seed'); i += 1) {
-      await new Promise((r) => setTimeout(r, 200));
-      aOwner = readOwner(num, { lockDir });
+    // Wait for A to reach the cleanup barrier. The barrier runs AFTER A has
+    // tree-killed its Xvfb, so the reliable signal that A is paused at the
+    // barrier is: A's owner file exists AND no Xvfb process is bound to :num
+    // anymore (A's Xvfb was killed). Poll for both.
+    const aOwnerFile = join(lockPath(num), `owner.${a.pid}`);
+    let aReady = false;
+    for (let i = 0; i < 120 && !aReady; i += 1) {
+      const ownerUp = existsSync(aOwnerFile);
+      const xvfbAlive = xvfbAliveOn(num);
+      if (ownerUp && !xvfbAlive) aReady = true;
+      else await new Promise((r) => setTimeout(r, 250));
     }
-    expect(aOwner).not.toBeNull();
-    expect(aOwner!.token).not.toBe('stale-seed'); // A's atomic rename installed a fresh token
-    expect(aOwner!.pid).toBe(a.pid); // ...with A's LIVE pid
-    const aToken = aOwner!.token;
+    expect(aReady).toBe(true); // A paused at the cleanup barrier, Xvfb dead
 
-    // --- B reclaims the SAME display while A is paused (A live). ---
-    // B's acquireStale reads A's pid → LIVE → returns null → claimExplicit
-    // returns null → B exits non-zero. B NEVER renamed/unlinked; A's lock
-    // survives with A's token.
-    const b = spawnLauncher({
+    // Simulate A mid-release: A has removed its owner file but not yet rmdir'd.
+    // (In production this is two steps inside releaseOwned; we force the
+    // in-between state so C arrives in the empty-dir window.) Also remove any
+    // residual Xvfb socket + X lock file (Xvfb was tree-killed and may not have
+    // removed them cleanly) so C's displayOccupied() returns false AND C's Xvfb
+    // can bind the socket path (a dead Xvfb leaves the socket + .X<num>-lock).
+    try { unlinkSync(aOwnerFile); } catch { /* ignore */ }
+    try { unlinkSync(socketPath(num)); } catch { /* ignore */ }
+    try { unlinkSync(`/tmp/.X${num}-lock`); } catch { /* ignore */ }
+    // C acquires the display. claimExplicit → acquireDisplay (EEXIST, dir
+    // exists) → acquireStale (empty dir, no live owner → rmdir + mkdir CAS) →
+    // C WINS, installs owner.<C-pid>. C is a LEGITIMATE owner (mkdir CAS).
+    const c = spawnLauncher({
       ...process.env,
       DSH_XVFB_DISPLAY: String(num),
-      DSH_CAPTURE_TIMEOUT_MS: '1500',
+      DSH_CAPTURE_TIMEOUT_MS: '30000',
       DISPLAY: '',
       ELECTRON_ENABLE_LOGGING: '0'
-      // No DSH_RECLAIM_BARRIER / DSH_CLEANUP_BARRIER — B should fail fast.
     });
-    started.push({ child: b, pid: b.pid });
-    drain(b);
-    const bExit = await waitExit(b, 30000);
-    expect(bExit).not.toBe(0); // B could NOT reclaim — A is live
-    // A's lock is UNTOUCHED by B: still A's token, still A's pid.
-    const afterB = readOwner(num, { lockDir });
-    expect(afterB!.token).toBe(aToken);
-    expect(afterB!.pid).toBe(a.pid);
-
-    // --- Release A: A re-reads → tokenA == A's → A wins, boots Xvfb. ---
-    writeFileSync(reclaimBarrier, 'go');
-    // Wait for A to win and bring up its Xvfb socket.
+    started.push({ child: c, pid: c.pid });
+    drain(c);
+    // Wait for C to win and boot Xvfb (C's owner file present, socket up).
     const sock = socketPath(num);
-    let aSockUp = false;
-    for (let i = 0; i < 60 && !aSockUp; i += 1) {
-      if (existsSync(sock)) aSockUp = true;
+    let cWon = false;
+    for (let i = 0; i < 80 && !cWon; i += 1) {
+      const o = readOwner(num);
+      if (o && o.pid === c.pid && existsSync(sock)) cWon = true;
       else await new Promise((r) => setTimeout(r, 200));
     }
-    expect(aSockUp).toBe(true); // A won and started its Xvfb
-    // A's lock still carries A's token (B never clobbered it).
-    expect(readOwner(num, { lockDir })!.token).toBe(aToken);
+    expect(cWon).toBe(true); // C legitimately won the mkdir CAS
+    const cOwner = readOwner(num);
+    expect(cOwner!.pid).toBe(c.pid);
+    const cToken = cOwner!.token;
 
-    // Release A's cleanup barrier so A self-cleans its OWN lock; no leaks.
+    // Release A's cleanup barrier: A's releaseOwned resumes. A opens
+    // owner.<A-pid> — GONE (C's is owner.<C-pid>, a different path) → no-op.
+    // A's rmdir fails (C's owner file present). C's lock is NOT covered/deleted.
     writeFileSync(cleanupBarrier, 'go');
     const aExit = await waitExit(a, 30000);
     expect(aExit).not.toBeNull();
-    expect(existsSync(staleP)).toBe(false); // A released its own lock
+    // C's lock survives A's late release: C's token + C's pid intact.
+    expect(readOwner(num)!.token).toBe(cToken);
+    expect(readOwner(num)!.pid).toBe(c.pid);
+    expect(existsSync(lockPath(num))).toBe(true);
+    // Clean up C (still running its capture gate).
+    if (c.pid) treeKill({ pid: c.pid, signal: 'SIGKILL', graceMs: 500 });
   }, 90000);
 });
+
+/** True if any Xvfb process is currently bound to display `:num`. */
+function xvfbAliveOn(num: number): boolean {
+  try {
+    const out = execFileSync('pgrep', ['-af', `Xvfb :${num} `], { encoding: 'utf8' });
+    return out.trim().length > 0;
+  } catch {
+    return false; // pgrep exit 1 = no match
+  }
+}

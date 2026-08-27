@@ -37,16 +37,17 @@ export function displayOccupied(num: number): boolean;
 export function newOwnerToken(): string;
 export function readOwner(num: number, opts?: DisplayOpts): OwnerInfo | null;
 export function acquireDisplay(num: number, opts?: DisplayOpts): string | null;
-export function acquireStale(
-  num: number,
-  opts?: DisplayOpts,
-  isPidAlive?: (pid: number) => boolean
-): string | null;
-/** CRITICAL SECTION (caller MUST hold the per-display flock). Pure path op. */
+/** Reclaim a dead-owner lock. ALWAYS under the per-display flock (no lock-free
+ * branch on the public mutation API). */
+export function acquireStale(num: number, opts?: DisplayOpts): string | null;
+/** CRITICAL SECTION (caller MUST hold the per-display flock). Pure path op.
+ * b0/b1/b2 are test hooks (b0 after acquiring flock, b1 after verify, b2 after
+ * the destructive op). */
 export function acquireStaleCritical(
   num: number,
   opts?: DisplayOpts,
   isPidAlive?: (pid: number) => boolean,
+  barrier0?: string,
   barrier1?: string,
   barrier2?: string
 ): string | null;
@@ -58,6 +59,7 @@ export function releaseOwnedCritical(
   num: number,
   token: string,
   opts?: DisplayOpts,
+  barrier0?: string,
   barrier1?: string,
   barrier2?: string
 ): boolean;
@@ -69,6 +71,7 @@ export function cleanOwnedSocket(input: CleanSocketInput, opts?: DisplayOpts): b
 export function cleanOwnedSocketCritical(
   input: CleanSocketInput,
   opts?: DisplayOpts,
+  barrier0?: string,
   barrier1?: string,
   barrier2?: string
 ): boolean;

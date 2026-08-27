@@ -247,26 +247,30 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
   // O_EXCL recreate is the single linearization point. This test FAILS on
   // c5b27ba (mkdir+write two-step: A mkdir'd empty dir, B rmdir+mkdir'd over
   // it, both wrote owner files) and PASSES here.
-  // ── REVIEW FIX (round 5): two reclaimers both judged dead → flock serializes
+  // ── REVIEW FIX (round 6): flock serializes — second caller CANNOT complete verify
   // The prior designs lost on the verify-then-unlink pathname TOCTOU: two
   // reclaimers could both pass verify, then the later unlink deleted the earlier
   // winner's just-installed LIVE lock. This iteration serializes the critical
   // section under a per-display kernel `flock` (via mut-op.mjs). While one
   // reclaimer holds the flock, the OTHER CANNOT enter its critical section —
   // its `flock` acquisition BLOCKS until the first releases. So the second can
-  // NEVER unlink the first's live lock.
+  // NEVER complete verify (let alone unlink) while the first holds the flock.
   //
-  // We FORCE the interleaving the review flagged: seed a dead-owner stale lock;
-  // start A and B against the SAME display + shared /tmp. A's acquireStale runs
-  // under flock; its critical section pauses at barrier1 (AFTER verify, BEFORE
-  // unlink) — A HOLDS the flock while paused. B's acquireStale tries to acquire
-  // the SAME flock and BLOCKS (it cannot enter the critical section, cannot
-  // verify, cannot unlink). Release A's barrier1: A unlinks+O_EXCL+writes owner
-  // (A WINS) and its mut-op exits → releases the flock. NOW B acquires the
-  // flock, enters its critical section, RE-VERIFIES → reads A's LIVE owner →
-  // refuses (returns null) → claimExplicit returns null → B exits non-zero. B
-  // never unlinked A's live lock. AT MOST ONE returned a token (A won, B lost).
-  it('two reclaimers both judged dead: flock serializes → at most one returns token, B never deletes A live lock', async () => {
+  // Correct safety property (per review): the SECOND CALLER CANNOT COMPLETE
+  // VERIFY while the first holds the flock. (It is NOT "both judged dead" — B
+  // is blocked outside the critical section and has not judged dead yet.)
+  //
+  // We FORCE the interleaving: seed a dead-owner stale lock; start A and B
+  // against the SAME display + shared /tmp. A's acquireStale runs under flock;
+  // its critical section pauses at barrier1 (AFTER verify, BEFORE unlink) — A
+  // HOLDS the flock while paused. B's acquireStale tries to acquire the SAME
+  // flock and BLOCKS (it CANNOT enter the critical section, CANNOT verify,
+  // CANNOT unlink). Release A's barrier1: A unlinks+O_EXCL+writes owner (A WINS)
+  // and its mut-op exits → releases the flock. NOW B acquires the flock, enters
+  // its critical section, verifies → reads A's LIVE owner → refuses (returns
+  // null) → claimExplicit returns null → B exits non-zero. B never unlinked A's
+  // live lock. AT MOST ONE returned a token (A won, B lost).
+  it('flock serializes reclaim: second caller cannot complete verify while first holds the mutex → at most one wins', async () => {
     const num = 771;
     const lockDir = '/tmp'; // shared production lockDir — real contention
     const barrier1 = join(tmpdir(), `dsh-reclaim-b1-${num}-${Date.now()}`);
@@ -539,7 +543,191 @@ describe('adversarial cleanup race (token compare-and-release)', { skip: skipIfN
     expect(existsSync(lockPath(num))).toBe(true);
     if (c.pid) treeKill({ pid: c.pid, signal: 'SIGKILL', graceMs: 500 });
   }, 90000);
+
+  // ── REVIEW FIX (round 6): public releaseOwned wrapper flock serialization
+  // Deterministic proof the PUBLIC releaseOwned wrapper (which dispatches via
+  // mut-op.mjs under flock) serializes two same-token releases across a
+  // generation: A's release verifies token T and pauses at barrier1 (HOLDING
+  // the flock, before unlink); B's release reaches the flock and BLOCKS. We
+  // release A's barrier1 → A unlinks + exits → releases the flock. B's release
+  // acquires the flock and pauses at barrier0 (after flock, before open). NOW
+  // (B still paused holding the flock, lock path empty) C acquires a NEW
+  // generation via acquireDisplay (O_EXCL, new token). Release B's barrier0 →
+  // B opens C's lock, reads C's token via fd → mismatch with T → no-op → ok:
+  // false. C's lock SURVIVES. B never deleted C's generation.
+  it('public releaseOwned flock-serialized: two same-token releases across a generation → B no-op, C survives', async () => {
+    const num = 775;
+    const lockDir = '/tmp';
+    const tokenT = 'tokT-' + Date.now();
+    // Seed A's lock with token T.
+    try { rmSync(lockPath(num, { lockDir }), { recursive: true, force: true }); } catch { /* ignore */ }
+    writeFileSync(lockPath(num, { lockDir }), `${tokenT}\npid=999999\n`);
+    try { unlinkSync(socketPath(num)); } catch { /* ignore */ }
+    try { unlinkSync(`/tmp/.X${num}-lock`); } catch { /* ignore */ }
+
+    const b1 = join(tmpdir(), `rel-b1-${num}-${Date.now()}`);
+    const b0B = join(tmpdir(), `rel-b0B-${num}-${Date.now()}`);
+    for (const p of [b1, b0B]) { try { unlinkSync(p); } catch { /* ignore */ } }
+
+    // A's release: verify token T, pause at b1 (HOLDING flock), before unlink.
+    // Use the env barriers (DSH_RELEASE_BARRIER1) via a node child that calls
+    // the public releaseOwned wrapper (which reads env + dispatches via flock).
+    const aEnv = {
+      ...process.env,
+      DSH_RELEASE_BARRIER1: b1
+    };
+    const a = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { releaseOwned } from '${fileURLToPathSafe()}';
+      const r = releaseOwned(${num}, '${tokenT}', { lockDir: '${lockDir}' });
+      process.stdout.write(String(r));
+    `], { env: aEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    a.unref();
+    started.push({ child: a as unknown as ReturnType<typeof spawnLauncher>, pid: a.pid });
+    drain(a as unknown as ReturnType<typeof spawnLauncher>);
+
+    // Wait until A holds the flock (mut-op releaseOwned running, paused at b1).
+    let aHolds = false;
+    for (let i = 0; i < 60 && !aHolds; i += 1) {
+      if (mutCriticalHeld(num, 'releaseOwned')) aHolds = true;
+      else await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(aHolds).toBe(true); // A holds the flock, paused at b1
+
+    // B's release (same token T) reaches the flock and BLOCKS. B uses barrier0
+    // to pause AFTER acquiring the flock (once A releases), BEFORE opening.
+    const bEnv = {
+      ...process.env,
+      DSH_RELEASE_BARRIER0: b0B
+    };
+    const b = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { releaseOwned } from '${fileURLToPathSafe()}';
+      const r = releaseOwned(${num}, '${tokenT}', { lockDir: '${lockDir}' });
+      process.stdout.write(String(r));
+    `], { env: bEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    b.unref();
+    started.push({ child: b as unknown as ReturnType<typeof spawnLauncher>, pid: b.pid });
+    drain(b as unknown as ReturnType<typeof spawnLauncher>);
+
+    // Release A's b1 → A unlinks the lock + exits → releases the flock.
+    writeFileSync(b1, 'go');
+    // B now acquires the flock (A released) and pauses at b0. Wait for B to hold.
+    let bHolds = false;
+    for (let i = 0; i < 60 && !bHolds; i += 1) {
+      if (mutCriticalHeld(num, 'releaseOwned', b.pid)) bHolds = true;
+      else await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(bHolds).toBe(true); // B holds the flock, paused at b0 (lock path empty)
+
+    // C acquires a NEW generation (different token) at the now-empty path.
+    const tokC = acquireDisplayInline(num, lockDir);
+    expect(tokC).not.toBeNull();
+    expect(tokC).not.toBe(tokenT);
+    expect(readOwner(num, { lockDir })!.token).toBe(tokC); // C's generation installed
+
+    // Release B's b0 → B opens C's lock, reads tokC via fd → mismatch with T
+    // → no-op → releaseOwned returns false.
+    writeFileSync(b0B, 'go');
+    const bExit = await waitExit(b as unknown as ReturnType<typeof spawnLauncher>, 30000);
+    expect(bExit).not.toBeNull();
+    // C's lock SURVIVES B's late release.
+    expect(readOwner(num, { lockDir })!.token).toBe(tokC);
+    expect(existsSync(lockPath(num, { lockDir }))).toBe(true);
+    // A exited.
+    const aExit = await waitExit(a as unknown as ReturnType<typeof spawnLauncher>, 5000);
+    void aExit;
+  }, 90000);
+
+  // ── REVIEW FIX (round 6): public cleanOwnedSocket wrapper flock serialization
+  // A cleanOwnedSocket verifies token T and pauses at b1 (HOLDING flock). A
+  // second cleanOwnedSocket (same T) BLOCKS. We prove the public wrapper
+  // dispatches under flock (not just the Critical function's sequential semantics).
+  it('public cleanOwnedSocket flock-serialized: second caller blocks while first holds the mutex', async () => {
+    const num = 776;
+    const lockDir = '/tmp';
+    const tokenT = 'csockT-' + Date.now();
+    try { rmSync(lockPath(num, { lockDir }), { recursive: true, force: true }); } catch { /* ignore */ }
+    writeFileSync(lockPath(num, { lockDir }), `${tokenT}\npid=999999\n`);
+    writeFileSync(socketPath(num), ''); // a socket to clean
+    const b1 = join(tmpdir(), `csock-b1-${num}-${Date.now()}`);
+    try { unlinkSync(b1); } catch { /* ignore */ }
+
+    const aEnv = {
+      ...process.env,
+      DSH_CLEANSOCK_BARRIER1: b1,
+      DSH_CLEANSOCK_INPUT: JSON.stringify({ socketExistedBefore: false, xvfbPidAlive: true })
+    };
+    const a = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { cleanOwnedSocket } from '${fileURLToPathSafe()}';
+      const r = cleanOwnedSocket({ num: ${num}, token: '${tokenT}', socketExistedBefore: false, xvfbPidAlive: true }, { lockDir: '${lockDir}' });
+      process.stdout.write(String(r));
+    `], { env: aEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    a.unref();
+    started.push({ child: a as unknown as ReturnType<typeof spawnLauncher>, pid: a.pid });
+    drain(a as unknown as ReturnType<typeof spawnLauncher>);
+
+    let aHolds = false;
+    for (let i = 0; i < 60 && !aHolds; i += 1) {
+      if (mutCriticalHeld(num, 'cleanOwnedSocket')) aHolds = true;
+      else await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(aHolds).toBe(true); // A holds the flock, paused at b1
+
+    // B's cleanOwnedSocket (same token) BLOCKS on the flock. B has NO barrier
+    // (must not pause); it should block on the flock A holds.
+    const { DSH_CLEANSOCK_BARRIER1: _ignored, ...bEnv } = aEnv;
+    void _ignored;
+    const b = spawn(process.execPath, ['--input-type=module', '-e', `
+      import { cleanOwnedSocket } from '${fileURLToPathSafe()}';
+      const r = cleanOwnedSocket({ num: ${num}, token: '${tokenT}', socketExistedBefore: false, xvfbPidAlive: true }, { lockDir: '${lockDir}' });
+      process.stdout.write(String(r));
+    `], { env: bEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    b.unref();
+    started.push({ child: b as unknown as ReturnType<typeof spawnLauncher>, pid: b.pid });
+    drain(b as unknown as ReturnType<typeof spawnLauncher>);
+
+    // Give B a moment to be blocked on the flock.
+    await new Promise((r) => setTimeout(r, 800));
+    // B should still be running (blocked on the flock A holds).
+    expect(b.exitCode).toBeNull();
+
+    // Release A's b1 → A unlinks the socket + exits → releases the flock.
+    writeFileSync(b1, 'go');
+    // B now acquires the flock and runs: opens the lock, reads token T (still
+    // A's — we did NOT replace it), verifies → matches → but the socket is
+    // already gone (A removed it) → returns false. B exits. (This proves the
+    // public wrapper serialized B behind A under flock.)
+    const bExit = await waitExit(b as unknown as ReturnType<typeof spawnLauncher>, 30000);
+    expect(bExit).not.toBeNull();
+    const aExit = await waitExit(a as unknown as ReturnType<typeof spawnLauncher>, 5000);
+    void aExit;
+  }, 90000);
 });
+
+/** Resolve the xvfb-display.mjs file URL for spawning public-wrapper test
+ * children. Returns a file:// URL string. */
+function fileURLToPathSafe(): string {
+  return fileURLToPath(new URL('../scripts/capture/xvfb-display.mjs', import.meta.url)).replace(/\\/g, '/');
+}
+
+/** Inline acquireDisplay (fresh O_EXCL) run as a sync child for the concurrent
+ * release test (so C's acquisition is a real process call, not a test-process
+ * in-band call). Returns the new token or null. */
+function acquireDisplayInline(num: number, lockDir: string): string | null {
+  try {
+    const out = execFileSync(
+      process.execPath,
+      ['--input-type=module', '-e', `
+        import { acquireDisplay } from '${fileURLToPathSafe()}';
+        const t = acquireDisplay(${num}, { lockDir: '${lockDir}' });
+        process.stdout.write(t ?? '');
+      `],
+      { encoding: 'utf8' }
+    );
+    return out || null;
+  } catch {
+    return null;
+  }
+}
 
 /** True if any Xvfb process is currently bound to display `:num`. */
 function xvfbAliveOn(num: number): boolean {

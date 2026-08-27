@@ -222,8 +222,10 @@ function waitForFile(p, deadlineMs) {
  * reclaimer BLOCKS until the first releases; it can never unlink the first's
  * just-installed live lock. The verify+unlink is serialized, not a TOCTOU.
  */
-export function acquireStaleCritical(num, opts = {}, isPidAlive = defaultIsPidAlive, barrier1, barrier2) {
+export function acquireStaleCritical(num, opts = {}, isPidAlive = defaultIsPidAlive, barrier0, barrier1, barrier2) {
   const p = lockPath(num, opts);
+  // Test hook: pause AFTER acquiring the flock, BEFORE opening the lock.
+  if (barrier0) waitForFile(barrier0, 30000);
   let fd;
   try {
     fd = openSync(p, 'r');
@@ -284,9 +286,13 @@ export function acquireStaleCritical(num, opts = {}, isPidAlive = defaultIsPidAl
  * sees the new token (mismatch) → no-op. [barrier1] pauses after verify, before
  * unlink. Returns a boolean.
  */
-export function releaseOwnedCritical(num, token, opts = {}, barrier1, barrier2) {
+export function releaseOwnedCritical(num, token, opts = {}, barrier0, barrier1, barrier2) {
   if (!token) return false;
   const p = lockPath(num, opts);
+  // Test hook: pause AFTER acquiring the flock, BEFORE opening the lock. Lets
+  // the adversarial test have a second release acquire the flock (after this one
+  // releases it) and be paused here while a third party installs a new generation.
+  if (barrier0) waitForFile(barrier0, 30000);
   let fd;
   try {
     fd = openSync(p, 'r');
@@ -331,10 +337,12 @@ export function shouldCleanSocket({ socketExistedBefore, xvfbPidAlive }) {
  * Serialized under flock. [barrier1] pauses after verify, before unlink.
  * Returns a boolean.
  */
-export function cleanOwnedSocketCritical({ num, token, socketExistedBefore, xvfbPidAlive }, opts = {}, barrier1, barrier2) {
+export function cleanOwnedSocketCritical({ num, token, socketExistedBefore, xvfbPidAlive }, opts = {}, barrier0, barrier1, barrier2) {
   if (!shouldCleanSocket({ socketExistedBefore, xvfbPidAlive })) return false;
   if (!token) return false;
   const p = lockPath(num, opts);
+  // Test hook: pause AFTER acquiring the flock, BEFORE opening the lock.
+  if (barrier0) waitForFile(barrier0, 30000);
   let fd;
   try {
     fd = openSync(p, 'r');
@@ -360,21 +368,20 @@ export function cleanOwnedSocketCritical({ num, token, socketExistedBefore, xvfb
 }
 
 /**
- * Reclaim a lock whose owner pid is dead. Runs the critical section under a
- * per-display kernel flock (via mut-op.mjs) so two reclaimers CANNOT both pass
- * verify then cross-unlink each other's live lock. Returns the new token or
- * null. `isPidAlive` is honored ONLY when the caller is in-process (the
- * production path uses the default probe via mut-op.mjs; a custom probe closure
- * cannot cross a child-process boundary). Unit tests that inject a custom
- * probe call acquireStaleCritical DIRECTLY (single-caller, no concurrency, so
- * the verify+unlink is safe by absence of a sibling).
+ * Reclaim a lock whose owner pid is dead. ALWAYS runs the critical section
+ * under the per-display kernel flock (via mut-op.mjs) — there is NO lock-free
+ * branch on this public mutation API. Two reclaimers therefore CANNOT both
+ * pass verify then cross-unlink each other's live lock: the second BLOCKS on
+ * the flock while the first holds it. Returns the new token or null.
+ *
+ * A custom liveness probe is NOT accepted on this public wrapper — a closure
+ * cannot cross the child-process boundary, and accepting one would let a
+ * caller bypass the flock (re-introducing the TOCTOU). Tests that need a
+ * custom probe call acquireStaleCritical DIRECTLY (the exported pure critical
+ * function, which documents its "caller must hold the flock / single-caller"
+ * precondition in its name and docstring).
  */
-export function acquireStale(num, opts = {}, isPidAlive = defaultIsPidAlive) {
-  if (isPidAlive !== defaultIsPidAlive) {
-    // Custom probe: caller is a single-caller test; run the pure critical
-    // section directly (no concurrent sibling exists in that test shape).
-    return acquireStaleCritical(num, opts, isPidAlive);
-  }
+export function acquireStale(num, opts = {}) {
   ensureMut(num, opts);
   const result = runUnderFlock(num, opts, 'acquireStale', [String(num), opts.lockDir || '']);
   if (!result || result.ok !== true) return null;
@@ -384,14 +391,15 @@ export function acquireStale(num, opts = {}, isPidAlive = defaultIsPidAlive) {
 /**
  * Release THIS run's ownership. Runs the critical section under the per-display
  * flock so two same-token releases cannot cross a generation. Always returns a
- * boolean. `barrier1`/`barrier2` (test hooks) are honored via env when set.
+ * boolean. Test hooks barrier0/1/2 honored via env (DSH_RELEASE_BARRIER0/1/2).
  */
 export function releaseOwned(num, token, opts = {}) {
   if (!token) return false;
   ensureMut(num, opts);
-  const barrier1 = process.env.DSH_RELEASE_BARRIER1 || '';
-  const barrier2 = process.env.DSH_RELEASE_BARRIER2 || '';
-  const result = runUnderFlock(num, opts, 'releaseOwned', [String(num), opts.lockDir || '', token, barrier1, barrier2]);
+  const b0 = process.env.DSH_RELEASE_BARRIER0 || '';
+  const b1 = process.env.DSH_RELEASE_BARRIER1 || '';
+  const b2 = process.env.DSH_RELEASE_BARRIER2 || '';
+  const result = runUnderFlock(num, opts, 'releaseOwned', [String(num), opts.lockDir || '', token, b0, b1, b2]);
   return !!(result && result.ok === true);
 }
 
@@ -399,18 +407,20 @@ export function releaseOwned(num, token, opts = {}) {
  * Remove the X11 socket for `num` ONLY IF we still own the claim. Runs the
  * critical section under the per-display flock. `socketExistedBefore` and
  * `xvfbPidAlive` are passed via env (DSH_CLEANSOCK_INPUT JSON). Always boolean.
+ * Test hooks barrier0/1/2 honored via env (DSH_CLEANSOCK_BARRIER0/1/2).
  */
 export function cleanOwnedSocket({ num, token, socketExistedBefore, xvfbPidAlive }, opts = {}) {
   if (!shouldCleanSocket({ socketExistedBefore, xvfbPidAlive })) return false;
   if (!token) return false;
   ensureMut(num, opts);
-  const barrier1 = process.env.DSH_CLEANSOCK_BARRIER1 || '';
-  const barrier2 = process.env.DSH_CLEANSOCK_BARRIER2 || '';
+  const b0 = process.env.DSH_CLEANSOCK_BARRIER0 || '';
+  const b1 = process.env.DSH_CLEANSOCK_BARRIER1 || '';
+  const b2 = process.env.DSH_CLEANSOCK_BARRIER2 || '';
   const env = {
     ...process.env,
     DSH_CLEANSOCK_INPUT: JSON.stringify({ socketExistedBefore, xvfbPidAlive })
   };
-  const result = runUnderFlock(num, opts, 'cleanOwnedSocket', [String(num), opts.lockDir || '', token, barrier1, barrier2], env);
+  const result = runUnderFlock(num, opts, 'cleanOwnedSocket', [String(num), opts.lockDir || '', token, b0, b1, b2], env);
   return !!(result && result.ok === true);
 }
 

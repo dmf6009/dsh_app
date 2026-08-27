@@ -23,14 +23,15 @@ import { join } from 'node:path';
 import {
   acquireDisplay,
   acquireStale,
+  acquireStaleCritical,
   claimExplicit,
   cleanOwnedSocket,
+  cleanOwnedSocketCritical,
   findFreeDisplay,
   lockPath,
   readOwner,
   releaseOwned,
   releaseOwnedCritical,
-  cleanOwnedSocketCritical,
   shouldCleanSocket,
   socketPath
 } from '../scripts/capture/xvfb-display.mjs';
@@ -201,14 +202,14 @@ describe('findFreeDisplay / claimExplicit (return token handles)', () => {
 describe('acquireStale (reclaim dead-owner lock; never owner-less; never live)', () => {
   it('reclaims a lock whose owner pid is dead', () => {
     seedStaleLock(560, 'oldtoken', 999999, { lockDir: lockDir() });
-    const tok = acquireStale(560, { lockDir: lockDir() }, () => false); // dead
+    const tok = acquireStaleCritical(560, { lockDir: lockDir() }, () => false); // dead
     expect(tok).not.toBeNull();
     expect(readOwner(560, { lockDir: lockDir() })!.token).toBe(tok);
   });
 
   it('refuses to reclaim a lock whose owner is still alive', () => {
     seedStaleLock(561, 'oldtoken', 999999, { lockDir: lockDir() });
-    const tok = acquireStale(561, { lockDir: lockDir() }, () => true); // alive
+    const tok = acquireStaleCritical(561, { lockDir: lockDir() }, () => true); // alive
     expect(tok).toBeNull();
     expect(readOwner(561, { lockDir: lockDir() })!.token).toBe('oldtoken');
   });
@@ -218,7 +219,7 @@ describe('acquireStale (reclaim dead-owner lock; never owner-less; never live)',
     // pending). acquireStale must NOT reclaim it (would delete a just-succeeded
     // claim). readOwner → null → bail.
     writeFileSync(lockPath(562, { lockDir: lockDir() }), ''); // empty
-    const tok = acquireStale(562, { lockDir: lockDir() }, () => false);
+    const tok = acquireStaleCritical(562, { lockDir: lockDir() }, () => false);
     expect(tok).toBeNull(); // owner-less — NOT reclaimable
     expect(existsSync(lockPath(562, { lockDir: lockDir() }))).toBe(true); // untouched
   });
@@ -241,7 +242,7 @@ describe('adversarial — fresh acquire empty-window (owner-less lock not reclai
     // unlink/reclaim). A then writes the owner. Exactly one owner (A).
     // We simulate "A mid-publication" by creating the empty lock directly.
     writeFileSync(lockPath(num, { lockDir: lockDir() }), ''); // empty (O_EXCL'd, write pending)
-    const bTok = acquireStale(num, { lockDir: lockDir() }, () => false);
+    const bTok = acquireStaleCritical(num, { lockDir: lockDir() }, () => false);
     expect(bTok).toBeNull(); // B could NOT reclaim an owner-less lock
     expect(existsSync(lockPath(num, { lockDir: lockDir() }))).toBe(true); // A's empty file untouched
     // A's owner write "completes" (we simulate by writing contents now).
@@ -257,14 +258,14 @@ describe('adversarial — two reclaimers of the same dead-owner lock (one O_EXCL
     // Seed a dead-owner lock.
     seedStaleLock(num, 'stale', 999999, { lockDir: lockDir() });
     // A reclaims (unlink + O_EXCL recreate → wins, writes owner.<A-token>).
-    const tokA = acquireStale(num, { lockDir: lockDir() }, () => false);
+    const tokA = acquireStaleCritical(num, { lockDir: lockDir() }, () => false);
     expect(tokA).not.toBeNull();
     const ownerAfterA = readOwner(num, { lockDir: lockDir() })!;
     expect(ownerAfterA.token).toBe(tokA);
     expect(ownerAfterA.pid).toBe(process.pid); // A's live pid
     // B reclaims the SAME display: reads A's owner pid (live) → refuses → null.
     // B never unlinked A's lock (A's file is not the dead 999999 file).
-    const tokB = acquireStale(num, { lockDir: lockDir() }); // default liveness: A live
+    const tokB = acquireStaleCritical(num, { lockDir: lockDir() }); // default liveness: A live
     expect(tokB).toBeNull();
     expect(readOwner(num, { lockDir: lockDir() })!.token).toBe(tokA); // A's survives
   });
@@ -281,7 +282,7 @@ describe('adversarial — PID reuse: a reused pid does not authorize reclaim (id
     // double-owner bug). Identity is the token, not the pid.
     const staleToken = 'reused-pid-stale';
     writeFileSync(lockPath(num, { lockDir: lockDir() }), `${staleToken}\npid=${process.pid}\n`);
-    const tok = acquireStale(num, { lockDir: lockDir() }); // default liveness
+    const tok = acquireStale(num, { lockDir: lockDir() }); // PUBLIC wrapper (default probe, flock-guarded)
     expect(tok).toBeNull(); // refused — the reused pid is live
     // The stale lock is untouched (we did not steal it).
     expect(readOwner(num, { lockDir: lockDir() })!.token).toBe(staleToken);
@@ -301,7 +302,7 @@ describe('adversarial — owner-write failure rolls back (no orphan claim)', () 
     // claim). The integration test injects a real write failure via a barrier.
     writeFileSync(lockPath(num, { lockDir: lockDir() }), ''); // empty orphan
     // acquireStale refuses (owner-less).
-    expect(acquireStale(num, { lockDir: lockDir() }, () => false)).toBeNull();
+    expect(acquireStaleCritical(num, { lockDir: lockDir() }, () => false)).toBeNull();
     // A fresh acquireDisplay fails EEXIST (orphan present) — no false success.
     expect(acquireDisplay(num, { lockDir: lockDir() })).toBeNull();
     // Clean up the orphan so the display is reclaimable later.

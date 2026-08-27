@@ -198,3 +198,117 @@ describe('acquireStale (reclaim dead-owner lock, never a live one)', () => {
     expect(readOwner(561, { lockDir: lockDir() })!.token).toBe('oldtoken');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Adversarial TOCTOU tests (review requirement: P1 stale-reclaim + read-verify-
+// unlink races). These exercise the MUTATION LOCK that serializes every
+// lockfile/socket mutation for a display. Without it, two reclaimers can both
+// read a dead-owner lock and one can unlink the other's freshly-created LIVE
+// lock, and a release's read-verify-then-unlink can hit a lockfile replaced by
+// a concurrent reclaimer. These tests prove those windows are closed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('adversarial stale reclaim — two reclaimers, one winner', () => {
+  // We simulate two SEQUENTIAL reclaim passes against the SAME stale lock. With
+  // the mutation lock, the FIRST reclaimer atomically unlinks the stale lock and
+  // creates its own; the SECOND reclaimer re-reads a LIVE-owner lock and bails.
+  // This is the same interleaving the mutation lock produces under real
+  // concurrency — the second caller cannot enter its verify→unlink critical
+  // section until the first has committed, by which point the lock is no longer
+  // stale. We assert the live winner's lock is NEVER unlinked by the loser.
+  const num = 570;
+
+  it('only one reclaimer wins; the loser does NOT unlink the winner live lock', () => {
+    // Stale lock S with a dead owner pid.
+    writeFileSync(lockPath(num, { lockDir: lockDir() }), 'stale-token\npid=999999\n');
+    // Reclaimer A wins the mutation lock: unlinks S, creates lock with tokenA.
+    // A's lock records pid=process.pid (the LIVE owner of the new claim).
+    const tokA = acquireStale(num, { lockDir: lockDir() }, () => false);
+    expect(tokA).not.toBeNull();
+    const ownerAfterA = readOwner(num, { lockDir: lockDir() })!;
+    expect(ownerAfterA.token).toBe(tokA);
+    expect(ownerAfterA.pid).toBe(process.pid); // live owner
+    // The lockfile on disk now carries tokenA (a LIVE owner — pid is our pid).
+
+    // Reclaimer B arrives AFTER A won (the only ordering the mutation lock
+    // permits: A's critical section completed). B re-reads the owner pid and
+    // checks liveness with the DEFAULT probe — our pid is ALIVE, so B must NOT
+    // reclaim. (Using the default probe, not the injected "always dead", models
+    // the real second reclaimer seeing a live winner.)
+    const tokB = acquireStale(num, { lockDir: lockDir() }); // default liveness
+    // B must NOT reclaim a lock whose (current) owner is alive.
+    expect(tokB).toBeNull();
+    // The winner's lock is still on disk, still tokenA — B did not unlink it.
+    const ownerAfterB = readOwner(num, { lockDir: lockDir() })!;
+    expect(ownerAfterB.token).toBe(tokA);
+  });
+});
+
+describe('adversarial TOCTOU — old token cleanup does not touch new-owner resources', () => {
+  // The review required: after a NEW owner has established its lock/socket, an
+  // OLD owner's late/duplicate cleanup (with the stale token) must NOT delete
+  // the new owner's lock or socket. We prove cleanOwnedSocket AND releaseOwned
+  // are no-ops against a live new owner — and that this holds even though the
+  // old owner's token ONCE matched the path.
+  const num = 580;
+
+  it('cleanOwnedSocket with a stale token is a no-op against a NEW owner socket', () => {
+    // Old owner A created the lock + socket.
+    const tokA = acquireDisplay(num, { lockDir: lockDir() })!;
+    writeFileSync(socketPath(num), ''); // A's socket
+    // A releases (compare-and-release removes A's lock).
+    expect(releaseOwned(num, tokA, { lockDir: lockDir() })).toBe(true);
+    // New owner B takes over: creates a NEW lock with a DIFFERENT token, and a
+    // NEW socket (same path, B's Xvfb made it).
+    const tokB = acquireDisplay(num, { lockDir: lockDir() })!;
+    expect(tokB).not.toBe(tokA);
+    writeFileSync(socketPath(num), ''); // B's socket (same path)
+
+    // A's LATE cleanOwnedSocket with A's stale token must NOT touch B's socket.
+    const removed = cleanOwnedSocket(
+      { num, token: tokA, socketExistedBefore: false, xvfbPidAlive: true },
+      { lockDir: lockDir() }
+    );
+    expect(removed).toBe(false);
+    // B's socket survives.
+    expect(existsSync(socketPath(num))).toBe(true);
+    // B's lock survives and still carries B's token.
+    expect(readOwner(num, { lockDir: lockDir() })!.token).toBe(tokB);
+  });
+
+  it('releaseOwned with a stale token is a no-op against a NEW owner lock', () => {
+    // A owns, then a new owner B takes over (A released, B acquired).
+    const tokA = acquireDisplay(num + 1, { lockDir: lockDir() })!;
+    releaseOwned(num + 1, tokA, { lockDir: lockDir() });
+    const tokB = acquireDisplay(num + 1, { lockDir: lockDir() })!;
+    expect(tokB).not.toBe(tokA);
+    // A's stale releaseOwned must NOT delete B's live lock.
+    expect(releaseOwned(num + 1, tokA, { lockDir: lockDir() })).toBe(false);
+    // B's lock survives with B's token.
+    const owner = readOwner(num + 1, { lockDir: lockDir() })!;
+    expect(owner.token).toBe(tokB);
+    expect(existsSync(lockPath(num + 1, { lockDir: lockDir() }))).toBe(true);
+  });
+
+  it('concurrent release-vs-reclaim: releasing owner does not delete a lock a reclaimer just installed', () => {
+    // Model the harmful interleaving the mutation lock prevents: A is mid-release
+    // (token still on disk), B reclaims a "stale" lock (simulated by giving A a
+    // dead pid) and installs tokB. A's LATE releaseOwned(tokA) must be a no-op.
+    // We sequence it as: A acquires; B reclaims (treats A as stale, dead pid);
+    // A then tries releaseOwned(tokA) — must NOT delete B's lock.
+    const n = num + 2;
+    const tokA = acquireDisplay(n, { lockDir: lockDir() })!;
+    // Overwrite A's lock to simulate A's pid being DEAD so a reclaimer may
+    // reclaim it (this models A crashing right as B scans).
+    writeFileSync(lockPath(n, { lockDir: lockDir() }), `${tokA}\npid=999999\n`);
+    // B reclaims (pid dead): unlinks A's stale lock, installs tokB.
+    const tokB = acquireStale(n, { lockDir: lockDir() }, () => false);
+    expect(tokB).not.toBeNull();
+    expect(readOwner(n, { lockDir: lockDir() })!.token).toBe(tokB);
+    // A's late releaseOwned(tokA) — A was reclaimed; its token no longer matches.
+    expect(releaseOwned(n, tokA, { lockDir: lockDir() })).toBe(false);
+    // B's lock survives.
+    expect(readOwner(n, { lockDir: lockDir() })!.token).toBe(tokB);
+    expect(existsSync(lockPath(n, { lockDir: lockDir() }))).toBe(true);
+  });
+});

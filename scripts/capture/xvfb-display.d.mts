@@ -2,6 +2,9 @@ export interface DisplayOpts {
   min?: number;
   max?: number;
   lockDir?: string;
+  /** Bounded retries for the per-display mutation lock (fail-closed on
+   * contention). Defaults to 8. */
+  mutRetries?: number;
 }
 
 export interface OwnerInfo {
@@ -31,6 +34,9 @@ export const DEFAULT_MAX_DISPLAY: number;
 
 export function socketPath(num: number): string;
 export function lockPath(num: number, opts?: DisplayOpts): string;
+/** The per-display mutation-lock path (coarse-grained mutex serializing all
+ * lockfile/socket mutations for one display). */
+export function mutPath(num: number, opts?: DisplayOpts): string;
 export function displayOccupied(num: number): boolean;
 export function newOwnerToken(): string;
 export function readOwner(num: number, opts?: DisplayOpts): OwnerInfo | null;

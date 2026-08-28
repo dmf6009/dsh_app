@@ -137,6 +137,57 @@ export class HydrationGuard {
 }
 
 /**
+ * User-visible hydration phase (UI/UE acceptance round: the hydrate window
+ * must show a visible transition state and block duplicate operations).
+ *
+ *   'idle'      — no hydration in flight; all session actions enabled.
+ *   'initial'   — the workspace's first hydrate after open (no prior content
+ *                 on screen); the chat area shows a loading placeholder.
+ *   'switching' — an A→B switch (or fallback after deleting the active
+ *                 session); the OLD session's model is still rendered and
+ *                 must be labelled as belonging to the PREVIOUS session so
+ *                 it cannot be mistaken for the newly selected one.
+ *
+ * The phase is derived (not stored) from { activeId, displayedFor, busy }:
+ * busy + displayedFor === null → initial; busy + displayedFor !== activeId →
+ * switching (displaying another session's content while `activeId` is the
+ * new selection); otherwise idle. Derivation keeps the phase impossible to
+ * get out of sync with the ids it describes.
+ */
+export type HydrationPhase = 'idle' | 'initial' | 'switching';
+
+export interface HydrationStatus {
+  phase: HydrationPhase;
+  /** True while a hydration request is in flight for `activeId`. */
+  busy: boolean;
+  /**
+   * The session id the currently DISPLAYED model belongs to, when known.
+   * During a switch it differs from `activeId` — that difference is exactly
+   * what marks the displayed content as "切换前会话" rather than the new one.
+   */
+  displayedFor: string | null;
+}
+
+/** Derive the user-visible phase (see HydrationPhase). Pure. */
+export function hydrationPhase(
+  hydratingFor: string | null,
+  activeId: string | null,
+  displayedFor: string | null
+): HydrationPhase {
+  if (hydratingFor === null) return 'idle';
+  // Nothing displayed yet → the workspace's first hydrate.
+  if (displayedFor === null) return 'initial';
+  // The displayed transcript belongs to another session → label it as the
+  // previous session's content (post-id-flip window of a switch/fallback).
+  if (displayedFor !== activeId) return 'switching';
+  // The transition targets another session while the outgoing one is still
+  // on screen → the persist/activate window of a switch.
+  if (hydratingFor !== activeId) return 'switching';
+  // Background re-hydration of the session already displayed.
+  return 'idle';
+}
+
+/**
  * Create flow. Order: persist outgoing → create → onCreated → empty model.
  * Abort stages: `persist` (outgoing checkpoint failed — nothing was mutated),
  * `create` (the store refused to create; outgoing was saved but no switch).

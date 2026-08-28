@@ -422,6 +422,43 @@ export async function runResponsiveMeasure(
           openState.focusInsidePanel === true,
           openState
         );
+        if (side === 'sessions') {
+          // DSHA-7 UI/UE acceptance: the hydration transition indicator must
+          // be perceivable inside the narrow-screen sessions drawer. The busy
+          // window is transient, so the probe is conditional: WHEN observed it
+          // must be within the viewport, role=status, and overflow-free; when
+          // the app is not transitioning, the indicator must be ABSENT and the
+          // list not aria-busy (the transition always resets — never stuck).
+          const hydration = await session.exec<{
+            observed: boolean;
+            withinViewport?: boolean;
+            statusRole?: boolean;
+            noOverflow?: boolean;
+            notStuck: boolean;
+          }>(`(() => {
+            const list = document.querySelector('.session-list');
+            const el = document.querySelector('.sessions-hydrating');
+            if (!el) {
+              return { observed: false, notStuck: !(list && list.getAttribute('aria-busy') === 'true') };
+            }
+            const r = el.getBoundingClientRect();
+            return {
+              observed: true,
+              withinViewport: r.right <= window.innerWidth + 0.5 && r.width > 0 && r.height > 0,
+              statusRole: el.getAttribute('role') === 'status',
+              noOverflow: el.scrollWidth <= el.clientWidth + 0.5,
+              notStuck: true
+            };
+          })()`);
+          session.check(
+            sizeKey,
+            'drawer-sessions/hydration-indicator',
+            hydration.notStuck === true &&
+              (!hydration.observed ||
+                (hydration.withinViewport === true && hydration.statusRole === true && hydration.noOverflow === true)),
+            hydration
+          );
+        }
 
         await session.exec(
           `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`

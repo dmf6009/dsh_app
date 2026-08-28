@@ -14,25 +14,33 @@ Renderer (React)  --IPC-->  Main process  --JSONL/stdio-->  DSH runtime
 ## Quick start
 
 ```bash
-npm install                # ELECTRON_SKIP_BINARY_DOWNLOAD=1 if the CDN is blocked
+npm install                # installs the app AND the @deepseek-ai/dsh runtime together
 npm run build              # tsc (main+preload) + vite build (renderer)
 npm start                  # full desktop app; runtime auto-starts on launch
 
 npm test                   # codec / process manager / stub / client tests
 npm run smoke:protocol     # frame-level demo vs. the reference stub
 npm run smoke:app          # boots Electron itself under xvfb, asserts the loop
-npm run smoke:dsh          # optional probe of a real dsh desktop profile
+npm run smoke:dsh          # optional probe of the real dsh desktop profile
 ```
 
 The child command is chosen at startup:
 
 | env                                   | effect                                    |
 | ------------------------------------- | ----------------------------------------- |
-| _(unset)_                             | default → `node scripts/stub-runtime.mjs` |
-| `DSH_RUNTIME_BIN` + `DSH_RUNTIME_ARGS`| e.g. `dsh --profile desktop --stdio`      |
+| _(unset)_                             | bundled runtime → `node_modules/.bin/dsh --profile desktop --stdio` (installed with the app via npm); falls back to `node scripts/stub-runtime.mjs` when absent |
+| `DSH_RUNTIME_BIN` + `DSH_RUNTIME_ARGS`| explicit override, e.g. `dsh --profile desktop --stdio` |
 | `DSH_NODE_BIN`                        | node binary used for the stub             |
 | `DSH_MAX_LINE_BYTES`                  | decoder line cap override                 |
 | `DSH_SMOKE=1`                         | headless closed-loop self-test, exit code |
+
+Notes:
+
+- The dsh detection (Home banner / Settings → DSH) resolves in the order:
+  Settings path override → bundled `node_modules/.bin/dsh` → `dsh` on PATH.
+- Smoke (`DSH_SMOKE=1`) and responsive-measure runs always default to the
+  deterministic stub runtime so QA stays reproducible; set `DSH_RUNTIME_BIN`
+  to point them at a real dsh.
 
 ## What works today (Phase 0 scope)
 

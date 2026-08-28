@@ -3,10 +3,11 @@
  *
  * Wires the RuntimeClient (DSH Process Manager + protocol codec), the
  * Workspace Manager (§30) with its boundary service, and the Settings module
- * to the renderer over IPC. The child command defaults to the reference stub
- * runtime so the closed loop is verifiable without a real DSH desktop profile;
- * set DSH_RUNTIME_BIN to point at `dsh --profile desktop --stdio` once it
- * exists.
+ * to the renderer over IPC. The child command prefers the dsh runtime that is
+ * installed together with the app (`@deepseek-ai/dsh` npm dependency);
+ * DSH_RUNTIME_BIN still overrides it, and the reference stub runtime remains
+ * the fallback so the closed loop is verifiable without a real DSH desktop
+ * profile.
  */
 
 import path from 'node:path';
@@ -24,7 +25,7 @@ import type {
   SaveProviderInput
 } from '../shared/settings';
 import { SettingsStore, redactSecrets } from './settings/settings-store';
-import { locateDsh } from './settings/dsh-locator';
+import { locateDsh, bundledDshCandidates } from './settings/dsh-locator';
 import { refreshModels } from './settings/model-refresh';
 import { WorkspaceManager } from './workspace';
 import { idForPath } from './workspace/recent-projects';
@@ -96,11 +97,34 @@ function resolveRuntimeCommand(appRoot: string): RuntimeCommandSpec {
       label: 'real dsh runtime'
     };
   }
+  // The dsh runtime is installed together with the app (npm dependency), so a
+  // normal launch uses it out of the box. Smoke / responsive QA flows keep the
+  // deterministic stub default unless DSH_RUNTIME_BIN says otherwise.
+  if (!isSmokeMode && !isResponsiveMeasureMode) {
+    for (const candidate of bundledDshCandidates(appRoot)) {
+      if (isExecutableFile(candidate)) {
+        return {
+          command: candidate,
+          args: ['--profile', 'desktop', '--stdio'],
+          label: 'bundled dsh runtime (@deepseek-ai/dsh)'
+        };
+      }
+    }
+  }
   return {
     command: process.env.DSH_NODE_BIN || 'node',
     args: [path.join(appRoot, 'scripts', 'stub-runtime.mjs')],
-    label: 'stub runtime (Phase 0 default)'
+    label: 'stub runtime (fallback)'
   };
+}
+
+function isExecutableFile(p: string): boolean {
+  try {
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function createManager(appRoot: string): { manager: DshProcessManager; spec: RuntimeCommandSpec } {
@@ -146,6 +170,7 @@ type SecretSource = () => string[];
 function registerIpcHandlers(context: {
   client: RuntimeClient;
   status: () => RuntimeStatus;
+  appRoot: string;
   workspaces: WorkspaceManager;
   settings: SettingsStore;
   approvals: ApprovalService;
@@ -158,6 +183,7 @@ function registerIpcHandlers(context: {
   const {
     client,
     status,
+    appRoot,
     workspaces,
     settings,
     approvals,
@@ -449,7 +475,7 @@ function registerIpcHandlers(context: {
   /* ---- DSH detection / diagnostics ---- */
 
   ipcMain.handle('dsh:detect', (): Promise<DshDetection> =>
-    locateDsh({ pathOverride: settings.getDshPath() })
+    locateDsh({ pathOverride: settings.getDshPath(), appRoot })
   );
   ipcMain.handle(
     'dsh:choose-path',
@@ -683,6 +709,7 @@ async function main(): Promise<void> {
   registerIpcHandlers({
     client,
     status,
+    appRoot,
     workspaces,
     settings,
     approvals,

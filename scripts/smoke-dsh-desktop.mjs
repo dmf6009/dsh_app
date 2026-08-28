@@ -2,19 +2,37 @@
 /**
  * Optional smoke test against a real DSH desktop profile.
  *
- * The Phase 0 contract is `dsh --profile desktop --stdio` (§19). That profile
- * does not exist yet (it is the deliverable of the dsh-desktop-runtime plugin,
- * built in later phases), so this script:
- *   1. resolves the runtime command from DSH_RUNTIME_BIN/DSH_RUNTIME_ARGS or
- *      defaults to `dsh --profile desktop --stdio`
+ * The Phase 0 contract is `dsh --profile desktop --stdio` (§19). This script:
+ *   1. resolves the runtime command from DSH_RUNTIME_BIN/DSH_RUNTIME_ARGS, or
+ *      falls back to the dsh installed together with this app
+ *      (`node_modules/.bin/dsh` from the @deepseek-ai/dsh dependency), then to
+ *      `dsh --profile desktop --stdio` on the PATH
  *   2. SKIPs with exit code 0 when the command cannot start, so CI stays green
  *   3. otherwise drives one `run` and prints the observed event stream
  */
 
+import { accessSync, constants as fsConstants } from 'node:fs';
 import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
-const bin = process.env.DSH_RUNTIME_BIN?.trim() || 'dsh';
+const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const bundledBin = path.join(appRoot, 'node_modules', '.bin', 'dsh');
+
+function resolveBundledDsh() {
+  try {
+    accessSync(bundledBin, fsConstants.X_OK);
+    return bundledBin;
+  } catch {
+    return null;
+  }
+}
+
+const bin =
+  process.env.DSH_RUNTIME_BIN?.trim() ||
+  resolveBundledDsh() ||
+  'dsh';
 const args = process.env.DSH_RUNTIME_ARGS
   ? process.env.DSH_RUNTIME_ARGS.split(/\s+/).filter(Boolean)
   : ['--profile', 'desktop', '--stdio'];

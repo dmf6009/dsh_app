@@ -3,7 +3,10 @@
  *
  * Resolution order:
  *   1. explicit override saved in Settings (SettingsStore dsh.path)
- *   2. `dsh` on the PATH
+ *   2. the copy bundled with this app (`@deepseek-ai/dsh` npm dependency,
+ *      i.e. `<appRoot>/node_modules/.bin/dsh`) — installed together with the
+ *      app by `npm install`
+ *   3. `dsh` on the PATH (externally installed)
  *
  * A found binary is probed with `--version` (short timeout) so Home can show a
  * real "就绪" signal rather than mere file existence. All failures degrade to
@@ -14,10 +17,12 @@ import { accessSync, constants, existsSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 export interface DshLocatorOptions {
-  /** Saved path override from Settings; null = resolve from PATH. */
+  /** Saved path override from Settings; null = resolve automatically. */
   pathOverride?: string | null;
   /** PATH-like environment string; defaults to process.env.PATH. */
   pathEnv?: string;
+  /** App root whose node_modules may contain the bundled @deepseek-ai/dsh. */
+  appRoot?: string;
   home?: string;
   /** Injectable version probe for tests. */
   runVersionProbe?: (binPath: string) => Promise<string | null>;
@@ -50,6 +55,15 @@ export async function locateDsh(options: DshLocatorOptions = {}): Promise<DshLoc
     return { found: true, path: candidate, version: version ?? undefined };
   }
 
+  if (options.appRoot) {
+    for (const candidate of bundledDshCandidates(options.appRoot)) {
+      if (isExecutable(candidate)) {
+        const version = await probe(candidate);
+        return { found: true, path: candidate, version: version ?? undefined };
+      }
+    }
+  }
+
   const searched = searchPaths(options.pathEnv ?? process.env.PATH ?? '');
   for (const dir of searched) {
     const candidate = join(dir, 'dsh');
@@ -58,7 +72,15 @@ export async function locateDsh(options: DshLocatorOptions = {}): Promise<DshLoc
       return { found: true, path: candidate, version: version ?? undefined };
     }
   }
-  return { found: false, reason: '未在 PATH 中找到可执行的 dsh' };
+  return { found: false, reason: '未找到可执行的 dsh（已检查随应用安装与 PATH）' };
+}
+
+/** Where `npm install` puts the bundled @deepseek-ai/dsh CLI for this app. */
+export function bundledDshCandidates(appRoot: string): string[] {
+  const binDir = join(appRoot, 'node_modules', '.bin');
+  return process.platform === 'win32'
+    ? [join(binDir, 'dsh.cmd'), join(binDir, 'dsh')]
+    : [join(binDir, 'dsh')];
 }
 
 function searchPaths(pathEnv: string): string[] {

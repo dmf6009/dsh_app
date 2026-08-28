@@ -3,11 +3,11 @@
  *
  * Wires the RuntimeClient (DSH Process Manager + protocol codec), the
  * Workspace Manager (§30) with its boundary service, and the Settings module
- * to the renderer over IPC. The child command prefers the dsh runtime that is
- * installed together with the app (`@deepseek-ai/dsh` npm dependency);
- * DSH_RUNTIME_BIN still overrides it, and the reference stub runtime remains
- * the fallback so the closed loop is verifiable without a real DSH desktop
- * profile.
+ * to the renderer over IPC. The child command is the desktop profile adapter
+ * (scripts/dsh-desktop-profile.mjs) driving the dsh runtime that is installed
+ * together with the app (`@deepseek-ai/dsh` npm dependency); DSH_RUNTIME_BIN
+ * still overrides it, and the reference stub runtime remains the fallback so
+ * the closed loop is verifiable without a real DSH desktop profile.
  */
 
 import path from 'node:path';
@@ -97,18 +97,20 @@ function resolveRuntimeCommand(appRoot: string): RuntimeCommandSpec {
       label: 'real dsh runtime'
     };
   }
-  // The dsh runtime is installed together with the app (npm dependency), so a
-  // normal launch uses it out of the box. Smoke / responsive QA flows keep the
-  // deterministic stub default unless DSH_RUNTIME_BIN says otherwise.
+  // The desktop profile is implemented by the in-repo adapter
+  // (scripts/dsh-desktop-profile.mjs): it speaks Runtime Protocol v1 and
+  // executes each run through the bundled dsh CLI's headless profile. When
+  // the official CLI grows a native desktop profile, point DSH_RUNTIME_BIN
+  // at it (e.g. `dsh --profile desktop --stdio`) to bypass the adapter.
+  // Smoke / responsive QA flows keep the deterministic stub default.
   if (!isSmokeMode && !isResponsiveMeasureMode) {
-    for (const candidate of bundledDshCandidates(appRoot)) {
-      if (isExecutableFile(candidate)) {
-        return {
-          command: candidate,
-          args: ['--profile', 'desktop', '--stdio'],
-          label: 'bundled dsh runtime (@deepseek-ai/dsh)'
-        };
-      }
+    const bundledDsh = bundledDshCandidates(appRoot).find((candidate) => isExecutableFile(candidate));
+    if (bundledDsh) {
+      return {
+        command: process.env.DSH_NODE_BIN || 'node',
+        args: [path.join(appRoot, 'scripts', 'dsh-desktop-profile.mjs')],
+        label: 'dsh desktop profile (bundled @deepseek-ai/dsh headless)'
+      };
     }
   }
   return {

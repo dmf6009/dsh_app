@@ -11,6 +11,8 @@ import type { RuntimeEventFrame } from '../src/shared/protocol/types';
 
 export const ROOT = path.resolve(__dirname, '..');
 export const STUB_PATH = path.join(ROOT, 'scripts', 'stub-runtime.mjs');
+export const DESKTOP_PROFILE_PATH = path.join(ROOT, 'scripts', 'dsh-desktop-profile.mjs');
+export const MOCK_DSH_PATH = path.join(__dirname, 'fixtures', 'mock-dsh.mjs');
 
 /** Env for spawning the stub quickly in tests. */
 export function stubEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {

@@ -28,14 +28,18 @@ The child command is chosen at startup:
 
 | env                                   | effect                                    |
 | ------------------------------------- | ----------------------------------------- |
-| _(unset)_                             | bundled runtime → `node_modules/.bin/dsh --profile desktop --stdio` (installed with the app via npm); falls back to `node scripts/stub-runtime.mjs` when absent |
-| `DSH_RUNTIME_BIN` + `DSH_RUNTIME_ARGS`| explicit override, e.g. `dsh --profile desktop --stdio` |
-| `DSH_NODE_BIN`                        | node binary used for the stub             |
+| _(unset)_                             | desktop profile → `node scripts/dsh-desktop-profile.mjs`, which speaks Runtime Protocol v1 and executes each run with the bundled dsh CLI's headless mode; falls back to `node scripts/stub-runtime.mjs` when no dsh is installed |
+| `DSH_RUNTIME_BIN` + `DSH_RUNTIME_ARGS`| explicit override, e.g. a future native `dsh --profile desktop --stdio` |
+| `DSH_NODE_BIN`                        | node binary used for the adapter/stub     |
 | `DSH_MAX_LINE_BYTES`                  | decoder line cap override                 |
 | `DSH_SMOKE=1`                         | headless closed-loop self-test, exit code |
 
 Notes:
 
+- The desktop profile adapter (`scripts/dsh-desktop-profile.mjs`) resolves its
+  dsh CLI in the order: `DSH_DESKTOP_DSH_BIN` → bundled `node_modules/.bin/dsh`
+  → `dsh` on PATH. When the official CLI ships a native desktop profile, point
+  `DSH_RUNTIME_BIN` at `dsh --profile desktop --stdio` to bypass the adapter.
 - The dsh detection (Home banner / Settings → DSH) resolves in the order:
   Settings path override → bundled `node_modules/.bin/dsh` → `dsh` on PATH.
 - Smoke (`DSH_SMOKE=1`) and responsive-measure runs always default to the

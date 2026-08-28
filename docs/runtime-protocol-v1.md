@@ -4,6 +4,13 @@ JSONL-over-stdio framing between the DSH Desktop main process (client) and a
 DSH runtime process (`dsh --profile desktop --stdio`, or the Phase 0 reference
 stub). One JSON object per line, UTF-8, `\n` terminated.
 
+Two runtime implementations exist on the wire today:
+
+- `scripts/dsh-desktop-profile.mjs` — the desktop profile adapter driving the
+  bundled `@deepseek-ai/dsh` CLI's headless profile (default for app runs)
+- `scripts/stub-runtime.mjs` — the deterministic reference stub (default for
+  `DSH_SMOKE` / QA runs)
+
 Source of truth for the type layer: `src/shared/protocol/types.ts`.
 Framing/tolerance rules: `src/shared/protocol/codec.ts`.
 

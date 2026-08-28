@@ -63,7 +63,6 @@ let idTick = 0;
 
 function makeStore(): SessionStore {
   let tick = 0;
-  idTick = 0;
   return new SessionStore({
     baseDirectory: STORE_DIR,
     now: () => new Date(++tick),
@@ -274,6 +273,11 @@ describe('R3/R4 — superseded requests and the full first-message disk lifecycl
     expect(model.phase).toBe('idle');
     expect(model.items.some((i) => i.kind === 'user' && i.text === MESSAGE)).toBe(true);
 
+    // A second, DISTINCT session created BEFORE the checkpoint — if the
+    // checkpoint cross-wrote, this is the record it would leak into.
+    const other = store.create(WS, '另一个会话');
+    expect(other.id).not.toBe(record!.id); // distinct sessions, never id reuse
+
     // Run-termination checkpoint persists THIS session's transcript only.
     expect(record).not.toBeNull();
     const saved = store.save(WS, {
@@ -293,11 +297,14 @@ describe('R3/R4 — superseded requests and the full first-message disk lifecycl
       expect(restoredModel?.items.some((i) => i.kind === 'user' && i.text === MESSAGE)).toBe(true);
     }
 
-    // …and no OTHER session was touched by the checkpoint.
-    const other = store.create(WS, '另一个会话');
-    const otherAfter = restarted.load(WS, other.id);
-    if (otherAfter.ok && otherAfter.record) {
-      expect(otherAfter.record.items.some((i) => i.kind === 'user' && i.text === MESSAGE)).toBe(false);
+    // …and the OTHER session never received this session's message (no
+    // cross-session write), both immediately and after the restart.
+    for (const reader of [store, restarted]) {
+      const otherAfter = reader.load(WS, other.id);
+      expect(otherAfter.ok).toBe(true);
+      if (otherAfter.ok && otherAfter.record) {
+        expect(otherAfter.record.items.some((i) => i.kind === 'user' && i.text === MESSAGE)).toBe(false);
+      }
     }
   });
 });

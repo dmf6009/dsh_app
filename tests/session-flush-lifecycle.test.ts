@@ -39,7 +39,6 @@ let idTick = 0;
 
 function makeStore(): SessionStore {
   let tick = 0;
-  idTick = 0;
   return new SessionStore({
     baseDirectory: STORE_DIR,
     now: () => new Date(++tick),

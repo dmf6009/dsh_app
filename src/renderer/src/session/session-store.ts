@@ -47,6 +47,13 @@ export interface SessionStoreValue {
    */
   hydration: HydrationStatus;
   /**
+   * Increments on every workspace change. Watching it tells the page the
+   * displayed model belongs to the PREVIOUS workspace and must be cleared
+   * (as a non-hydration mutation, so a stale in-flight request cannot
+   * re-apply the old transcript).
+   */
+  workspaceEpoch: number;
+  /**
    * Last persistence error surfaced to the user (save/delete failure). Set when
    * the main process returns ok=false; cleared by the next successful op or by
    * dismissError. Pre-framed via the §32 error-copy module (发生了什么 / 为什么 /
@@ -140,6 +147,13 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
   const [hydratingFor, setHydratingFor] = useState<string | null>(null);
   const [displayedFor, setDisplayedFor] = useState<string | null>(null);
   /**
+   * Bumped on every workspaceRoot change. The page watches it to clear the
+   * displayed ChatModel (which belongs to the OLD workspace) at the same
+   * moment the store voids the session identity — a transcript from workspace
+   * A must never stay on screen (interactive, idle) inside workspace B.
+   */
+  const [workspaceEpoch, setWorkspaceEpoch] = useState(0);
+  /**
    * The session id whose load request is still CURRENT. When `activeId` moves
    * on (switch/delete/new create) while a load is in flight, this ref keeps
    * the old id so the late result is recognized as superseded and dropped
@@ -189,7 +203,9 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
       setActiveId(null);
       setActiveTitle(null);
       setDisplayedFor(null);
+      setLoaded(false); // no active session until this workspace's bootstrap lands
       lastBaseRef.current = null;
+      setWorkspaceEpoch((epoch) => epoch + 1); // the page clears its model on this
     }
     if (!workspaceRoot) {
       setLoaded(false);
@@ -491,6 +507,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     activeTitle,
     loaded,
     hydration,
+    workspaceEpoch,
     lastError,
     dismissError,
     surfaceError,

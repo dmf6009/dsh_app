@@ -18,21 +18,43 @@
  *     on screen without the decision having been made. Identity-safe.
  */
 
-import { useEffect, type RefObject } from 'react';
+import { useEffect, useRef, type RefObject } from 'react';
 
-import type { ChatModel } from '../chat/model';
+import { INITIAL_MODEL, type ChatModel } from '../chat/model';
 import type { SessionStoreValue } from './session-store';
 import type { HydrationGuard } from './session-transition';
 
 export function useSessionHydration(
   sessions: Pick<
     SessionStoreValue,
-    'loaded' | 'activeId' | 'hydrate' | 'noteDisplayedFor' | 'settleHydration'
+    | 'loaded'
+    | 'activeId'
+    | 'hydrate'
+    | 'noteDisplayedFor'
+    | 'settleHydration'
+    | 'workspaceEpoch'
   >,
   setModel: (model: ChatModel) => void,
   guardRef: RefObject<HydrationGuard | null>
 ): void {
-  const { loaded, activeId, hydrate, noteDisplayedFor, settleHydration } = sessions;
+  const { loaded, activeId, hydrate, noteDisplayedFor, settleHydration, workspaceEpoch } = sessions;
+
+  // Workspace displayed-model isolation (review round): when the workspace
+  // identity is voided (workspaceEpoch bump), the ChatModel still on screen
+  // belongs to the PREVIOUS workspace — clear it here. The clear goes through
+  // the HydrationGuard as a NON-hydration mutation: any in-flight request
+  // from the old workspace is invalidated and cannot re-apply the old
+  // transcript afterwards. Without this, a failed bootstrap in the new
+  // workspace would leave the old workspace's transcript interactive and
+  // idle on screen.
+  const lastEpochRef = useRef(workspaceEpoch);
+  useEffect(() => {
+    if (lastEpochRef.current === workspaceEpoch) return;
+    lastEpochRef.current = workspaceEpoch;
+    guardRef.current?.noteMutation();
+    setModel(INITIAL_MODEL);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- setModel is a stable React state setter
+  }, [workspaceEpoch]);
   useEffect(() => {
     if (!loaded) return;
     let cancelled = false;

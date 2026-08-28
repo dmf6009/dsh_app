@@ -174,7 +174,13 @@ export function hydrationPhase(
   activeId: string | null,
   displayedFor: string | null
 ): HydrationPhase {
-  if (hydratingFor === null) return 'idle';
+  if (hydratingFor === null) {
+    // Not transitioning — but if the displayed transcript still belongs to
+    // ANOTHER session (e.g. a guard-dropped switch snapshot), the attribution
+    // label stays on: an active id with a foreign transcript must never be an
+    // UNLABELED mismatch, busy or not.
+    return displayedFor !== null && displayedFor !== activeId ? 'switching' : 'idle';
+  }
   // Nothing displayed yet → the workspace's first hydrate.
   if (displayedFor === null) return 'initial';
   // The displayed transcript belongs to another session → label it as the

@@ -163,6 +163,16 @@ export default function WorkspacePage(): JSX.Element {
   // so it is testable against the real hook with deferred desktop promises.
   useSessionHydration(sessions, setModel, hydrationGuardRef);
 
+  // The displayed-model reset on a workspace change lives INSIDE
+  // useSessionHydration (shared with the hook tests). The page additionally
+  // resets its run-phase bookkeeping so the next persist trigger starts clean.
+  const workspaceEpochRef = useRef(sessions.workspaceEpoch);
+  useEffect(() => {
+    if (workspaceEpochRef.current === sessions.workspaceEpoch) return;
+    workspaceEpochRef.current = sessions.workspaceEpoch;
+    lastPhaseRef.current = 'idle';
+  }, [sessions.workspaceEpoch]);
+
   // Persist on run termination (done / run_completed / run_cancelled / error).
   const lastPhaseRef = useRef<RunPhase>('idle');
   useEffect(() => {

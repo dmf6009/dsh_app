@@ -157,9 +157,15 @@ class HydrationStateSimulation {
 }
 
 describe('hydrationPhase — derivation', () => {
-  it('idle when not busy, even with mismatched ids', () => {
-    expect(hydrationPhase(null, 'a', 'b')).toBe('idle');
+  it('idle when not busy and attribution is consistent (or absent)', () => {
+    expect(hydrationPhase(null, 'a', 'a')).toBe('idle');
     expect(hydrationPhase(null, null, null)).toBe('idle');
+  });
+
+  it('switching when NOT busy but the displayed model belongs to another session (labeled mismatch)', () => {
+    // A guard-dropped switch snapshot leaves the old transcript under the new
+    // active id — that mismatch must stay labeled, never silent.
+    expect(hydrationPhase(null, 'b', 'a')).toBe('switching');
   });
 
   it('initial while busy with nothing displayed yet', () => {

@@ -14,6 +14,11 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import {
+  describeSessionError,
+  sessionDeleteFailedCopy,
+  sessionSaveFailedCopy
+} from '../../../shared/error-copy';
 import type { SessionRecord, SessionSummary } from '../../../shared/session';
 import {
   fromSessionItems,
@@ -29,16 +34,34 @@ export interface SessionStoreValue {
   activeTitle: string | null;
   /** Whether the active session record exists on disk (vs. never created). */
   loaded: boolean;
+  /**
+   * Last persistence error surfaced to the user (save/delete failure). Set when
+   * the main process returns ok=false; cleared by the next successful op or by
+   * dismissError. Pre-framed via the §32 error-copy module (发生了什么 / 为什么 /
+   * 建议动作 + 原始信息) so the banner is diagnosable, not a bare fs message.
+   */
+  lastError: string | null;
+  dismissError: () => void;
   /** Rehydrate the ChatModel from the active persisted session. */
   hydrate: () => Promise<ChatModel | null>;
-  /** Persist the current ChatModel + metadata as the active session. */
-  persist: (model: ChatModel, meta: SessionPersistMeta) => Promise<void>;
+  /** Persist the current ChatModel + metadata as the active session. Returns
+   *  an error string on failure instead of silently swallowing it. */
+  persist: (model: ChatModel, meta: SessionPersistMeta) => Promise<string | null>;
   /** Create a new (empty) session and switch to it; returns the fresh ChatModel. */
   create: (title?: string) => Promise<ChatModel>;
   /** Switch to an existing session; returns its rehydrated ChatModel. */
   switchTo: (id: string, currentModel: ChatModel, meta: SessionPersistMeta) => Promise<ChatModel>;
-  /** Delete a session; if it was active, switches to the next one. */
-  remove: (id: string) => Promise<void>;
+  /** Delete a session; if it was active, switches to the next one. Returns an
+   *  error string on failure instead of silently swallowing it. */
+  remove: (id: string) => Promise<string | null>;
+  /**
+   * Synchronous checkpoint for the active session (§15/§34 lifecycle). Used
+   * on navigation away from the Workspace page, component unload, and app close
+   * (beforeunload/pagehide) so an in-flight conversation is never lost. The
+   * caller passes the live model + meta; this builds the full record and calls
+   * the main process's sendSync flush channel. Returns the save result.
+   */
+  flush: (model: ChatModel, meta: SessionPersistMeta) => { ok: boolean; error?: string };
 }
 
 export interface SessionPersistMeta {
@@ -66,10 +89,19 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeTitle, setActiveTitle] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [lastError, setLastError] = useState<string | null>(null);
   /** Track whether a session was just created (so we skip saving the empty
    * prior one on the first persist cycle). */
   const freshlyCreatedRef = useRef(false);
   const hydratedRef = useRef(false);
+  /** Last-known full record for the active session (createdAt/updatedAt/title
+   *  carried over from load/create/persist) so the synchronous flush() can
+   *  build a complete SessionRecord without an async round-trip. */
+  const lastBaseRef = useRef<SessionRecord | null>(null);
+
+  const dismissError = useCallback((): void => {
+    setLastError(null);
+  }, []);
 
   // Reload the list whenever the workspace changes.
   useEffect(() => {
@@ -121,8 +153,12 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     hydratedRef.current = true;
     if (!result.ok || !result.record) {
       // Corrupt or missing — start fresh so the panel still works.
+      lastBaseRef.current = null;
       return EMPTY_MODEL;
     }
+    // Cache the loaded record so a synchronous flush() can build a complete
+    // SessionRecord without an async round-trip.
+    lastBaseRef.current = result.record;
     setActiveTitle(result.record.title);
     return {
       items: fromSessionItems(result.record.items),
@@ -133,8 +169,8 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     };
   }, [activeId]);
 
-  const persist = useCallback(async (model: ChatModel, meta: SessionPersistMeta): Promise<void> => {
-    if (!activeId || !meta.workspaceRoot) return;
+  const persist = useCallback(async (model: ChatModel, meta: SessionPersistMeta): Promise<string | null> => {
+    if (!activeId || !meta.workspaceRoot) return null;
     const patch = toRecordPatch(model, meta);
     const existing = await window.desktop.loadSession(activeId);
     const base: SessionRecord =
@@ -152,8 +188,21 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
             tokenUsage: null,
             items: []
           };
-    await window.desktop.saveSession({ ...base, ...patch });
+    const result = await window.desktop.saveSession({ ...base, ...patch });
+    if (!result.ok) {
+      // Surface the failure (§32 三段式) — never silently pretend the save
+      // landed, then refresh anyway so the list reflects the real on-disk state.
+      const msg = describeSessionError(sessionSaveFailedCopy(result.error));
+      setLastError(msg);
+      void refreshList();
+      return msg;
+    }
+    // Cache the saved record so a synchronous flush() can build a complete
+    // SessionRecord without an async round-trip.
+    lastBaseRef.current = { ...base, ...patch };
+    setLastError(null);
     void refreshList();
+    return null;
   }, [activeId, activeTitle, refreshList]);
 
   const create = useCallback(async (title?: string): Promise<ChatModel> => {
@@ -167,6 +216,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     ]);
     freshlyCreatedRef.current = true;
     hydratedRef.current = true;
+    lastBaseRef.current = record;
     setLoaded(true);
     return EMPTY_MODEL;
   }, []);
@@ -185,6 +235,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
       hydratedRef.current = false;
       const loaded = await window.desktop.loadSession(id);
       if (loaded.ok && loaded.record) {
+        lastBaseRef.current = loaded.record;
         setActiveTitle(loaded.record.title);
         return {
           items: fromSessionItems(loaded.record.items),
@@ -200,8 +251,17 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
   );
 
   const remove = useCallback(
-    async (id: string): Promise<void> => {
-      await window.desktop.deleteSession(id);
+    async (id: string): Promise<string | null> => {
+      const result = await window.desktop.deleteSession(id);
+      if (!result.ok) {
+        // Delete failed on disk — do NOT switch away from the active session
+        // (the store did not mutate its index); surface the §32 三段式 failure.
+        const msg = describeSessionError(sessionDeleteFailedCopy(result.error));
+        setLastError(msg);
+        void refreshList();
+        return msg;
+      }
+      setLastError(null);
       const list = await window.desktop.listSessions();
       setSummaries(list);
       // If the deleted one was active, fall back to the next.
@@ -213,8 +273,42 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
         freshlyCreatedRef.current = false;
         hydratedRef.current = false;
       }
+      return null;
     },
-    [activeId]
+    [activeId, refreshList]
+  );
+
+  // Synchronous checkpoint: build the full record from the cached base + the
+  // live model/meta and send it to the main process over sendSync so the save
+  // completes before navigation/unload/quit discards the renderer. Falls back
+  // to a minimal record when no base is cached yet (first-ever save).
+  const flush = useCallback(
+    (model: ChatModel, meta: SessionPersistMeta): { ok: boolean; error?: string } => {
+      if (!activeId || !meta.workspaceRoot) return { ok: false, error: 'no active session' };
+      const patch = toRecordPatch(model, meta);
+      const base: SessionRecord = lastBaseRef.current ?? {
+        schemaVersion: 1,
+        id: activeId,
+        workspaceRoot: meta.workspaceRoot,
+        title: activeTitle ?? `会话 ${activeId.slice(0, 8)}`,
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+        model: null,
+        agentState: 'idle',
+        tokenUsage: null,
+        items: []
+      };
+      const record: SessionRecord = { ...base, ...patch };
+      const result = window.desktop.flushBeforeQuit(record);
+      if (result.ok) {
+        lastBaseRef.current = record;
+        setLastError(null);
+      } else {
+        setLastError(describeSessionError(sessionSaveFailedCopy(result.error)));
+      }
+      return result;
+    },
+    [activeId, activeTitle]
   );
 
   return {
@@ -222,10 +316,13 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     activeId,
     activeTitle,
     loaded,
+    lastError,
+    dismissError,
     hydrate,
     persist,
     create,
     switchTo,
-    remove
+    remove,
+    flush
   };
 }

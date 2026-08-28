@@ -86,13 +86,6 @@ export default function WorkspacePage(): JSX.Element {
   const branchLabel = changes.snapshot?.gitAvailable
     ? `⎇ ${changes.snapshot.branch ?? '未知分支'}${changes.snapshot.detached ? ' (detached)' : ''}`
     : null;
-  const openDiff = useCallback(
-    (path: string) => {
-      changes.select(path);
-      appDispatch({ type: 'navigate', route: 'diff' });
-    },
-    [changes, appDispatch]
-  );
 
   const dispatch = useCallback((action: Parameters<typeof reduceChat>[1]): void => {
     setModel((prev) => reduceChat(prev, action));
@@ -108,9 +101,20 @@ export default function WorkspacePage(): JSX.Element {
     workspaceRoot: appState.workspaceRoot
   }), [modelChoice, appState.workspaceRoot]);
 
+  // The active session id + flush fn come from the session hook (declared
+  // here, before openDiff, so the navigation checkpoint can reference them).
+  const { loaded: sessionLoaded, activeId: sessionActiveId, hydrate: sessionHydrate, persist: sessionPersist, flush: sessionFlush } = sessions;
+
+  // Synchronous checkpoint of the active session (navigation / unload / quit).
+  // Uses the main-process sendSync flush channel so the save completes before
+  // the renderer is torn down. No-op when there is no active session/workspace.
+  const flushNow = useCallback((): { ok: boolean; error?: string } => {
+    if (!sessionActiveId || !appState.workspaceRoot) return { ok: false };
+    return sessionFlush(modelRef.current, persistMeta());
+  }, [sessionActiveId, appState.workspaceRoot, sessionFlush, persistMeta]);
+
   // Hydrate the active session once it's loaded (and when the active id
   // changes due to a switch). Never auto-resume a running task.
-  const { loaded: sessionLoaded, activeId: sessionActiveId, hydrate: sessionHydrate } = sessions;
   useEffect(() => {
     if (!sessionLoaded) return;
     let cancelled = false;
@@ -121,10 +125,8 @@ export default function WorkspacePage(): JSX.Element {
     return () => { cancelled = true; };
   }, [sessionLoaded, sessionActiveId, sessionHydrate]);
 
-  // Persist on run termination (done / run_completed / run_cancelled / error)
-  // and when leaving to the Diff page so the transcript is checkpointed.
+  // Persist on run termination (done / run_completed / run_cancelled / error).
   const lastPhaseRef = useRef<RunPhase>('idle');
-  const sessionPersist = sessions.persist;
   useEffect(() => {
     const prev = lastPhaseRef.current;
     const next = model.phase;
@@ -134,6 +136,36 @@ export default function WorkspacePage(): JSX.Element {
       void sessionPersist(modelRef.current, persistMeta());
     }
   }, [model.phase, sessionActiveId, sessionPersist, persistMeta]);
+
+  // §15 持久化生命周期：组件卸载与 app 关闭前的同步 checkpoint。beforeunload
+  // 覆盖窗口关闭/刷新；pagehide 作为兜底。两者都通过 flushNow 走 sendSync，
+  // 保证在进程退出前完成落盘。
+  useEffect(() => {
+    const flushBeforeExit = (): void => {
+      flushNow();
+    };
+    window.addEventListener('beforeunload', flushBeforeExit);
+    window.addEventListener('pagehide', flushBeforeExit);
+    return () => {
+      // Unmount flush — e.g. when the page-host swaps Workspace out.
+      flushNow();
+      window.removeEventListener('beforeunload', flushBeforeExit);
+      window.removeEventListener('pagehide', flushBeforeExit);
+    };
+    // flushNow is stable across the workspace/session identity it depends on;
+    // re-subscribe when those change so the listener always captures the right id.
+  }, [flushNow]);
+
+  const openDiff = useCallback(
+    (path: string) => {
+      // §15/§34 持久化生命周期：离开 Workspace 进入 Diff 前，同步落盘当前会话，
+      // 避免尚未发生终止事件的消息/工具调用在导航时丢失。
+      flushNow();
+      changes.select(path);
+      appDispatch({ type: 'navigate', route: 'diff' });
+    },
+    [changes, appDispatch, flushNow]
+  );
 
   /* ---- subscriptions ------------------------------------------------ */
 
@@ -616,7 +648,7 @@ export default function WorkspacePage(): JSX.Element {
         {showRunSummary(runActive, changes.snapshot) && (
           <div className="changes-summary-bar" role="status">
             <span className="changes-summary-text">{summaryLabel(changedFileList.length)}</span>
-            <Button variant="secondary" onClick={() => appDispatch({ type: 'navigate', route: 'diff' })}>
+            <Button variant="secondary" onClick={() => { flushNow(); appDispatch({ type: 'navigate', route: 'diff' }); }}>
               View Diff
             </Button>
           </div>
@@ -642,6 +674,18 @@ export default function WorkspacePage(): JSX.Element {
             type="button"
             className="btn btn-secondary"
             onClick={() => setApprovalNotice(null)}
+          >
+            知道了
+          </button>
+        </div>
+      )}
+      {sessions.lastError !== null && (
+        <div className="oob-banner session-error-banner" role="alert">
+          <span>✕ {sessions.lastError}</span>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => sessions.dismissError()}
           >
             知道了
           </button>

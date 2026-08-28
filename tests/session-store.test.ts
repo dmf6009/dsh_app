@@ -9,7 +9,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { SessionStore } from '../src/main/session/session-store';
-import { SESSION_SCHEMA_VERSION, type SessionRecord } from '../src/shared/session';
+import {
+  isValidSessionId,
+  SESSION_SCHEMA_VERSION,
+  validateSessionRecord,
+  type SessionRecord
+} from '../src/shared/session';
 import { ROOT } from './helpers';
 
 const STORE_DIR = path.join(ROOT, '.tmp-tests', 'sessions');
@@ -241,5 +246,191 @@ describe('SessionStore — §35 security', () => {
     expect('apiKey' in parsed).toBe(false);
     expect('credentials' in parsed).toBe(false);
     expect('tokenUsage' in parsed).toBe(true); // §15 Token Usage field exists
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Trusted-input validation (P0-2): the renderer and disk content are  */
+/* untrusted. IDs are path-traversal-free; records are schema-validated; */
+/* cross-workspace / forged-id reads are rejected; unknown kinds and   */
+/* wrong-typed fields are dropped, never force-cast.                    */
+/* ------------------------------------------------------------------ */
+
+describe('isValidSessionId — traversal / shape guard', () => {
+  it('accepts UUID-like and test-form ids', () => {
+    expect(isValidSessionId('a1b2c3d4-e5f6-7890-abcd-ef1234567890')).toBe(true);
+    expect(isValidSessionId('sess-1')).toBe(true);
+    expect(isValidSessionId('abcDEF_123-456')).toBe(true);
+  });
+
+  it('rejects path-traversal and index collisions', () => {
+    expect(isValidSessionId('../escape')).toBe(false);
+    expect(isValidSessionId('a/b')).toBe(false);
+    expect(isValidSessionId('a\\b')).toBe(false);
+    expect(isValidSessionId('index')).toBe(false);
+    expect(isValidSessionId('foo.json')).toBe(false);
+    expect(isValidSessionId('')).toBe(false);
+    expect(isValidSessionId('with null\x00char')).toBe(false);
+    expect(isValidSessionId('has space')).toBe(false);
+  });
+});
+
+describe('validateSessionRecord — schema + consistency', () => {
+  const good: SessionRecord = {
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    id: 'sess-1',
+    workspaceRoot: WS,
+    title: 't',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    model: null,
+    agentState: 'idle',
+    tokenUsage: null,
+    items: [{ kind: 'user', id: 'u1', text: 'hi' }]
+  };
+
+  it('accepts a well-formed record', () => {
+    expect(validateSessionRecord(good).ok).toBe(true);
+  });
+
+  it('rejects id/context mismatch (forged id)', () => {
+    const r = validateSessionRecord(good, { expectedId: 'sess-other' });
+    expect(r.ok).toBe(false);
+  });
+
+  it('rejects cross-workspace workspaceRoot', () => {
+    const r = validateSessionRecord(good, { expectedWorkspaceRoot: '/other/workspace' });
+    expect(r.ok).toBe(false);
+  });
+
+  it('rejects an illegal id', () => {
+    const r = validateSessionRecord({ ...good, id: '../x' });
+    expect(r.ok).toBe(false);
+  });
+
+  it('drops unknown item kinds instead of keeping them', () => {
+    const r = validateSessionRecord({
+      ...good,
+      items: [
+        { kind: 'user', id: 'u1', text: 'ok' },
+        { kind: 'alien', id: 'x' } as unknown as never,
+        // valid kind, but a wrong-typed field (output is a number, not string)
+        { kind: 'tool', id: 't1', tool: 'shell', output: 123 as unknown as string }
+      ]
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // Unknown kind dropped; wrong-typed field dropped but the item kept
+      // (only the bad field is removed, never the whole row force-cast).
+      expect(r.record.items).toHaveLength(2);
+      expect(r.record.items.map((i) => i.kind)).toEqual(['user', 'tool']);
+      const tool = r.record.items.find((i) => i.kind === 'tool')!;
+      expect(tool.output).toBeUndefined();
+      expect(tool.tool).toBe('shell');
+    }
+  });
+
+  it('rejects wrong-typed top-level fields', () => {
+    expect(validateSessionRecord({ ...good, title: 123 as unknown as string }).ok).toBe(false);
+    expect(validateSessionRecord({ ...good, items: 'nope' as unknown as [] }).ok).toBe(false);
+    expect(validateSessionRecord({ ...good, agentState: 'bogus' }).ok).toBe(false);
+    expect(validateSessionRecord({ ...good, tokenUsage: [] as unknown as null }).ok).toBe(false);
+  });
+});
+
+describe('SessionStore — trusted boundary (P0-2 negative paths)', () => {
+  it('refuses to load/save/switch/delete a traversal-shaped id', () => {
+    const store = makeStore();
+    store.create(WS);
+    expect(store.load(WS, '../escape').ok).toBe(false);
+    expect(store.save(WS, { ...store.create(WS), id: '../escape' }).ok).toBe(false);
+    expect(store.switchTo(WS, 'a/b').ok).toBe(false);
+    expect(store.delete(WS, 'a\\b').ok).toBe(false);
+  });
+
+  it('load rejects an id that is not a member of this workspace index', () => {
+    const store = makeStore();
+    const wsA = '/tmp/ws-a';
+    const wsB = '/tmp/ws-b';
+    const a = store.create(wsA);
+    // Even though a's file exists under wsA's dir, requesting it from wsB
+    // must not find it.
+    expect(store.load(wsB, a.id).ok).toBe(false);
+    // And a legitimate-but-foreign id never reads across workspaces.
+    expect(store.load(wsB, 'sess-foreign').ok).toBe(false);
+  });
+
+  it('save refuses a record whose id/workspaceRoot is forged against the context', () => {
+    const store = makeStore();
+    const created = store.create(WS);
+    // Tamper: claim a different workspaceRoot than the one we saved under.
+    const forged: SessionRecord = { ...created, workspaceRoot: '/tmp/other' };
+    expect(store.save(WS, forged).ok).toBe(false);
+    // Tamper: swap the id to a foreign (but index-valid? no) id.
+    expect(store.save(WS, { ...created, id: 'foreign-id' }).ok).toBe(false);
+  });
+
+  it('loadRecord drops a tampered on-disk record (id/workspace mismatch)', () => {
+    const store = makeStore();
+    const created = store.create(WS);
+    const file = store.recordPath(WS, created.id);
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as SessionRecord;
+    // Rewrite the file with a mismatched workspaceRoot — it must read as corrupt.
+    fs.writeFileSync(file, JSON.stringify({ ...raw, workspaceRoot: '/tmp/elsewhere' }), 'utf8');
+    expect(store.load(WS, created.id)).toMatchObject({ ok: false });
+    // And it no longer appears in the listing.
+    expect(store.listSummaries(WS).map((s) => s.id)).not.toContain(created.id);
+  });
+
+  it('loadRecord drops items with unknown kinds / wrong field types', () => {
+    const store = makeStore();
+    const created = store.create(WS);
+    const file = store.recordPath(WS, created.id);
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as SessionRecord;
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        ...raw,
+        items: [
+          { kind: 'user', id: 'u1', text: 'kept' },
+          { kind: 'malware', id: 'm1' },
+          { kind: 'tool', id: 't1', tool: 'shell', output: 999, level: ['bad'] }
+        ]
+      }),
+      'utf8'
+    );
+    const loaded = store.load(WS, created.id);
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok && loaded.record) {
+      // 'malware' (unknown kind) dropped; 'tool' kept but its wrong-typed
+      // fields (output:number, level:array) dropped rather than force-cast.
+      expect(loaded.record.items).toHaveLength(2);
+      expect(loaded.record.items.map((i) => i.kind)).toEqual(['user', 'tool']);
+      const tool = loaded.record.items.find((i) => i.kind === 'tool')!;
+      expect(tool.output).toBeUndefined();
+      expect(tool.level).toBeUndefined();
+      expect(tool.tool).toBe('shell');
+    }
+  });
+
+  it('delete does NOT mutate the index when the record file cannot be removed', () => {
+    const store = makeStore();
+    const created = store.create(WS);
+    const file = store.recordPath(WS, created.id);
+    // Replace the record file with a directory so rmSync({force:true}) throws
+    // ERR_FS_EISDIR — a realistic deletion failure the store must survive.
+    fs.rmSync(file, { force: true });
+    fs.mkdirSync(file);
+    const result = store.delete(WS, created.id);
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/删除会话文件失败/);
+    // The index.json on disk must STILL list the id — delete returned failure
+    // and did not commit the index change. (listSummaries hides the id because
+    // the record is now an unparseable dir; verify the raw index instead.)
+    const indexFile = path.join(store.workspaceDir(WS), 'index.json');
+    const index = JSON.parse(fs.readFileSync(indexFile, 'utf8')) as { sessions: string[] };
+    expect(index.sessions).toContain(created.id);
+    // Cleanup so afterAll can rm the tree.
+    fs.rmSync(file, { recursive: true, force: true });
   });
 });

@@ -1853,6 +1853,24 @@ code {
   font-size: 13px;
 }
 
+.approval-notice-banner,
+.session-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+/* Session persistence errors carry the §32 three-part copy (发生了什么/原因/
+   建议/原始信息, one per line) — preserve those line breaks in the banner. */
+.session-error-banner {
+  align-items: flex-start;
+}
+
+.session-error-banner span {
+  white-space: pre-line;
+}
+
 .approval-reasons {
   margin: 0;
   padding-left: 18px;

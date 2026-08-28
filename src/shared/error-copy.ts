@@ -9,6 +9,9 @@
  *   3. Model API 401/404/429 → 消息流内联错误卡（保留原始可诊断信息）
  *   4. Agent Crash         → Session 保留 + Restart Runtime / Resume Session
  *
+ * Plus the §15 persistence-layer failures (save/delete), framed with the same
+ * three-part structure so a failed checkpoint is never silently swallowed.
+ *
  * Diagnostic detail (stderr tail, provider code/message) is preserved verbatim
  * so support can diagnose; secrets are stripped upstream of these functions by
  * the runtime-log redaction choke point (§33).
@@ -18,7 +21,8 @@ export type ErrorScenario =
   | 'dsh_not_found'
   | 'runtime_startup_failed'
   | 'model_api'
-  | 'agent_crash';
+  | 'agent_crash'
+  | 'session_persist';
 
 export interface ErrorCopy {
   scenario: ErrorScenario;
@@ -110,4 +114,48 @@ export function dshNotFoundCopy(reason?: string): ErrorCopy {
     why: reason ?? '未检测到可用的 dsh 运行时。Desktop 需要 dsh CLI 才能驱动 Agent。',
     action: '安装 dsh CLI（确保 dsh 在 PATH 中），或点击「Choose DSH Path」指定已安装的可执行文件路径。',
   };
+}
+
+/* ---- Session persistence errors (§15/§32: save/delete must not fail silently) ---- */
+
+/**
+ * Session-save failure copy. `detail` is the store's raw error (e.g. an fs
+ * message or a validation rejection reason). The user must be able to tell
+ * the transcript is NOT safely on disk yet — otherwise they close the app and
+ * lose the conversation (AC-12 regression).
+ */
+export function sessionSaveFailedCopy(detail?: string): ErrorCopy {
+  return {
+    scenario: 'session_persist',
+    what: '会话保存失败',
+    why: '会话记录未能写入磁盘（磁盘错误、目录权限问题，或记录未通过完整性校验）。当前对话仍显示在界面中，但尚未成功落盘——此时关闭应用可能丢失这段历史。',
+    action: '继续对话会自动再次尝试保存；也可以手动切换一次会话触发保存。若持续失败，请检查磁盘空间与 ~/.dsh/desktop 目录权限，并避免多个应用实例同时打开同一工作区。',
+    detail
+  };
+}
+
+/**
+ * Session-delete failure copy. `detail` is the store's raw error. The store
+ * deliberately keeps the index unchanged on delete failure so the list never
+ * claims a deletion that did not happen on disk — the copy explains that.
+ */
+export function sessionDeleteFailedCopy(detail?: string): ErrorCopy {
+  return {
+    scenario: 'session_persist',
+    what: '会话删除失败',
+    why: '会话文件在磁盘上未能移除（可能被其他进程占用）。为避免列表与磁盘状态分裂，本次删除未生效，会话仍保留在列表中。',
+    action: '关闭可能占用该文件的其他程序后重试；文件仍完整保留在磁盘上，对话内容不会丢失。',
+    detail
+  };
+}
+
+/**
+ * Single-string projection of a session persistence error (same shape as the
+ * chat layer's `describeError`): 发生了什么 / 原因 / 建议 / 原始信息, one per
+ * line, so a copy/paste into a bug report keeps the diagnostics.
+ */
+export function describeSessionError(copy: ErrorCopy): string {
+  return [copy.what, `原因：${copy.why}`, `建议：${copy.action}`, copy.detail ? `原始信息：${copy.detail}` : null]
+    .filter((line): line is string => line !== null && line !== '')
+    .join('\n');
 }

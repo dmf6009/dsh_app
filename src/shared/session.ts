@@ -104,3 +104,169 @@ export interface SessionLoadResult {
   /** True when the file existed but could not be parsed (corrupt). */
   corrupt?: boolean;
 }
+
+/* ------------------------------------------------------------------ */
+/* Trusted-input validation (S-4 hardening)                            */
+/*                                                                    */
+/* Renderer / disk-persisted content is NOT trusted. These pure guards   */
+/* enforce a fixed session-id shape, a closed `kind` set, per-field    */
+/* type checks and record/context consistency so a malformed payload    */
+/* can never traverse the filesystem or be force-cast into a live       */
+/* SessionRecord. Used by the main-process SessionStore AND the IPC     */
+/* boundary so both layers apply identical rules.                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Acceptable session id shape. Allows the runtime-generated UUID form and the
+ * `sess-<digits>` test form, but rejects anything that could traverse
+ * directories (`/`, `\\`, `..`, NUL, control chars) or name the index file.
+ * Length-bounded to keep the on-disk filename sane.
+ */
+const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** True iff `id` is a safe, path-traversal-free session id. */
+export function isValidSessionId(id: unknown): id is string {
+  if (typeof id !== 'string' || id === '' || id === 'index') return false;
+  if (id.includes('.') && id !== '') {
+    // Reject ids that look like filenames (an id with an extension could
+    // collide with or shadow a record file by name).
+    if (id.includes('.json')) return false;
+  }
+  return SESSION_ID_PATTERN.test(id);
+}
+
+/** Every `kind` value a persisted transcript item may legitimately take. */
+export const SESSION_ITEM_KINDS: ReadonlySet<string> = new Set([
+  'user', 'assistant', 'plan', 'tool', 'file_read', 'file_changed',
+  'subagent', 'summary', 'notice'
+]);
+
+/** Per-field type guards for the optional SessionItem fields. */
+const ITEM_FIELD_TYPES: Record<string, (v: unknown) => boolean> = {
+  text: (v) => typeof v === 'string',
+  steps: (v) => Array.isArray(v) && v.every((s) => typeof s === 'string'),
+  toolCallId: (v) => typeof v === 'string',
+  tool: (v) => typeof v === 'string',
+  command: (v) => typeof v === 'string',
+  output: (v) => typeof v === 'string',
+  status: (v) => typeof v === 'string',
+  level: (v) => typeof v === 'string',
+  category: (v) => typeof v === 'string',
+  basis: (v) => typeof v === 'string',
+  form: (v) => typeof v === 'string',
+  path: (v) => typeof v === 'string',
+  change: (v) => typeof v === 'string',
+  sizeBytes: (v) => typeof v === 'number' && Number.isFinite(v),
+  label: (v) => typeof v === 'string',
+  summary: (v) => typeof v === 'string',
+  tone: (v) => typeof v === 'string'
+};
+
+/**
+ * Strictly validate one transcript item. Returns a clean SessionItem with only
+ * known, well-typed fields (unknown kinds and wrong-typed fields are dropped
+ * or rejected). Never throws — corrupt items become `null` for the caller to
+ * skip, so a single bad row never poisons the whole record.
+ *
+ * `rejectUnknownKind` controls whether an item whose `kind` is not in the
+ * closed set is dropped (true, the default — disk content is untrusted) or
+ * kept as-is (false — only used internally where a kind was already vetted).
+ */
+export function validateSessionItem(
+  value: unknown,
+  rejectUnknownKind = true
+): SessionItem | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const kind = item['kind'];
+  if (typeof kind !== 'string') return null;
+  if (rejectUnknownKind && !SESSION_ITEM_KINDS.has(kind)) return null;
+  const id = item['id'];
+  if (typeof id !== 'string' || id === '') return null;
+  const out: SessionItem = { kind: kind as SessionItem['kind'], id };
+  for (const [key, guard] of Object.entries(ITEM_FIELD_TYPES)) {
+    if (key in item && item[key] !== undefined && item[key] !== null) {
+      if (guard(item[key])) {
+        (out as unknown as Record<string, unknown>)[key] = item[key];
+      }
+      // Wrong-typed fields are silently dropped, never force-cast.
+    }
+  }
+  return out;
+}
+
+const AGENT_STATES: ReadonlySet<string> = new Set([
+  'idle', 'running', 'awaiting_approval', 'awaiting_cancel', 'crashed'
+]);
+
+/**
+ * Validate a full SessionRecord payload arriving from the renderer (save IPC)
+ * or read from disk. Enforces the §15 field set with strict types and the
+ * closed item-kind set; rejects records whose `id` / `workspaceRoot` do not
+ * match the caller's context (cross-workspace / forged-id protection).
+ *
+ * Returns `{ ok, record, error }` — never throws — so callers degrade a bad
+ * record to a recoverable error instead of executing it.
+ */
+export function validateSessionRecord(
+  value: unknown,
+  context: { expectedId?: string; expectedWorkspaceRoot?: string } = {}
+): { ok: true; record: SessionRecord } | { ok: false; error: string } {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { ok: false, error: '会话记录不是合法对象' };
+  }
+  const r = value as Record<string, unknown>;
+  if (!isValidSessionId(r['id'])) {
+    return { ok: false, error: '会话 id 非法' };
+  }
+  if (context.expectedId !== undefined && r['id'] !== context.expectedId) {
+    return { ok: false, error: '会话 id 与请求上下文不一致' };
+  }
+  if (typeof r['workspaceRoot'] !== 'string' || r['workspaceRoot'].trim() === '') {
+    return { ok: false, error: 'workspaceRoot 缺失或非法' };
+  }
+  if (
+    context.expectedWorkspaceRoot !== undefined &&
+    r['workspaceRoot'] !== context.expectedWorkspaceRoot
+  ) {
+    return { ok: false, error: 'workspaceRoot 与当前工作区不一致' };
+  }
+  if (typeof r['title'] !== 'string') return { ok: false, error: 'title 字段非法' };
+  if (typeof r['createdAt'] !== 'string' || typeof r['updatedAt'] !== 'string') {
+    return { ok: false, error: '时间戳字段非法' };
+  }
+  if (r['model'] !== null && typeof r['model'] !== 'string') {
+    return { ok: false, error: 'model 字段非法' };
+  }
+  if (r['agentState'] !== null && typeof r['agentState'] !== 'string') {
+    return { ok: false, error: 'agentState 字段非法' };
+  }
+  if (typeof r['agentState'] === 'string' && !AGENT_STATES.has(r['agentState'])) {
+    return { ok: false, error: 'agentState 取值非法' };
+  }
+  if (r['tokenUsage'] !== null && (typeof r['tokenUsage'] !== 'object' || Array.isArray(r['tokenUsage']))) {
+    return { ok: false, error: 'tokenUsage 字段非法' };
+  }
+  if (!Array.isArray(r['items'])) {
+    return { ok: false, error: 'items 不是数组' };
+  }
+  const items: SessionItem[] = [];
+  for (const raw of r['items']) {
+    const validated = validateSessionItem(raw, true);
+    if (validated === null) continue; // drop bad rows instead of poisoning the record
+    items.push(validated);
+  }
+  const record: SessionRecord = {
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    id: r['id'],
+    workspaceRoot: r['workspaceRoot'],
+    title: r['title'],
+    createdAt: r['createdAt'],
+    updatedAt: r['updatedAt'],
+    model: r['model'] === null ? null : r['model'] as string,
+    agentState: r['agentState'] === null ? 'idle' : r['agentState'] as SessionRecord['agentState'],
+    tokenUsage: r['tokenUsage'] === null ? null : r['tokenUsage'] as Record<string, number>,
+    items
+  };
+  return { ok: true, record };
+}

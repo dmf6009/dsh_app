@@ -7,9 +7,12 @@ import { describe, expect, it } from 'vitest';
 
 import {
   agentCrashCopy,
+  describeSessionError,
   dshNotFoundCopy,
   modelApiErrorCopy,
-  runtimeStartupFailedCopy
+  runtimeStartupFailedCopy,
+  sessionDeleteFailedCopy,
+  sessionSaveFailedCopy
 } from '../src/shared/error-copy';
 
 describe('§32 model API errors (401/404/429/other)', () => {
@@ -79,5 +82,45 @@ describe('§32 DSH not found', () => {
   it('uses the provided reason when present', () => {
     const c = dshNotFoundCopy('custom reason');
     expect(c.why).toBe('custom reason');
+  });
+});
+
+describe('§15/§32 session persistence errors', () => {
+  it('save failure warns the transcript is not on disk yet', () => {
+    const c = sessionSaveFailedCopy('EACCES: permission denied');
+    expect(c.scenario).toBe('session_persist');
+    expect(c.what).toBe('会话保存失败');
+    // The「为什么」must say the conversation is NOT safely persisted — that is
+    // the AC-12 regression the user needs to know about before closing the app.
+    expect(c.why).toContain('尚未成功落盘');
+    expect(c.action).toContain('再次尝试保存');
+    expect(c.action).toContain('~/.dsh/desktop');
+    expect(c.detail).toBe('EACCES: permission denied');
+  });
+
+  it('delete failure explains the index was deliberately not mutated', () => {
+    const c = sessionDeleteFailedCopy('EBUSY: resource busy');
+    expect(c.scenario).toBe('session_persist');
+    expect(c.what).toBe('会话删除失败');
+    expect(c.why).toContain('未生效');
+    expect(c.why).toContain('列表与磁盘状态分裂');
+    expect(c.action).toContain('重试');
+    expect(c.detail).toBe('EBUSY: resource busy');
+  });
+
+  it('describeSessionError projects the three parts + raw detail, one per line', () => {
+    const text = describeSessionError(sessionSaveFailedCopy('EACCES'));
+    const lines = text.split('\n');
+    expect(lines).toHaveLength(4);
+    expect(lines[0]).toBe('会话保存失败');
+    expect(lines[1]).toMatch(/^原因：/);
+    expect(lines[2]).toMatch(/^建议：/);
+    expect(lines[3]).toBe('原始信息：EACCES');
+  });
+
+  it('describeSessionError omits the detail line when there is none', () => {
+    const text = describeSessionError(sessionDeleteFailedCopy());
+    expect(text.split('\n')).toHaveLength(3);
+    expect(text).not.toContain('原始信息');
   });
 });

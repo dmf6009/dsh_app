@@ -103,6 +103,8 @@ const api: DesktopApi = {
     ipcRenderer.invoke('session:switch', id),
   deleteSession: (id: string): Promise<SessionMutationResult> =>
     ipcRenderer.invoke('session:delete', id),
+  flushBeforeQuit: (record: SessionRecord): SessionMutationResult =>
+    ipcRenderer.sendSync('session:flush-before-quit', record),
 
   getSettings: (): Promise<SettingsView> => ipcRenderer.invoke('settings:get'),
   saveProvider: (input: SaveProviderInput): Promise<OperationResult> =>

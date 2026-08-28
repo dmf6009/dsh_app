@@ -23,8 +23,9 @@ import path from 'node:path';
 import { expandAndNormalize } from '../workspace/boundary';
 import { idForPath } from '../workspace/recent-projects';
 import {
+  isValidSessionId,
   SESSION_SCHEMA_VERSION,
-  type SessionItem,
+  validateSessionRecord,
   type SessionLoadResult,
   type SessionMutationResult,
   type SessionRecord,
@@ -70,12 +71,15 @@ export class SessionStore {
    */
   listSummaries(workspaceRoot: string, activeId: string | null | undefined = undefined): SessionSummary[] {
     const dir = this.workspaceDir(workspaceRoot);
+    const expectedRoot = expandAndNormalize(workspaceRoot);
     const index = this.loadIndex(dir);
     const resolvedActive = activeId === undefined ? index.activeId : activeId;
     const summaries: SessionSummary[] = [];
     const seen = new Set<string>();
     for (const id of index.sessions) {
-      const record = this.loadRecord(dir, id);
+      // Enforce workspaceRoot consistency on listing too, so a tampered record
+      // that no longer belongs to this workspace is dropped from the list.
+      const record = this.loadRecord(dir, id, expectedRoot);
       if (record === null) continue; // corrupt/missing file — skip, keep listing
       seen.add(id);
       summaries.push({
@@ -134,10 +138,22 @@ export class SessionStore {
   /**
    * Load one session record. A missing file is a soft failure (the session
    * may have been deleted); a corrupt file is flagged so the UI can offer to
-   * discard it. Never throws (§ 损坏文件恢复).
+   * discard it. Never throws (§ 损坏文件恢复). Only sessions that are members
+   * of this workspace's index may be loaded — a forged id that happens to
+   * name a file is rejected as not-found.
    */
   load(workspaceRoot: string, id: string): SessionLoadResult {
-    const record = this.loadRecord(this.workspaceDir(workspaceRoot), id);
+    if (!isValidSessionId(id)) {
+      return { ok: false, error: '会话 id 非法' };
+    }
+    const dir = this.workspaceDir(workspaceRoot);
+    // Index membership: a request for an id that is not part of THIS
+    // workspace's index is treated as not-found, so a crafted id cannot read a
+    // record belonging to another workspace.
+    if (!this.loadIndex(dir).sessions.includes(id)) {
+      return { ok: false, error: '会话不存在' };
+    }
+    const record = this.loadRecord(dir, id, expandAndNormalize(workspaceRoot));
     if (record === null) {
       // Distinguish missing from corrupt by probing the raw file.
       const filePath = this.recordPath(workspaceRoot, id);
@@ -158,16 +174,32 @@ export class SessionStore {
    * Persist the full transcript + metadata of an existing session. Called by
    * the renderer whenever the conversation state should be checkpointed
    * (after a run completes, on session switch, before app close).
+   *
+   * The record is validated as untrusted input: id shape, index membership,
+   * closed item-kind set, per-field types and id/workspaceRoot consistency
+   * with the request context are all enforced before a single byte is
+   * written.
    */
   save(workspaceRoot: string, record: SessionRecord): SessionMutationResult {
+    const normalizedRoot = expandAndNormalize(workspaceRoot);
     const dir = this.workspaceDir(workspaceRoot);
+    if (!isValidSessionId(record.id)) {
+      return { ok: false, error: '会话 id 非法' };
+    }
     if (!this.loadIndex(dir).sessions.includes(record.id)) {
       return { ok: false, error: '会话不存在' };
     }
+    const validated = validateSessionRecord(record, {
+      expectedId: record.id,
+      expectedWorkspaceRoot: normalizedRoot
+    });
+    if (!validated.ok) {
+      return { ok: false, error: validated.error };
+    }
     const stamped: SessionRecord = {
-      ...record,
+      ...validated.record,
       schemaVersion: SESSION_SCHEMA_VERSION,
-      workspaceRoot: expandAndNormalize(workspaceRoot),
+      workspaceRoot: normalizedRoot,
       updatedAt: this.now().toISOString()
     };
     try {
@@ -180,6 +212,9 @@ export class SessionStore {
 
   /** Mark a session as the active one (§15 切换). */
   switchTo(workspaceRoot: string, id: string): SessionMutationResult {
+    if (!isValidSessionId(id)) {
+      return { ok: false, error: '会话 id 非法' };
+    }
     const dir = this.workspaceDir(workspaceRoot);
     if (!this.loadIndex(dir).sessions.includes(id)) {
       return { ok: false, error: '会话不存在' };
@@ -190,18 +225,38 @@ export class SessionStore {
 
   /**
    * Delete a session record and drop it from the index (§15 删除). Idempotent:
-   * deleting a missing id is a no-op success.
+   * deleting a missing id is a no-op success. The on-disk record removal is
+   * atomic with the index update — if `rmSync` fails the index is NOT mutated
+   * and a failure is returned, so the list never claims a deletion that did
+   * not happen on disk.
    */
   delete(workspaceRoot: string, id: string): SessionMutationResult {
+    if (!isValidSessionId(id)) {
+      return { ok: false, error: '会话 id 非法' };
+    }
     const dir = this.workspaceDir(workspaceRoot);
     const index = this.loadIndex(dir);
     if (!index.sessions.includes(id)) {
       return { ok: true, id };
     }
+    // Remove the record file first. Only on success do we mutate the index —
+    // a leftover file is recoverable; a missing-file-but-listed record is not.
+    const filePath = this.recordPath(workspaceRoot, id);
+    let fileExists = true;
     try {
-      fs.rmSync(this.recordPath(workspaceRoot, id), { force: true });
+      fs.rmSync(filePath, { force: true });
+    } catch (err) {
+      // `force:true` already swallows ENOENT; any other error is real.
+      return { ok: false, error: `删除会话文件失败：${err instanceof Error ? err.message : String(err)}` };
+    }
+    try {
+      fileExists = fs.existsSync(filePath);
     } catch {
-      /* best-effort */
+      fileExists = true;
+    }
+    if (fileExists) {
+      // File survived the rm — do not pretend it was deleted.
+      return { ok: false, error: '删除会话文件失败：文件仍存在' };
     }
     const remaining = index.sessions.filter((sid) => sid !== id);
     const nextActive = index.activeId === id ? (remaining[remaining.length - 1] ?? null) : index.activeId;
@@ -226,7 +281,16 @@ export class SessionStore {
 
   /* ---- Low-level IO --------------------------------------------------- */
 
-  private loadRecord(dir: string, id: string): SessionRecord | null {
+  /**
+   * Read + strictly validate one record file. The owning workspace root is
+   * passed in (when known) so a disk record whose `workspaceRoot`/`id` was
+   * tampered with (or that belongs to a different workspace after a move) is
+   * rejected as corrupt rather than loaded. Unknown item kinds and wrong-typed
+   * fields are dropped, never force-cast. Returns null on any failure (caller
+   * probes file existence to distinguish missing from corrupt).
+   */
+  private loadRecord(dir: string, id: string, expectedWorkspaceRoot?: string): SessionRecord | null {
+    if (!isValidSessionId(id)) return null;
     const filePath = path.join(dir, `${id}.json`);
     let raw: string;
     try {
@@ -234,22 +298,23 @@ export class SessionStore {
     } catch {
       return null;
     }
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(raw) as SessionRecord;
-      if (
-        typeof parsed !== 'object' ||
-        parsed === null ||
-        typeof parsed.id !== 'string' ||
-        !Array.isArray(parsed.items)
-      ) {
-        return null; // corrupt — caller distinguishes via file existence probe
-      }
-      // Migrate / normalize: stamp current schema version if older.
-      const items = parsed.items.map(normalizeItem).filter((v): v is SessionItem => v !== null);
-      return { ...parsed, schemaVersion: SESSION_SCHEMA_VERSION, items };
+      parsed = JSON.parse(raw);
     } catch {
-      return null;
+      return null; // corrupt JSON
     }
+    // Trust-but-verify: the file's own id must match its filename id, and —
+    // when the caller knows the owning workspace — the workspaceRoot must
+    // match too. A mismatched record is treated as corrupt so it cannot
+    // masquerade as another session or workspace.
+    const result = validateSessionRecord(parsed, {
+      expectedId: id,
+      expectedWorkspaceRoot
+    });
+    if (!result.ok) return null;
+    // Stamp the current schema version (migration) and return the vetted record.
+    return { ...result.record, schemaVersion: SESSION_SCHEMA_VERSION };
   }
 
   private loadIndex(dir: string): StoredIndex {
@@ -320,26 +385,4 @@ export class SessionStore {
     const next = fn(this.loadIndex(dir));
     this.writeIndex(dir, next);
   }
-}
-
-/**
- * Normalize one persisted transcript item defensively: drop anything that is
- * not a plain object with a string `kind`, and trim unknown fields later code
- * won't expect. Keeps load resilient to hand-edited or partially-written files.
- */
-function normalizeItem(value: unknown): SessionItem | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
-  const item = value as Record<string, unknown>;
-  if (typeof item['kind'] !== 'string') return null;
-  const out: SessionItem = { kind: item['kind'] as SessionItem['kind'], id: typeof item['id'] === 'string' ? item['id'] : '' };
-  for (const key of [
-    'text', 'steps', 'toolCallId', 'tool', 'command', 'output', 'status',
-    'level', 'category', 'basis', 'form', 'path', 'change', 'sizeBytes',
-    'label', 'summary', 'tone'
-  ] as const) {
-    if (key in item && item[key] !== undefined && item[key] !== null) {
-      (out as unknown as Record<string, unknown>)[key] = item[key];
-    }
-  }
-  return out;
 }

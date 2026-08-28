@@ -136,6 +136,12 @@ export interface DesktopApi {
   switchSession(id: string): Promise<SessionMutationResult>;
   /** Delete a session record (§15 删除; idempotent). */
   deleteSession(id: string): Promise<SessionMutationResult>;
+  /**
+   * Synchronous checkpoint used by the renderer's beforeunload/pagehide and
+   * the main process before-quit so an in-flight conversation is never lost on
+   * navigation or app close (§34/§15 持久化生命周期). Returns the save result.
+   */
+  flushBeforeQuit(record: SessionRecord): SessionMutationResult;
 
   /* ---- Settings (§17/§12/§32) ---- */
   getSettings(): Promise<SettingsView>;

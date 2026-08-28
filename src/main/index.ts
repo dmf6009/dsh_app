@@ -49,6 +49,7 @@ import type {
   SessionRecord,
   SessionSummary
 } from '../shared/session';
+import { isValidSessionId, validateSessionRecord } from '../shared/session';
 import { ChangeRecordService } from './changes/change-record-service';
 import { buildFileDiff } from './changes/file-diff';
 import { SessionStore } from './session/session-store';
@@ -309,31 +310,58 @@ function registerIpcHandlers(context: {
   );
   ipcMain.handle('session:load', (_event, id: unknown): Promise<SessionLoadResult> => {
     const root = workspaces.currentRoot;
-    if (!root || typeof id !== 'string') {
-      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 无效' });
+    if (!root || !isValidSessionId(id)) {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 非法' });
     }
     return Promise.resolve(sessions.load(root, id));
   });
   ipcMain.handle('session:save', (_event, record: unknown): Promise<SessionMutationResult> => {
     const root = workspaces.currentRoot;
-    if (!root || typeof record !== 'object' || record === null || typeof (record as { id?: unknown }).id !== 'string') {
+    if (!root || typeof record !== 'object' || record === null) {
       return Promise.resolve({ ok: false, error: '未打开工作区或会话记录无效' });
     }
-    return Promise.resolve(sessions.save(root, record as SessionRecord));
+    // Validate the untrusted renderer payload centrally before handing it to
+    // the store; the store re-validates on the disk side too (defence in depth).
+    const validated = validateSessionRecord(record, {
+      expectedWorkspaceRoot: workspaces.currentRoot ?? undefined
+    });
+    if (!validated.ok) {
+      return Promise.resolve({ ok: false, error: validated.error });
+    }
+    return Promise.resolve(sessions.save(root, validated.record));
   });
   ipcMain.handle('session:switch', (_event, id: unknown): Promise<SessionMutationResult> => {
     const root = workspaces.currentRoot;
-    if (!root || typeof id !== 'string') {
-      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 无效' });
+    if (!root || !isValidSessionId(id)) {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 非法' });
     }
     return Promise.resolve(sessions.switchTo(root, id));
   });
   ipcMain.handle('session:delete', (_event, id: unknown): Promise<SessionMutationResult> => {
     const root = workspaces.currentRoot;
-    if (!root || typeof id !== 'string') {
-      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 无效' });
+    if (!root || !isValidSessionId(id)) {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 非法' });
     }
     return Promise.resolve(sessions.delete(root, id));
+  });
+  // §34/§15 持久化生命周期：app 关闭/导航前的同步 checkpoint。Renderer
+  // 用 sendSync 发送当前 SessionRecord，主进程同步落盘后返回结果——
+  // 这样 beforeunload/pagehide 与 before-quit 都能在进程退出前完成保存。
+  // 输入按 save() 口径做不可信校验（id 格式、schema、跨工作区一致性）。
+  ipcMain.on('session:flush-before-quit', (event, record: unknown): void => {
+    const root = workspaces.currentRoot;
+    if (!root || typeof record !== 'object' || record === null) {
+      event.returnValue = { ok: false, error: '未打开工作区或会话记录无效' };
+      return;
+    }
+    const validated = validateSessionRecord(record, {
+      expectedWorkspaceRoot: workspaces.currentRoot ?? undefined
+    });
+    if (!validated.ok) {
+      event.returnValue = { ok: false, error: validated.error };
+      return;
+    }
+    event.returnValue = sessions.save(root, validated.record);
   });
 
   /* ---- Settings ---- */

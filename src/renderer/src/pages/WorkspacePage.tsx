@@ -228,9 +228,11 @@ export default function WorkspacePage(): JSX.Element {
     const text = input.trim();
     if (!canSend) return;
     // Ensure a session exists before the first send so the transcript is
-    // persisted from the very first message (§15/AC-12).
+    // persisted from the very first message (§15/AC-12). There is no outgoing
+    // session yet, so this cannot abort in practice — but stay defensive.
     if (!sessions.activeId) {
-      const restored = await sessions.create(text.slice(0, 40));
+      const restored = await sessions.create(modelRef.current, persistMeta(), text.slice(0, 40));
+      if (restored === null) return; // creation failed; banner shows why
       setModel(restored);
       lastPhaseRef.current = 'idle';
     }
@@ -253,7 +255,7 @@ export default function WorkspacePage(): JSX.Element {
         ]
       }));
     }
-  }, [input, canSend, dispatch, sessions]);
+  }, [input, canSend, dispatch, sessions, persistMeta]);
 
   const stop = useCallback(async (): Promise<void> => {
     if (modelRef.current.phase === 'idle') return;
@@ -269,14 +271,21 @@ export default function WorkspacePage(): JSX.Element {
 
   const newSession = useCallback(async (): Promise<void> => {
     if (running) return; // lock during a run
-    const restored = await sessions.create();
+    // The outgoing session is checkpointed inside create(); on failure the
+    // transition aborts (null) and the current model/active id stay on screen
+    // so unsaved conversation state is never discarded (§15/AC-12).
+    const restored = await sessions.create(modelRef.current, persistMeta());
+    if (restored === null) return;
     setModel(restored);
     lastPhaseRef.current = 'idle';
-  }, [running, sessions]);
+  }, [running, sessions, persistMeta]);
 
   const switchSession = useCallback(async (id: string): Promise<void> => {
     if (running) return;
+    // Same abort semantics: a failed outgoing checkpoint keeps the user on the
+    // current (unsaved) session instead of silently replacing the model.
     const restored = await sessions.switchTo(id, modelRef.current, persistMeta());
+    if (restored === null) return;
     setModel(restored);
     lastPhaseRef.current = 'idle';
   }, [running, sessions, persistMeta]);

@@ -336,6 +336,19 @@ describe('validateSessionRecord — schema + consistency', () => {
     expect(validateSessionRecord({ ...good, agentState: 'bogus' }).ok).toBe(false);
     expect(validateSessionRecord({ ...good, tokenUsage: [] as unknown as null }).ok).toBe(false);
   });
+
+  it('validates every tokenUsage value is a finite number (per-value guard)', () => {
+    // Well-formed usage maps pass, including empty ones.
+    expect(validateSessionRecord({ ...good, tokenUsage: { input: 120, output: 45.5 } }).ok).toBe(true);
+    expect(validateSessionRecord({ ...good, tokenUsage: {} }).ok).toBe(true);
+    // Non-numeric / non-finite values must be rejected, not force-cast into
+    // Record<string, number>.
+    expect(validateSessionRecord({ ...good, tokenUsage: { input: '120' } }).ok).toBe(false);
+    expect(validateSessionRecord({ ...good, tokenUsage: { input: NaN } }).ok).toBe(false);
+    expect(validateSessionRecord({ ...good, tokenUsage: { input: Infinity } }).ok).toBe(false);
+    expect(validateSessionRecord({ ...good, tokenUsage: { input: null } }).ok).toBe(false);
+    expect(validateSessionRecord({ ...good, tokenUsage: { nested: { deep: 1 } as unknown as number } }).ok).toBe(false);
+  });
 });
 
 describe('SessionStore — trusted boundary (P0-2 negative paths)', () => {

@@ -244,8 +244,19 @@ export function validateSessionRecord(
   if (typeof r['agentState'] === 'string' && !AGENT_STATES.has(r['agentState'])) {
     return { ok: false, error: 'agentState 取值非法' };
   }
-  if (r['tokenUsage'] !== null && (typeof r['tokenUsage'] !== 'object' || Array.isArray(r['tokenUsage']))) {
-    return { ok: false, error: 'tokenUsage 字段非法' };
+  if (r['tokenUsage'] !== null) {
+    const usage = r['tokenUsage'];
+    if (typeof usage !== 'object' || usage === null || Array.isArray(usage)) {
+      return { ok: false, error: 'tokenUsage 字段非法' };
+    }
+    // Per-value guard: the map is force-cast to Record<string, number>, so
+    // every value must actually be a finite number — a NaN/Infinity/string
+    // value would otherwise ride along unvalidated.
+    for (const value of Object.values(usage)) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return { ok: false, error: 'tokenUsage 字段非法' };
+      }
+    }
   }
   if (!Array.isArray(r['items'])) {
     return { ok: false, error: 'items 不是数组' };

@@ -17,15 +17,16 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   describeSessionError,
   sessionDeleteFailedCopy,
+  sessionOpFailedCopy,
   sessionSaveFailedCopy
 } from '../../../shared/error-copy';
 import type { SessionRecord, SessionSummary } from '../../../shared/session';
+import { toSessionItems, type ChatModel, type RunPhase } from '../chat/model';
 import {
-  fromSessionItems,
-  toSessionItems,
-  type ChatModel,
-  type RunPhase
-} from '../chat/model';
+  createSessionWithCheckpoint,
+  modelFromRecord,
+  switchSessionWithCheckpoint
+} from './session-transition';
 
 export interface SessionStoreValue {
   summaries: SessionSummary[];
@@ -47,10 +48,20 @@ export interface SessionStoreValue {
   /** Persist the current ChatModel + metadata as the active session. Returns
    *  an error string on failure instead of silently swallowing it. */
   persist: (model: ChatModel, meta: SessionPersistMeta) => Promise<string | null>;
-  /** Create a new (empty) session and switch to it; returns the fresh ChatModel. */
-  create: (title?: string) => Promise<ChatModel>;
-  /** Switch to an existing session; returns its rehydrated ChatModel. */
-  switchTo: (id: string, currentModel: ChatModel, meta: SessionPersistMeta) => Promise<ChatModel>;
+  /**
+   * Create a new (empty) session and switch to it. The outgoing session is
+   * checkpointed FIRST; if that checkpoint fails, creation is aborted (the
+   * current active id/model stay put) and `null` is returned — a failed save
+   * must never discard unsaved conversation state.
+   */
+  create: (currentModel: ChatModel, meta: SessionPersistMeta, title?: string) => Promise<ChatModel | null>;
+  /**
+   * Switch to an existing session; returns its rehydrated ChatModel. Same
+   * abort semantics as {@link create}: when the outgoing session cannot be
+   * checkpointed, the switch is aborted and `null` is returned so the caller
+   * keeps the current (unsaved) model on screen.
+   */
+  switchTo: (id: string, currentModel: ChatModel, meta: SessionPersistMeta) => Promise<ChatModel | null>;
   /** Delete a session; if it was active, switches to the next one. Returns an
    *  error string on failure instead of silently swallowing it. */
   remove: (id: string) => Promise<string | null>;
@@ -160,13 +171,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     // SessionRecord without an async round-trip.
     lastBaseRef.current = result.record;
     setActiveTitle(result.record.title);
-    return {
-      items: fromSessionItems(result.record.items),
-      phase: 'idle', // never auto-resume a running task
-      changes: result.record.items
-        .filter((i) => i.kind === 'file_changed')
-        .map((i) => ({ id: i.id, path: i.path ?? '', change: (i.change as 'added' | 'modified' | 'deleted') ?? 'modified' }))
-    };
+    return modelFromRecord(result.record);
   }, [activeId]);
 
   const persist = useCallback(async (model: ChatModel, meta: SessionPersistMeta): Promise<string | null> => {
@@ -205,47 +210,73 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     return null;
   }, [activeId, activeTitle, refreshList]);
 
-  const create = useCallback(async (title?: string): Promise<ChatModel> => {
-    const { result, record } = await window.desktop.createSession(title);
-    if (!result.ok || !record) return EMPTY_MODEL;
-    setActiveId(record.id);
-    setActiveTitle(record.title);
-    setSummaries((prev) => [
-      { id: record.id, title: record.title, createdAt: record.createdAt, updatedAt: record.updatedAt, active: true },
-      ...prev.map((s) => ({ ...s, active: false }))
-    ]);
-    freshlyCreatedRef.current = true;
-    hydratedRef.current = true;
-    lastBaseRef.current = record;
-    setLoaded(true);
-    return EMPTY_MODEL;
-  }, []);
+  // §15/AC-12 (review round 2): creating or switching sessions checkpoints the
+  // OUTGOING session first; a failed checkpoint aborts the whole transition —
+  // no new session is created, no switch happens, and the current model stays
+  // on screen. The orchestration lives in session-transition.ts so the exact
+  // ordering (persist → create/activate → load → apply) is unit-testable.
+  const create = useCallback(
+    async (currentModel: ChatModel, meta: SessionPersistMeta, title?: string): Promise<ChatModel | null> => {
+      const outcome = await createSessionWithCheckpoint(
+        {
+          persistOutgoing: () => (activeId ? persist(currentModel, meta) : Promise.resolve(null)),
+          createNew: (t?: string) => window.desktop.createSession(t),
+          activate: () => Promise.resolve({ ok: true }),
+          load: () => Promise.resolve({ ok: false }),
+          onCreated: (record) => {
+            setActiveId(record.id);
+            setActiveTitle(record.title);
+            setSummaries((prev) => [
+              { id: record.id, title: record.title, createdAt: record.createdAt, updatedAt: record.updatedAt, active: true },
+              ...prev.map((s) => ({ ...s, active: false }))
+            ]);
+            freshlyCreatedRef.current = true;
+            hydratedRef.current = true;
+            lastBaseRef.current = record;
+            setLoaded(true);
+            setLastError(null);
+          },
+          onSwitched: () => {}
+        },
+        title
+      );
+      if (outcome.status === 'aborted' && outcome.stage === 'create') {
+        // persist-stage failures already surfaced their own §32 banner inside
+        // persist(); only a failed create itself needs framing here.
+        setLastError(describeSessionError(sessionOpFailedCopy('新建', outcome.error)));
+      }
+      return outcome.status === 'completed' ? outcome.model : null;
+    },
+    [activeId, persist]
+  );
 
   const switchTo = useCallback(
-    async (id: string, currentModel: ChatModel, meta: SessionPersistMeta): Promise<ChatModel> => {
-      // Save the outgoing session first so its transcript is not lost.
-      if (activeId && activeId !== id) {
-        await persist(currentModel, meta);
+    async (id: string, currentModel: ChatModel, meta: SessionPersistMeta): Promise<ChatModel | null> => {
+      const outcome = await switchSessionWithCheckpoint(
+        {
+          persistOutgoing: () =>
+            activeId && activeId !== id ? persist(currentModel, meta) : Promise.resolve(null),
+          createNew: () => Promise.resolve({ result: { ok: false } }),
+          activate: (target: string) => window.desktop.switchSession(target),
+          load: (target: string) => window.desktop.loadSession(target),
+          onCreated: () => {},
+          onSwitched: (target: string, record) => {
+            setActiveId(target);
+            setSummaries((prev) => prev.map((s) => ({ ...s, active: s.id === target })));
+            freshlyCreatedRef.current = false;
+            hydratedRef.current = false;
+            if (record) {
+              lastBaseRef.current = record;
+              setActiveTitle(record.title);
+            }
+          }
+        },
+        id
+      );
+      if (outcome.status === 'aborted' && outcome.stage === 'activate') {
+        setLastError(describeSessionError(sessionOpFailedCopy('切换', outcome.error)));
       }
-      const result = await window.desktop.switchSession(id);
-      if (!result.ok) return EMPTY_MODEL;
-      setActiveId(id);
-      setSummaries((prev) => prev.map((s) => ({ ...s, active: s.id === id })));
-      freshlyCreatedRef.current = false;
-      hydratedRef.current = false;
-      const loaded = await window.desktop.loadSession(id);
-      if (loaded.ok && loaded.record) {
-        lastBaseRef.current = loaded.record;
-        setActiveTitle(loaded.record.title);
-        return {
-          items: fromSessionItems(loaded.record.items),
-          phase: 'idle',
-          changes: loaded.record.items
-            .filter((i) => i.kind === 'file_changed')
-            .map((i) => ({ id: i.id, path: i.path ?? '', change: (i.change as 'added' | 'modified' | 'deleted') ?? 'modified' }))
-        };
-      }
-      return EMPTY_MODEL;
+      return outcome.status === 'completed' ? outcome.model : null;
     },
     [activeId, persist]
   );

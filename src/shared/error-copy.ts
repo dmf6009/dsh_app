@@ -150,6 +150,21 @@ export function sessionDeleteFailedCopy(detail?: string): ErrorCopy {
 }
 
 /**
+ * Copy for a create/switch transition that failed at the store level (the
+ * outgoing checkpoint already succeeded at this point, so unlike a save
+ * failure the conversation IS safely on disk).
+ */
+export function sessionOpFailedCopy(op: '新建' | '切换', detail?: string): ErrorCopy {
+  return {
+    scenario: 'session_persist',
+    what: `会话${op}失败`,
+    why: '当前会话已成功保存，但目标会话操作未完成，界面仍停留在当前会话。',
+    action: '请重试该操作；若持续失败，请检查磁盘空间与 ~/.dsh/desktop 目录权限。',
+    detail
+  };
+}
+
+/**
  * Single-string projection of a session persistence error (same shape as the
  * chat layer's `describeError`): 发生了什么 / 原因 / 建议 / 原始信息, one per
  * line, so a copy/paste into a bug report keeps the diagnostics.

@@ -33,7 +33,7 @@ import { useChanges } from '../changes/changes-store';
 import { badgeTitle, changedFiles, showRunSummary, summaryLabel } from '../changes/model';
 import { useSessionStore } from '../session/session-store';
 import { runSubmit } from '../session/submit-flow';
-import { shouldApplyHydratedModel } from '../session/session-transition';
+import { HydrationGuard } from '../session/session-transition';
 import {
   INITIAL_MODEL,
   reduceChat,
@@ -85,6 +85,15 @@ export default function WorkspacePage(): JSX.Element {
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<ChatModel>(INITIAL_MODEL);
   modelRef.current = model;
+  /**
+   * Hydration race guard (§15/AC-12, review round 4): a hydration result may
+   * only replace the model if nothing mutated the model since the request was
+   * issued. Chat actions, create/switch model applications and send-failure
+   * notices each call noteMutation(); this is what stops a late empty snapshot
+   * from wiping a just-dispatched first message WITHOUT blocking legitimate
+   * replacements of a stale (deleted/previous) session's model.
+   */
+  const hydrationGuardRef = useRef<HydrationGuard>(new HydrationGuard());
 
   /* ---- aggregated Changes (DSHA-6) ------------------------------------ */
 
@@ -96,6 +105,9 @@ export default function WorkspacePage(): JSX.Element {
     : null;
 
   const dispatch = useCallback((action: Parameters<typeof reduceChat>[1]): void => {
+    // Every chat action mutates the live model → invalidates any in-flight
+    // hydration request (HydrationGuard, §15/AC-12 race protection).
+    hydrationGuardRef.current.noteMutation();
     setModel((prev) => reduceChat(prev, action));
   }, []);
 
@@ -126,15 +138,16 @@ export default function WorkspacePage(): JSX.Element {
   useEffect(() => {
     if (!sessionLoaded) return;
     let cancelled = false;
+    // §15/AC-12 竞态防护（review round 4）：hydrate 结果仅在「请求发出后内存
+    // 模型未被任何非 hydrate 变更改动」时才可应用。判定基于请求代次而非
+    // 「内存是否为空」——删除活动会话后内存仍保留被删会话的非空模型，
+    // fallback 快照必须能够替换它；而请求期间新 dispatch 的消息又绝不能被
+    // 迟到的空快照抹掉。effect 的 cancelled 清理继续承担「active id 已变、
+    // 请求被取代」的第一道防线。时序见 tests/session-first-message.test.ts。
+    const epoch = hydrationGuardRef.current.request();
     void sessionHydrate().then((restored) => {
       if (cancelled || restored === null) return;
-      // AC-12 首条消息防覆盖：新建 Session 后组件挂载会触发一次 hydrate。若
-      // 此刻内存里已有内容（用户刚发送首条消息、或其任何派生状态），说明
-      // hydrate 的磁盘快照相对内存是陈旧的——直接应用会把尚未落盘的对话
-      // 整体抹掉（QA 抓到的首条消息丢失）。仅当内存仍是初始空模型时才应用
-      // 快照；否则保留内存状态，由 run 终止 / 导航 / 卸载 / 关闭的
-      // checkpoint 负责落盘。时序见 tests/session-first-message.test.ts。
-      if (!shouldApplyHydratedModel(modelRef.current)) return;
+      if (!hydrationGuardRef.current.canApply(epoch)) return;
       setModel(restored);
     });
     return () => { cancelled = true; };
@@ -263,6 +276,7 @@ export default function WorkspacePage(): JSX.Element {
         },
         onWorkspaceActivated: (path) => appDispatch({ type: 'workspace', path }),
         onSessionCreated: (model) => {
+          hydrationGuardRef.current.noteMutation();
           setModel(model);
           lastPhaseRef.current = 'idle';
         },
@@ -278,7 +292,8 @@ export default function WorkspacePage(): JSX.Element {
         },
         onSendFailed: (error) => {
           // No run actually started — release the lock and surface the error
-          // (pre-existing behavior, unchanged).
+          // (pre-existing behavior, unchanged). A model mutation all the same.
+          hydrationGuardRef.current.noteMutation();
           setModel((prev) => ({
             ...prev,
             phase: 'idle',
@@ -317,6 +332,7 @@ export default function WorkspacePage(): JSX.Element {
     // so unsaved conversation state is never discarded (§15/AC-12).
     const restored = await sessions.create(modelRef.current, persistMeta());
     if (restored === null) return;
+    hydrationGuardRef.current.noteMutation();
     setModel(restored);
     lastPhaseRef.current = 'idle';
   }, [running, sessions, persistMeta]);
@@ -327,6 +343,7 @@ export default function WorkspacePage(): JSX.Element {
     // current (unsaved) session instead of silently replacing the model.
     const restored = await sessions.switchTo(id, modelRef.current, persistMeta());
     if (restored === null) return;
+    hydrationGuardRef.current.noteMutation();
     setModel(restored);
     lastPhaseRef.current = 'idle';
   }, [running, sessions, persistMeta]);

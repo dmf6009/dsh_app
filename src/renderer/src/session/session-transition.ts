@@ -97,14 +97,43 @@ export function resolveHydration(
 }
 
 /**
- * Whether a hydration pass may REPLACE the live model. Only a pristine live
- * model (no items, no changes, idle) may be replaced: anything else means the
- * user has live, possibly unpersisted state — e.g. the first dispatched
- * message of a just-created session — and a disk snapshot resolving late must
- * never wipe it (AC-12, QA round 3 regression).
+ * Session-identity race guard for hydration (DSHA-7 review round 4).
+ *
+ * The round-3 guard rejected ANY non-empty live model, which wrongly blocked
+ * legitimate replacements — e.g. after deleting the active session the page
+ * keeps the deleted session's non-empty model and relies on hydration to load
+ * the fallback session. The correct discriminator is not "is the model empty"
+ * but "did the live model MUTATE since the hydration request was issued":
+ *
+ *   - request() captures an epoch when a hydration pass starts;
+ *   - noteMutation() is called on every NON-hydration model mutation (chat
+ *     dispatch, create/switch model application, send-failure notice);
+ *   - canApply(epoch) is true only when nothing mutated in between.
+ *
+ * Consequences: a first message dispatched while a fresh hydration is in
+ * flight bumps the epoch → the stale empty snapshot is dropped (the round-3
+ * bug), while a stale model left over from a DELETED or PREVIOUS session has
+ * NOT mutated → the legitimate fallback/existing snapshot still replaces it
+ * (the round-4 requirement). The effect's own cancellation flag remains the
+ * first line of defense for "active id changed → request superseded".
  */
-export function shouldApplyHydratedModel(live: ChatModel): boolean {
-  return live.items.length === 0 && live.changes.length === 0 && live.phase === 'idle';
+export class HydrationGuard {
+  private epoch = 0;
+
+  /** Record a non-hydration mutation of the live model. */
+  noteMutation(): void {
+    this.epoch += 1;
+  }
+
+  /** Epoch captured when a hydration request is issued. */
+  request(): number {
+    return this.epoch;
+  }
+
+  /** May a result requested at `epoch` still be applied? */
+  canApply(epoch: number): boolean {
+    return epoch === this.epoch;
+  }
 }
 
 /**

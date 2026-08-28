@@ -239,12 +239,15 @@ export default function WorkspacePage(): JSX.Element {
     // 工作区上下文一致性 + 首条消息会话建立（§15/AC-02/AC-12）：先让主进程激活
     // workspace，再创建 Session，最后发送。激活/创建失败则不发送并给出准确三段式
     // 提示；绝不退回「无会话静默发送」的旧降级。时序编排见 session/submit-flow.ts。
+    // 输入框清空由编排内部的 clearInput 控制——仅在消息实际 dispatch 时清空，
+    // 被阻断（无工作区/激活失败/创建中止）时保留原输入，本函数不得另行改写 input。
     await runSubmit(
       {
         workspaceRoot: () => appState.workspaceRoot,
         hasActiveSession: () => sessions.activeId !== null,
         activateWorkspace: (path) => window.desktop.ensureWorkspaceActive(path),
         createSession: (title) => sessions.create(modelRef.current, persistMeta(), title),
+        clearInput: () => setInput(''),
         sendMessage: (message) => {
           // The user message goes on screen optimistically, then the run starts.
           dispatch({ type: 'send', text: message });
@@ -257,14 +260,15 @@ export default function WorkspacePage(): JSX.Element {
         },
         onBlocked: (notice) => {
           // No workspace context (or activation failed) — accurate §32 copy,
-          // never a bare store error string.
+          // never a bare store error string. The input is NOT touched here:
+          // preservation is the flow's default (no clearInput call).
           sessions.surfaceError(
             notice === '未打开工作区'
               ? describeSessionError(workspaceNotOpenCopy())
               : describeSessionError(workspaceActivationFailedCopy(notice))
           );
-          setInput(text); // keep the user's message so it is not lost
-        },        onSendFailed: (error) => {
+        },
+        onSendFailed: (error) => {
           // No run actually started — release the lock and surface the error
           // (pre-existing behavior, unchanged).
           setModel((prev) => ({
@@ -284,7 +288,6 @@ export default function WorkspacePage(): JSX.Element {
       },
       text
     );
-    setInput('');
   }, [input, canSend, dispatch, sessions, persistMeta, appState.workspaceRoot, appDispatch]);
 
   const stop = useCallback(async (): Promise<void> => {

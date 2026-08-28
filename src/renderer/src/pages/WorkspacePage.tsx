@@ -32,6 +32,7 @@ import { useApp } from '../store/app-store';
 import { useChanges } from '../changes/changes-store';
 import { badgeTitle, changedFiles, showRunSummary, summaryLabel } from '../changes/model';
 import { useSessionStore } from '../session/session-store';
+import { useSessionHydration } from '../session/use-session-hydration';
 import { runSubmit } from '../session/submit-flow';
 import { HydrationGuard } from '../session/session-transition';
 import {
@@ -129,12 +130,9 @@ export default function WorkspacePage(): JSX.Element {
   // depending on `sessions` itself would re-trigger hydration endlessly and
   // wipe freshly dispatched messages with post-dispatch re-hydrations).
   const {
-    loaded: sessionLoaded,
     activeId: sessionActiveId,
-    hydrate: sessionHydrate,
     persist: sessionPersist,
-    flush: sessionFlush,
-    noteDisplayedFor: sessionNoteDisplayedFor
+    flush: sessionFlush
   } = sessions;
 
   /* ---- Hydration transition state (UI/UE 验收) ---------------------- *
@@ -159,30 +157,11 @@ export default function WorkspacePage(): JSX.Element {
   }, [sessionActiveId, appState.workspaceRoot, sessionFlush, persistMeta]);
 
   // Hydrate the active session once it's loaded (and when the active id
-  // changes due to a switch). Never auto-resume a running task.
-  useEffect(() => {
-    if (!sessionLoaded) return;
-    let cancelled = false;
-    // §15/AC-12 竞态防护（review round 4）：hydrate 结果仅在「请求发出后内存
-    // 模型未被任何非 hydrate 变更改动」时才可应用。判定基于请求代次而非
-    // 「内存是否为空」——删除活动会话后内存仍保留被删会话的非空模型，
-    // fallback 快照必须能够替换它；而请求期间新 dispatch 的消息又绝不能被
-    // 迟到的空快照抹掉。effect 的 cancelled 清理继续承担「active id 已变、
-    // 请求被取代」的第一道防线。时序见 tests/session-first-message.test.ts。
-    const epoch = hydrationGuardRef.current.request();
-    void sessionHydrate().then((restored) => {
-      if (cancelled) return; // superseded (active id moved on) — result dropped
-      if (restored !== null && hydrationGuardRef.current.canApply(epoch)) {
-        setModel(restored);
-        // The applied snapshot now belongs to the session it was requested for.
-        sessionNoteDisplayedFor(sessionActiveId);
-      }
-      // A null result (freshly-created session) keeps the live model, which
-      // already belongs to the active session.
-      if (restored === null) sessionNoteDisplayedFor(sessionActiveId);
-    });
-    return () => { cancelled = true; };
-  }, [sessionLoaded, sessionActiveId, sessionHydrate, sessionNoteDisplayedFor]);
+  // changes due to a switch). Never auto-resume a running task. The exact
+  // production wiring (epoch → hydrate → cancelled/guard decision → apply +
+  // attribution → settle AFTER the decision) lives in use-session-hydration.ts
+  // so it is testable against the real hook with deferred desktop promises.
+  useSessionHydration(sessions, setModel, hydrationGuardRef);
 
   // Persist on run termination (done / run_completed / run_cancelled / error).
   const lastPhaseRef = useRef<RunPhase>('idle');
@@ -387,7 +366,7 @@ export default function WorkspacePage(): JSX.Element {
     // The active session is saved by the user before this; deleting the
     // active one lets the hydrate effect load the fallback when activeId flips.
     await sessions.remove(id);
-  }, [running, sessions]);
+  }, [running, sessionTransitioning, sessions]);
 
   /* ---- responsive drawers (#5) ---------------------------------------
    * Below 960px the side columns become off-canvas drawers: the middle

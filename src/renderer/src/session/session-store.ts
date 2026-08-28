@@ -68,6 +68,13 @@ export interface SessionStoreValue {
    * to the previous session.
    */
   noteDisplayedFor: (id: string | null) => void;
+  /**
+   * Settle the hydration request issued for `requestId`: the busy transition
+   * ends here — AFTER the caller has decided to apply or drop the result.
+   * Identity-safe: a late settle cannot unlock a newer transition. A null id
+   * is a no-op (no request was issued for it).
+   */
+  settleHydration: (requestId: string | null) => void;
   /** Rehydrate the ChatModel from the active persisted session. */
   hydrate: () => Promise<ChatModel | null>;
   /** Persist the current ChatModel + metadata as the active session. Returns
@@ -132,6 +139,18 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
    */
   const [hydratingFor, setHydratingFor] = useState<string | null>(null);
   const [displayedFor, setDisplayedFor] = useState<string | null>(null);
+  /**
+   * The session id whose load request is still CURRENT. When `activeId` moves
+   * on (switch/delete/new create) while a load is in flight, this ref keeps
+   * the old id so the late result is recognized as superseded and dropped
+   * inside hydrate() itself — independent of the page-side guard.
+   */
+  const cancelledHydrationRef = useRef<string | null>(null);
+  /** Last workspaceRoot seen by the bootstrap effect (change detection). */
+  const workspaceRootRef = useRef<string | null>(null);
+  /** Live mirror of activeId for the bootstrap's identity reset. */
+  const activeIdRef = useRef<string | null>(null);
+  activeIdRef.current = activeId;
   /** Track whether a session was just created (so we skip saving the empty
    * prior one on the first persist cycle). */
   const freshlyCreatedRef = useRef(false);
@@ -155,15 +174,26 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
 
   // Reload the list whenever the workspace changes.
   useEffect(() => {
-    if (!workspaceRoot) {
+    // Entering (or leaving) a workspace IMMEDIATELY voids the previous
+    // workspace's session identity: a late load from the old workspace must
+    // be recognized as superseded, and the stale active id/title/displayed
+    // model must never survive into the new workspace's state (a later flush
+    // with the new root would otherwise carry the old session's identity).
+    // Runs ONLY on a workspaceRoot change (tracked via ref, not effect deps —
+    // activeId flips on every switch/delete/create and must NOT re-bootstrap).
+    const previousRoot = workspaceRootRef.current;
+    workspaceRootRef.current = workspaceRoot;
+    if (previousRoot !== workspaceRoot) {
+      cancelledHydrationRef.current = activeIdRef.current;
       setSummaries([]);
       setActiveId(null);
       setActiveTitle(null);
-      setLoaded(false);
-      // Workspace closed/switched: any in-flight hydration is void and the
-      // displayed model belongs to nothing — reset both (no stuck loading).
-      setHydratingFor(null);
       setDisplayedFor(null);
+      lastBaseRef.current = null;
+    }
+    if (!workspaceRoot) {
+      setLoaded(false);
+      setHydratingFor(null);
       return;
     }
     let cancelled = false;
@@ -178,6 +208,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
       setSummaries(list);
       const id = active.id;
       setActiveId(id);
+      cancelledHydrationRef.current = id; // this id's loads are now current
       const activeSummary = list.find((s) => s.id === id);
       setActiveTitle(activeSummary?.title ?? null);
       setLoaded(Boolean(id));
@@ -192,6 +223,8 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
       setSummaries([]);
       setLoaded(false);
       setHydratingFor(null); // failed bootstrap never stays busy
+      // The old workspace's identity was already reset above; a failed
+      // bootstrap leaves NO active session rather than a stale one.
     });
     return () => {
       cancelled = true;
@@ -208,17 +241,21 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     // Mark the hydration in flight for THIS id (supersedes any earlier mark,
     // including the workspace bootstrap's 'pending-workspace').
     setHydratingFor(activeId);
+    if (freshlyCreatedRef.current) {
+      // A brand-new session: nothing exists on disk, and the LIVE model is the
+      // truth — possibly holding the first dispatched message that has not
+      // been checkpointed yet. resolveHydration returns null so the caller
+      // keeps it (the old EMPTY_MODEL return silently wiped that message).
+      freshlyCreatedRef.current = false;
+      hydratedRef.current = true;
+      // NOTE: the busy mark is NOT cleared here — the caller owns the settle
+      // (see `settleHydration`): the transition ends only after the page has
+      // decided to apply or drop the result, never before.
+      return resolveHydration(true, null);
+    }
     try {
-      if (freshlyCreatedRef.current) {
-        // A brand-new session: nothing exists on disk, and the LIVE model is the
-        // truth — possibly holding the first dispatched message that has not
-        // been checkpointed yet. resolveHydration returns null so the caller
-        // keeps it (the old EMPTY_MODEL return silently wiped that message).
-        freshlyCreatedRef.current = false;
-        hydratedRef.current = true;
-        return resolveHydration(true, null);
-      }
       const result = await window.desktop.loadSession(activeId);
+      if (cancelledHydrationRef.current !== activeId) return null; // superseded
       hydratedRef.current = true;
       if (!result.ok || !result.record) {
         // Corrupt or missing — start fresh so the panel still works.
@@ -230,13 +267,27 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
       lastBaseRef.current = result.record;
       setActiveTitle(result.record.title);
       return resolveHydration(false, result.record);
-    } finally {
-      // Always clear the busy mark — success, failure and a corrupt/missing
-      // record all end the transition; the page additionally drops superseded
-      // results via the HydrationGuard before applying them.
-      setHydratingFor((current) => (current === activeId ? null : current));
+    } catch {
+      // A failed load is a corrupt-equivalent fallback: settle with the empty
+      // rest model (still owned by the caller's settle decision below).
+      return resolveHydration(false, null);
     }
   }, [activeId]);
+
+  /**
+   * Settle a hydration request (review round: settle ownership). The busy
+   * transition ends HERE — when the page has finished deciding whether to
+   * apply or drop the result — not inside hydrate()'s finally, which runs
+   * before the caller's guard check and would unlock (and drop the
+   * attribution banner) while the old transcript is still on screen.
+   *
+   * `requestId` is the id the hydration was issued for; a settle only clears
+   * its own mark, so a late completion cannot unlock a newer transition.
+   */
+  const settleHydration = useCallback((requestId: string | null): void => {
+    if (requestId === null) return;
+    setHydratingFor((current) => (current === requestId ? null : current));
+  }, []);
 
   const persist = useCallback(async (model: ChatModel, meta: SessionPersistMeta): Promise<string | null> => {
     if (!activeId || !meta.workspaceRoot) return null;
@@ -289,6 +340,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
           load: () => Promise.resolve({ ok: false }),
           onCreated: (record) => {
             setActiveId(record.id);
+            cancelledHydrationRef.current = record.id; // supersedes any old load
             setActiveTitle(record.title);
             // The fresh session's model is applied by the page right after
             // create returns; nothing needs hydrating (freshly-created no-op).
@@ -335,6 +387,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
           onCreated: () => {},
           onSwitched: (target: string, record) => {
             setActiveId(target);
+            cancelledHydrationRef.current = target; // supersedes any old load
             setSummaries((prev) => prev.map((s) => ({ ...s, active: s.id === target })));
             freshlyCreatedRef.current = false;
             hydratedRef.current = false;
@@ -381,6 +434,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
       if (id === activeId) {
         const next = list[0] ?? null;
         setActiveId(next?.id ?? null);
+        cancelledHydrationRef.current = next?.id ?? null; // supersedes the deleted id's load
         setActiveTitle(next?.title ?? null);
         setLoaded(Boolean(next));
         freshlyCreatedRef.current = false;
@@ -441,6 +495,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     dismissError,
     surfaceError,
     noteDisplayedFor,
+    settleHydration,
     hydrate,
     persist,
     create,

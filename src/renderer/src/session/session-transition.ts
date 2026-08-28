@@ -79,6 +79,35 @@ export function modelFromRecord(record: SessionRecord | null | undefined): ChatM
 }
 
 /**
+ * Decide what a hydration pass may apply to the live model (DSHA-7 QA round 3:
+ * a freshly created session's async hydrate used to resolve an EMPTY model
+ * that overwrote the first, still-unpersisted user message — AC-12 loss).
+ *
+ * A freshly created session has NOTHING on disk: hydration is a no-op and
+ * returns null so the caller keeps the live (possibly mid-dispatch) model.
+ * An existing session projects its record as usual; a corrupt/missing record
+ * degrades to the empty at-rest model so the panel still works.
+ */
+export function resolveHydration(
+  freshlyCreated: boolean,
+  record: SessionRecord | null | undefined
+): ChatModel | null {
+  if (freshlyCreated) return null;
+  return modelFromRecord(record ?? null);
+}
+
+/**
+ * Whether a hydration pass may REPLACE the live model. Only a pristine live
+ * model (no items, no changes, idle) may be replaced: anything else means the
+ * user has live, possibly unpersisted state — e.g. the first dispatched
+ * message of a just-created session — and a disk snapshot resolving late must
+ * never wipe it (AC-12, QA round 3 regression).
+ */
+export function shouldApplyHydratedModel(live: ChatModel): boolean {
+  return live.items.length === 0 && live.changes.length === 0 && live.phase === 'idle';
+}
+
+/**
  * Create flow. Order: persist outgoing → create → onCreated → empty model.
  * Abort stages: `persist` (outgoing checkpoint failed — nothing was mutated),
  * `create` (the store refused to create; outgoing was saved but no switch).

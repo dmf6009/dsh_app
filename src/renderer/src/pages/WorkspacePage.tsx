@@ -33,6 +33,7 @@ import { useChanges } from '../changes/changes-store';
 import { badgeTitle, changedFiles, showRunSummary, summaryLabel } from '../changes/model';
 import { useSessionStore } from '../session/session-store';
 import { runSubmit } from '../session/submit-flow';
+import { shouldApplyHydratedModel } from '../session/session-transition';
 import {
   INITIAL_MODEL,
   reduceChat,
@@ -127,6 +128,13 @@ export default function WorkspacePage(): JSX.Element {
     let cancelled = false;
     void sessionHydrate().then((restored) => {
       if (cancelled || restored === null) return;
+      // AC-12 首条消息防覆盖：新建 Session 后组件挂载会触发一次 hydrate。若
+      // 此刻内存里已有内容（用户刚发送首条消息、或其任何派生状态），说明
+      // hydrate 的磁盘快照相对内存是陈旧的——直接应用会把尚未落盘的对话
+      // 整体抹掉（QA 抓到的首条消息丢失）。仅当内存仍是初始空模型时才应用
+      // 快照；否则保留内存状态，由 run 终止 / 导航 / 卸载 / 关闭的
+      // checkpoint 负责落盘。时序见 tests/session-first-message.test.ts。
+      if (!shouldApplyHydratedModel(modelRef.current)) return;
       setModel(restored);
     });
     return () => { cancelled = true; };

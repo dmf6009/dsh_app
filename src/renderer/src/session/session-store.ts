@@ -24,7 +24,7 @@ import type { SessionRecord, SessionSummary } from '../../../shared/session';
 import { toSessionItems, type ChatModel, type RunPhase } from '../chat/model';
 import {
   createSessionWithCheckpoint,
-  modelFromRecord,
+  resolveHydration,
   switchSessionWithCheckpoint
 } from './session-transition';
 
@@ -99,8 +99,6 @@ function toRecordPatch(model: ChatModel, meta: SessionPersistMeta): Pick<Session
   };
 }
 
-const EMPTY_MODEL: ChatModel = { items: [], phase: 'idle', changes: [] };
-
 export function useSessionStore(workspaceRoot: string | null): SessionStoreValue {
   const [summaries, setSummaries] = useState<SessionSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -165,23 +163,26 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
   const hydrate = useCallback(async (): Promise<ChatModel | null> => {
     if (!activeId) return null;
     if (freshlyCreatedRef.current) {
-      // A brand-new session: nothing on disk to load, start empty.
+      // A brand-new session: nothing exists on disk, and the LIVE model is the
+      // truth — possibly holding the first dispatched message that has not
+      // been checkpointed yet. resolveHydration returns null so the caller
+      // keeps it (the old EMPTY_MODEL return silently wiped that message).
       freshlyCreatedRef.current = false;
       hydratedRef.current = true;
-      return EMPTY_MODEL;
+      return resolveHydration(true, null);
     }
     const result = await window.desktop.loadSession(activeId);
     hydratedRef.current = true;
     if (!result.ok || !result.record) {
       // Corrupt or missing — start fresh so the panel still works.
       lastBaseRef.current = null;
-      return EMPTY_MODEL;
+      return resolveHydration(false, null);
     }
     // Cache the loaded record so a synchronous flush() can build a complete
     // SessionRecord without an async round-trip.
     lastBaseRef.current = result.record;
     setActiveTitle(result.record.title);
-    return modelFromRecord(result.record);
+    return resolveHydration(false, result.record);
   }, [activeId]);
 
   const persist = useCallback(async (model: ChatModel, meta: SessionPersistMeta): Promise<string | null> => {

@@ -37,6 +37,29 @@ export type TransitionOutcome =
   | { status: 'completed'; model: ChatModel }
   | { status: 'aborted'; stage: 'persist' | 'create' | 'activate'; error?: string };
 
+export interface ActivateOutcome {
+  ok: boolean;
+  /** Canonical activated path (normalized by the main process) on success. */
+  path?: string;
+  error?: string;
+}
+
+/**
+ * 工作区上下文一致性（DSHA-7 QA 回归修复）：renderer 已有 workspaceRoot 而主进程
+ * currentRoot 尚未同步时，先让主进程激活该 workspace，再允许 session:create 与
+ * runtime:send。激活失败则发送中止并返回错误——绝不退回 fallback root 静默发送
+ * （那会让会话落到错误的目录，破坏 §15 local-first 持久化）。
+ */
+export async function ensureWorkspaceActive(
+  workspaceRoot: string | null,
+  activate: (path: string) => Promise<ActivateOutcome>
+): Promise<ActivateOutcome> {
+  if (workspaceRoot === null || workspaceRoot.trim() === '') {
+    return { ok: false, error: '未打开工作区' };
+  }
+  return activate(workspaceRoot);
+}
+
 const EMPTY_MODEL: ChatModel = { items: [], phase: 'idle', changes: [] };
 
 /** Project a loaded record into the at-rest ChatModel shown after a switch. */

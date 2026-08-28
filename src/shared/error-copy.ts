@@ -150,16 +150,50 @@ export function sessionDeleteFailedCopy(detail?: string): ErrorCopy {
 }
 
 /**
- * Copy for a create/switch transition that failed at the store level (the
- * outgoing checkpoint already succeeded at this point, so unlike a save
- * failure the conversation IS safely on disk).
+ * Copy for a create/switch transition that failed at the store level. When
+ * `savedOutgoing` is false there was no outgoing session to save (first-ever
+ * create), so the copy must NOT claim the current session was saved.
  */
-export function sessionOpFailedCopy(op: '新建' | '切换', detail?: string): ErrorCopy {
+export function sessionOpFailedCopy(
+  op: '新建' | '切换',
+  detail?: string,
+  savedOutgoing = true
+): ErrorCopy {
+  if (!savedOutgoing) {
+    return {
+      scenario: 'session_persist',
+      what: `会话${op}失败`,
+      why: '当前没有已打开的会话需要保存，新会话也未能创建，因此消息未被发送。',
+      action: '请确认已打开工作区后重试；若持续失败，请检查磁盘空间与 ~/.dsh/desktop 目录权限。',
+      detail
+    };
+  }
   return {
     scenario: 'session_persist',
     what: `会话${op}失败`,
     why: '当前会话已成功保存，但目标会话操作未完成，界面仍停留在当前会话。',
     action: '请重试该操作；若持续失败，请检查磁盘空间与 ~/.dsh/desktop 目录权限。',
+    detail
+  };
+}
+
+/** Copy for the composer with no workspace context at all (§3.3/§7.1). */
+export function workspaceNotOpenCopy(): ErrorCopy {
+  return {
+    scenario: 'session_persist',
+    what: '未打开工作区',
+    why: '当前没有已打开的工作区，无法创建会话或发送任务。',
+    action: '请回到首页通过「打开项目」选择一个目录，或在最近项目列表中选择一个可用的工作区。'
+  };
+}
+
+/** Copy for a workspace whose activation in the main process failed. */
+export function workspaceActivationFailedCopy(detail?: string): ErrorCopy {
+  return {
+    scenario: 'session_persist',
+    what: '工作区激活失败',
+    why: '无法在主进程中打开当前工作区，因此未能创建会话，消息未被发送（已保留在输入框中）。',
+    action: '请确认该目录仍然存在且可访问后重试；若持续失败，请回到首页重新打开该项目。',
     detail
   };
 }

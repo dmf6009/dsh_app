@@ -14,7 +14,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ConnectionState, RuntimeStatus } from '../../../shared/desktop-api';
-import { agentCrashCopy, runtimeStartupFailedCopy } from '../../../shared/error-copy';
+import {
+  agentCrashCopy,
+  describeSessionError,
+  runtimeStartupFailedCopy,
+  workspaceActivationFailedCopy,
+  workspaceNotOpenCopy
+} from '../../../shared/error-copy';
 import type {
   ApprovalRequestPayload,
 } from '../../../shared/approval-protocol';
@@ -26,6 +32,7 @@ import { useApp } from '../store/app-store';
 import { useChanges } from '../changes/changes-store';
 import { badgeTitle, changedFiles, showRunSummary, summaryLabel } from '../changes/model';
 import { useSessionStore } from '../session/session-store';
+import { runSubmit } from '../session/submit-flow';
 import {
   INITIAL_MODEL,
   reduceChat,
@@ -222,40 +229,63 @@ export default function WorkspacePage(): JSX.Element {
   /* ---- actions ------------------------------------------------------ */
 
   const running = model.phase !== 'idle';
-  const canSend = connection === 'ready' && !running && input.trim() !== '';
+  // 没有工作区上下文时 composer 禁用（§3.3/§7.1）——消息必须落在已打开的
+  // workspace 里，不再退回 fallback root 静默发送。
+  const canSend = connection === 'ready' && !running && input.trim() !== '' && appState.workspaceRoot !== null;
 
   const submit = useCallback(async (): Promise<void> => {
     const text = input.trim();
     if (!canSend) return;
-    // Ensure a session exists before the first send so the transcript is
-    // persisted from the very first message (§15/AC-12). There is no outgoing
-    // session yet, so this cannot abort in practice — but stay defensive.
-    if (!sessions.activeId) {
-      const restored = await sessions.create(modelRef.current, persistMeta(), text.slice(0, 40));
-      if (restored === null) return; // creation failed; banner shows why
-      setModel(restored);
-      lastPhaseRef.current = 'idle';
-    }
+    // 工作区上下文一致性 + 首条消息会话建立（§15/AC-02/AC-12）：先让主进程激活
+    // workspace，再创建 Session，最后发送。激活/创建失败则不发送并给出准确三段式
+    // 提示；绝不退回「无会话静默发送」的旧降级。时序编排见 session/submit-flow.ts。
+    await runSubmit(
+      {
+        workspaceRoot: () => appState.workspaceRoot,
+        hasActiveSession: () => sessions.activeId !== null,
+        activateWorkspace: (path) => window.desktop.ensureWorkspaceActive(path),
+        createSession: (title) => sessions.create(modelRef.current, persistMeta(), title),
+        sendMessage: (message) => {
+          // The user message goes on screen optimistically, then the run starts.
+          dispatch({ type: 'send', text: message });
+          return window.desktop.sendMessage(message);
+        },
+        onWorkspaceActivated: (path) => appDispatch({ type: 'workspace', path }),
+        onSessionCreated: (model) => {
+          setModel(model);
+          lastPhaseRef.current = 'idle';
+        },
+        onBlocked: (notice) => {
+          // No workspace context (or activation failed) — accurate §32 copy,
+          // never a bare store error string.
+          sessions.surfaceError(
+            notice === '未打开工作区'
+              ? describeSessionError(workspaceNotOpenCopy())
+              : describeSessionError(workspaceActivationFailedCopy(notice))
+          );
+          setInput(text); // keep the user's message so it is not lost
+        },        onSendFailed: (error) => {
+          // No run actually started — release the lock and surface the error
+          // (pre-existing behavior, unchanged).
+          setModel((prev) => ({
+            ...prev,
+            phase: 'idle',
+            items: [
+              ...prev.items,
+              {
+                kind: 'notice',
+                id: `senderr-${Date.now()}`,
+                tone: 'error' as const,
+                text: `发送失败：${error ?? 'unknown error'}`
+              }
+            ]
+          }));
+        }
+      },
+      text
+    );
     setInput('');
-    dispatch({ type: 'send', text });
-    const result = await window.desktop.sendMessage(text);
-    if (!result.ok) {
-      // No run actually started — release the lock and surface the error.
-      setModel((prev) => ({
-        ...prev,
-        phase: 'idle',
-        items: [
-          ...prev.items,
-          {
-            kind: 'notice',
-            id: `senderr-${Date.now()}`,
-            tone: 'error' as const,
-            text: `发送失败：${result.error ?? 'unknown error'}`
-          }
-        ]
-      }));
-    }
-  }, [input, canSend, dispatch, sessions, persistMeta]);
+  }, [input, canSend, dispatch, sessions, persistMeta, appState.workspaceRoot, appDispatch]);
 
   const stop = useCallback(async (): Promise<void> => {
     if (modelRef.current.phase === 'idle') return;
@@ -569,13 +599,15 @@ export default function WorkspacePage(): JSX.Element {
             className="composer-input"
             value={input}
             placeholder={
-              connection === 'ready'
-                ? running
-                  ? '任务运行中，请等待完成或点击停止…'
-                  : '描述你要完成的任务…'
-                : '先在首页启动 Runtime…'
+              appState.workspaceRoot === null
+                ? '未打开工作区——请回首页打开项目后再发送…'
+                : connection === 'ready'
+                  ? running
+                    ? '任务运行中，请等待完成或点击停止…'
+                    : '描述你要完成的任务…'
+                  : '先在首页启动 Runtime…'
             }
-            disabled={connection !== 'ready' || running}
+            disabled={appState.workspaceRoot === null || connection !== 'ready' || running}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -686,6 +718,12 @@ export default function WorkspacePage(): JSX.Element {
           >
             知道了
           </button>
+        </div>
+      )}
+      {appState.workspaceRoot === null && (
+        // 工作区上下文不存在：composer 禁用 + 三段式指引（§3.3/§7.1）。
+        <div className="oob-banner session-error-banner" role="alert">
+          <span>✕ {describeSessionError(workspaceNotOpenCopy())}</span>
         </div>
       )}
       {sessions.lastError !== null && (

@@ -10,6 +10,8 @@
  */
 
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 
 import { BrowserWindow, app, dialog, ipcMain } from 'electron';
 
@@ -25,6 +27,7 @@ import { SettingsStore, redactSecrets } from './settings/settings-store';
 import { locateDsh } from './settings/dsh-locator';
 import { refreshModels } from './settings/model-refresh';
 import { WorkspaceManager } from './workspace';
+import { idForPath } from './workspace/recent-projects';
 import type { OpenProjectResult } from '../shared/workspace';
 import { DshProcessManager } from './runtime/dsh-process-manager';
 import { RuntimeClient } from './runtime/runtime-client';
@@ -284,6 +287,20 @@ function registerIpcHandlers(context: {
     return workspaces.checkPath(target);
   });
   ipcMain.handle('workspace:get-current', () => ({ path: workspaces.currentRoot }));
+  // 工作区上下文一致性（DSHA-7 QA 回归修复）：renderer 端 workspaceRoot 可由
+  // Recent Projects 头部自动激活/顶部导航带入，而主进程 currentRoot 可能尚未
+  // 同步。发送前 renderer 通过此通道让主进程激活同一 workspace；激活成功才
+  // 允许 session:create 与 runtime:send（§15 local-first：会话必须落在真正的
+  // workspace 目录下，不得退回 fallback root 静默发送）。
+  ipcMain.handle('workspace:ensure-active', (_event, target: unknown): OpenProjectResult => {
+    if (typeof target !== 'string' || target.trim() === '') {
+      return { ok: false, error: '路径无效' };
+    }
+    // Reuse the same validated activation path as openAt (existence/type/
+    // accessibility checks + recent touch) so main and renderer agree on ONE
+    // canonical workspace activation entry point.
+    return workspaces.openAt(target);
+  });
 
   /* ---- Sessions (§15/§16, F10/AC-12) — local-first persistence ---- */
 
@@ -689,6 +706,19 @@ async function main(): Promise<void> {
     }
   });
 
+  // The responsive probes drive the real Workspace page. Since the DSHA-7
+  // workspace-consistency fix the composer requires an ACTIVE workspace (no
+  // more silent fallback-root sends), so open a throwaway probe workspace
+  // BEFORE the renderer loads — its Recent-Projects bootstrap then sees a
+  // valid head and the full user flow (activate → session:create → send) is
+  // exercised. Dropped again after the probes (record + directory).
+  const responsiveProbeWorkspace = isResponsiveMeasureMode
+    ? fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-responsive-probe-'))
+    : null;
+  if (responsiveProbeWorkspace !== null) {
+    workspaces.openAt(responsiveProbeWorkspace);
+  }
+
   // §34 cold-start probe: first-paint timestamp = the first navigation the
   // renderer finished loading (did-finish-load). Attached BEFORE loadFile so
   // the initial load's event is captured; one-shot, logged to stdout so the
@@ -728,8 +758,21 @@ async function main(): Promise<void> {
       );
     }
     // Deterministic teardown: stop the resident stub so no child survives,
-    // then exit with the probe verdict.
+    // drop the probe workspace (recent record + directory), then exit with
+    // the probe verdict.
     await client.stop().catch(() => undefined);
+    if (responsiveProbeWorkspace !== null) {
+      try {
+        workspaces.removeRecent(idForPath(responsiveProbeWorkspace));
+      } catch {
+        /* best-effort */
+      }
+      try {
+        fs.rmSync(responsiveProbeWorkspace, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
     console.log(JSON.stringify({ responsive: failed ? 'fail' : 'ok' }));
     setTimeout(() => app.exit(failed ? 1 : 0), 100).unref();
     return;

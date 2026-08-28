@@ -138,12 +138,21 @@ export function AppProvider({ children }: { children: ReactNode }): JSX.Element 
       )
       .catch(() => dispatch({ type: 'connection', state: 'crashed' }));
 
-    void window.desktop.listRecentProjects().then((projects) => {
+    void window.desktop.listRecentProjects().then(async (projects) => {
       dispatch({ type: 'recent', projects });
       // listRecentProjects returns pinned-first order; activating its head
       // opens the shell on the pinned project (falling back to most recent).
       if (projects.length > 0) {
-        dispatch({ type: 'workspace', path: projects[0]!.path });
+        // 工作区上下文一致性（DSHA-7）：renderer 侧的 workspaceRoot 必须同时在
+        // 主进程激活，否则 session:create / runtime:send 会以「未打开工作区」
+        // 失败或落到 fallback root。激活失败（目录已删除等）则不设置
+        // workspaceRoot，Workspace composer 禁用并给出三段式指引。
+        try {
+          const result = await window.desktop.ensureWorkspaceActive(projects[0]!.path);
+          dispatch({ type: 'workspace', path: result.ok && result.path ? result.path : null });
+        } catch {
+          dispatch({ type: 'workspace', path: null });
+        }
       }
     });
 

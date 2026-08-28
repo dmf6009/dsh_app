@@ -12,7 +12,10 @@ import {
   modelApiErrorCopy,
   runtimeStartupFailedCopy,
   sessionDeleteFailedCopy,
-  sessionSaveFailedCopy
+  sessionOpFailedCopy,
+  sessionSaveFailedCopy,
+  workspaceActivationFailedCopy,
+  workspaceNotOpenCopy
 } from '../src/shared/error-copy';
 
 describe('§32 model API errors (401/404/429/other)', () => {
@@ -122,5 +125,32 @@ describe('§15/§32 session persistence errors', () => {
     const text = describeSessionError(sessionDeleteFailedCopy());
     expect(text.split('\n')).toHaveLength(3);
     expect(text).not.toContain('原始信息');
+  });
+});
+
+describe('§15/§32 workspace-context copy (QA regression round)', () => {
+  it('no-workspace copy points the user at Home / recent projects', () => {
+    const c = workspaceNotOpenCopy();
+    expect(c.what).toBe('未打开工作区');
+    expect(c.why).toContain('没有已打开的工作区');
+    expect(c.action).toContain('打开项目');
+  });
+
+  it('activation-failure copy says the message was NOT sent and is preserved', () => {
+    const c = workspaceActivationFailedCopy('目录不存在');
+    expect(c.what).toBe('工作区激活失败');
+    expect(c.why).toContain('消息未被发送');
+    expect(c.why).toContain('保留');
+    expect(c.action).toContain('重试');
+    expect(c.detail).toBe('目录不存在');
+  });
+
+  it('first-ever create failure must NOT claim the current session was saved', () => {
+    const c = sessionOpFailedCopy('新建', '未打开工作区', false);
+    expect(c.why).toContain('没有已打开的会话需要保存');
+    expect(c.why).not.toContain('已成功保存');
+    // The switching/with-outgoing variant keeps the saved-outgoing claim.
+    const withOutgoing = sessionOpFailedCopy('切换', '会话不存在', true);
+    expect(withOutgoing.why).toContain('已成功保存');
   });
 });

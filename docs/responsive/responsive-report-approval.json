@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-08-26T05:06:40.268Z",
+  "generatedAt": "2026-08-28T08:50:38.685Z",
   "approvalFlow": true,
   "sizes": [
     "500x400",
@@ -197,9 +197,9 @@
         "commandScrollsInternally": true,
         "commandScrollableStyle": true,
         "commandContentHeight": 118,
-        "commandBoxHeight": 83,
+        "commandBoxHeight": 20,
         "commandWithinViewport": true,
-        "modalScrollsInternally": false
+        "modalScrollsInternally": true
       }
     },
     {
@@ -209,7 +209,7 @@
       "detail": {
         "commandScrollsInternally": true,
         "commandContentHeight": 118,
-        "commandBoxHeight": 83
+        "commandBoxHeight": 20
       }
     },
     {
@@ -367,7 +367,7 @@
       "ok": true,
       "detail": {
         "x": 272,
-        "y": 372,
+        "y": 404,
         "w": 72,
         "h": 36
       }
@@ -392,7 +392,7 @@
         "reject": {
           "rect": {
             "x": 272,
-            "y": 372,
+            "y": 404,
             "w": 72,
             "h": 36
           },

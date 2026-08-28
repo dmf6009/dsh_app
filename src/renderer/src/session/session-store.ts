@@ -43,6 +43,12 @@ export interface SessionStoreValue {
    */
   lastError: string | null;
   dismissError: () => void;
+  /**
+   * Surface a pre-framed §32 notice on the session error banner. Used by
+   * callers that block an action (e.g. submit with no activatable workspace)
+   * and need the same 「发生了什么/为什么/建议动作」 presentation.
+   */
+  surfaceError: (notice: string) => void;
   /** Rehydrate the ChatModel from the active persisted session. */
   hydrate: () => Promise<ChatModel | null>;
   /** Persist the current ChatModel + metadata as the active session. Returns
@@ -112,6 +118,10 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
 
   const dismissError = useCallback((): void => {
     setLastError(null);
+  }, []);
+
+  const surfaceError = useCallback((notice: string): void => {
+    setLastError(notice);
   }, []);
 
   // Reload the list whenever the workspace changes.
@@ -242,8 +252,10 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
       );
       if (outcome.status === 'aborted' && outcome.stage === 'create') {
         // persist-stage failures already surfaced their own §32 banner inside
-        // persist(); only a failed create itself needs framing here.
-        setLastError(describeSessionError(sessionOpFailedCopy('新建', outcome.error)));
+        // persist(); only a failed create itself needs framing here. When
+        // there was no outgoing session (first-ever create) the copy must not
+        // claim the current session was saved.
+        setLastError(describeSessionError(sessionOpFailedCopy('新建', outcome.error, activeId !== null)));
       }
       return outcome.status === 'completed' ? outcome.model : null;
     },
@@ -349,6 +361,7 @@ export function useSessionStore(workspaceRoot: string | null): SessionStoreValue
     loaded,
     lastError,
     dismissError,
+    surfaceError,
     hydrate,
     persist,
     create,

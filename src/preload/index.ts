@@ -89,6 +89,8 @@ const api: DesktopApi = {
     ipcRenderer.invoke('workspace:check-path', path),
   getCurrentWorkspace: (): Promise<{ path: string | null }> =>
     ipcRenderer.invoke('workspace:get-current'),
+  ensureWorkspaceActive: (path: string): Promise<OpenProjectResult> =>
+    ipcRenderer.invoke('workspace:ensure-active', path),
 
   listSessions: (): Promise<SessionSummary[]> => ipcRenderer.invoke('session:list'),
   getActiveSessionId: (): Promise<{ id: string | null }> =>

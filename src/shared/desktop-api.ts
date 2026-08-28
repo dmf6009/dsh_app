@@ -120,6 +120,14 @@ export interface DesktopApi {
   removeRecentProject(id: string): Promise<OperationResult>;
   checkPath(path: string): Promise<PathCheckResult>;
   getCurrentWorkspace(): Promise<{ path: string | null }>;
+  /**
+   * Make sure the main process has the same workspace active as the renderer
+   * (§15 工作区上下文一致性). The renderer's workspaceRoot can come from the
+   * Recent Projects head or top navigation while main's currentRoot is still
+   * null; callers must ensure activation BEFORE creating sessions/sending.
+   * Reuses the same validated activation as openProjectAt.
+   */
+  ensureWorkspaceActive(path: string): Promise<OpenProjectResult>;
 
   /* ---- Sessions (§15/§16, F10/AC-12) ---- */
   /** Sidebar summaries for the active workspace (newest-updated first). */

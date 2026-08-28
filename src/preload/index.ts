@@ -24,6 +24,7 @@ import type {
   SettingsView
 } from '../shared/settings';
 import type { OpenProjectResult, PathCheckResult, RecentProject } from '../shared/workspace';
+import type { PluginsSnapshot, PluginMutationResult } from '../shared/plugins';
 import type {
   SessionLoadResult,
   SessionMutationResult,
@@ -125,7 +126,12 @@ const api: DesktopApi = {
 
   detectDsh: () => ipcRenderer.invoke('dsh:detect'),
   chooseDshPath: () => ipcRenderer.invoke('dsh:choose-path'),
-  getStderrTail: (): Promise<string> => ipcRenderer.invoke('dsh:get-stderr-tail')
+  getStderrTail: (): Promise<string> => ipcRenderer.invoke('dsh:get-stderr-tail'),
+
+  listPlugins: (): Promise<PluginsSnapshot> => ipcRenderer.invoke('plugins:list'),
+  addPlugin: (spec: string): Promise<PluginMutationResult> => ipcRenderer.invoke('plugins:add', spec),
+  removePlugin: (name: string): Promise<PluginMutationResult> =>
+    ipcRenderer.invoke('plugins:remove', name)
 };
 
 contextBridge.exposeInMainWorld('desktop', api);

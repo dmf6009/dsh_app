@@ -46,6 +46,17 @@ Notes:
   deterministic stub runtime so QA stays reproducible; set `DSH_RUNTIME_BIN`
   to point them at a real dsh.
 
+## Plugins（万物皆可插）
+
+Settings → 插件 manages the plugins of the run profile (default `headless`,
+overridable via `DSH_DESKTOP_PLUGIN_PROFILE`): listing reads the profile
+manifest (`~/.dsh/profiles/<profile>/package.json` — `dsh.profile.bundles` is
+the ordered boot stack), install/remove goes through the official
+`dsh plugin --profile <p> add|remove` CLI (pnpm forward + bundle-list
+reconcile). `@deepseek-ai/dsh-base` is protected from removal. Plugin changes
+apply to the next agent run — the runtime spawns dsh per run, no app restart
+needed. Design spec: `docs/design/mvp-pages-ui-ux-spec.md` §11.
+
 ## What works today (Phase 0 scope)
 
 - Runtime Protocol v1: typed JSONL frames, tolerant decoder, overlong-line

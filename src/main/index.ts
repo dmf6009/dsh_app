@@ -57,6 +57,8 @@ import { isValidSessionId, validateSessionRecord } from '../shared/session';
 import { ChangeRecordService } from './changes/change-record-service';
 import { buildFileDiff } from './changes/file-diff';
 import { SessionStore } from './session/session-store';
+import { PluginManager } from './plugins/plugin-manager';
+import type { PluginsSnapshot, PluginMutationResult } from '../shared/plugins';
 
 const isSmokeMode = process.env.DSH_SMOKE === '1';
 /** #5 responsive regression: DSH_RESPONSIVE_MEASURE=1 drives the UI probe. */
@@ -173,6 +175,7 @@ function registerIpcHandlers(context: {
   client: RuntimeClient;
   status: () => RuntimeStatus;
   appRoot: string;
+  home: string;
   workspaces: WorkspaceManager;
   settings: SettingsStore;
   approvals: ApprovalService;
@@ -186,6 +189,7 @@ function registerIpcHandlers(context: {
     client,
     status,
     appRoot,
+    home,
     workspaces,
     settings,
     approvals,
@@ -502,6 +506,28 @@ function registerIpcHandlers(context: {
     // §33: stderr shown in UI must not leak credentials either.
     redactSecrets(stderrTail, settings.allSecrets())
   );
+
+  /* ---- Plugins (dsh「万物皆可插」— run profile 的插件管理) ---- */
+
+  const resolvePluginManager = async (): Promise<PluginManager> => {
+    const detection = await locateDsh({ pathOverride: settings.getDshPath(), appRoot });
+    return new PluginManager({ home, dshBin: detection.found && detection.path ? detection.path : null });
+  };
+  ipcMain.handle('plugins:list', async (): Promise<PluginsSnapshot> => (await resolvePluginManager()).snapshot());
+  ipcMain.handle(
+    'plugins:add',
+    (_event, spec: unknown): Promise<PluginMutationResult> =>
+      typeof spec === 'string'
+        ? resolvePluginManager().then((m) => m.addPlugin(spec))
+        : Promise.resolve({ ok: false, error: '参数无效' })
+  );
+  ipcMain.handle(
+    'plugins:remove',
+    (_event, name: unknown): Promise<PluginMutationResult> =>
+      typeof name === 'string'
+        ? resolvePluginManager().then((m) => m.removePlugin(name))
+        : Promise.resolve({ ok: false, error: '参数无效' })
+  );
 }
 
 let stderrTail = '';
@@ -712,6 +738,7 @@ async function main(): Promise<void> {
     client,
     status,
     appRoot,
+    home,
     workspaces,
     settings,
     approvals,

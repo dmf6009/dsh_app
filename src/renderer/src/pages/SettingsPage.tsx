@@ -31,11 +31,18 @@ import {
 } from '../../../shared/settings';
 import { Banner, Button, Card, PasswordField, RadioGroup, SelectField, Tabs, TextField } from '../components/ui';
 import { useApp } from '../store/app-store';
+import {
+  PLUGIN_KIND_LABELS,
+  canRemovePlugin,
+  type InstalledPlugin,
+  type PluginsSnapshot
+} from '../../../shared/plugins';
 
 const TAB_ITEMS = [
   { id: 'models', label: '模型' },
   { id: 'dsh', label: 'DSH' },
-  { id: 'permissions', label: '权限' }
+  { id: 'permissions', label: '权限' },
+  { id: 'plugins', label: '插件' }
 ] as const;
 
 interface FormState {
@@ -93,6 +100,7 @@ export default function SettingsPage(): JSX.Element {
       {tab === 'models' && <ModelsTab />}
       {tab === 'dsh' && <DshTab />}
       {tab === 'permissions' && <PermissionsTab />}
+      {tab === 'plugins' && <PluginsTab />}
     </div>
   );
 }
@@ -409,6 +417,149 @@ function DshTab(): JSX.Element {
           刷新
         </Button>
         <p className="hint">敏感信息已在展示前自动遮蔽。</p>
+      </section>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Plugins tab (dsh「万物皆可插」)                                      */
+/* ------------------------------------------------------------------ */
+
+function PluginBadges({ plugin }: { plugin: InstalledPlugin }): JSX.Element {
+  return (
+    <>
+      <span className={`badge ${plugin.isBundle ? 'badge-info' : 'badge-neutral'}`}>
+        {PLUGIN_KIND_LABELS[plugin.isBundle ? 'bundle' : 'dep']}
+      </span>
+      {plugin.protected && <span className="badge badge-warning">核心</span>}
+    </>
+  );
+}
+
+function PluginsTab(): JSX.Element {
+  const [snapshot, setSnapshot] = useState<PluginsSnapshot | null>(null);
+  const [spec, setSpec] = useState('');
+  const [busy, setBusy] = useState<'add' | 'remove' | null>(null);
+  const [removingName, setRemovingName] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const refresh = useCallback(async (): Promise<void> => {
+    setSnapshot(await window.desktop.listPlugins());
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const add = async (): Promise<void> => {
+    const target = spec.trim();
+    if (target === '') return;
+    setBusy('add');
+    setMessage(null);
+    try {
+      const result = await window.desktop.addPlugin(target);
+      if (result.ok) {
+        setSpec('');
+        setMessage({ ok: true, text: `已安装 ${target}，对下一次 Agent 运行生效。` });
+        setSnapshot(result.snapshot ?? (await window.desktop.listPlugins()));
+      } else {
+        setMessage({ ok: false, text: result.error ?? '安装失败' });
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async (name: string): Promise<void> => {
+    if (!window.confirm(`卸载插件「${name}」？它将从运行 profile 的启动栈中移除。`)) return;
+    setBusy('remove');
+    setRemovingName(name);
+    setMessage(null);
+    try {
+      const result = await window.desktop.removePlugin(name);
+      if (result.ok) {
+        setMessage({ ok: true, text: `已卸载 ${name}，对下一次 Agent 运行生效。` });
+        setSnapshot(result.snapshot ?? (await window.desktop.listPlugins()));
+      } else {
+        setMessage({ ok: false, text: result.error ?? '卸载失败' });
+      }
+    } finally {
+      setBusy(null);
+      setRemovingName(null);
+    }
+  };
+
+  const plugins = snapshot?.plugins ?? [];
+  return (
+    <div className="tab-panel" role="tabpanel" id="panel-plugins" aria-labelledby="tab-plugins">
+      <section className="plugin-list">
+        <h3 className="panel-title">
+          运行 profile 的插件 <code>{snapshot?.profile ?? '…'}</code>
+        </h3>
+        <p className="hint">
+          dsh 的核心是「万物皆可插」：npm 包即插件，可扩展模型适配、工具、UI 与工作流。
+          插件束会加入 profile 的启动栈；变更对下一次 Agent 运行生效。
+        </p>
+        {snapshot && !snapshot.profileExists && (
+          <Banner tone="info" title="该 profile 尚未初始化">
+            首次安装插件时会自动创建 profile 目录并接入插件栈。
+          </Banner>
+        )}
+        {!snapshot ? (
+          <p className="empty-hint">插件列表加载中…</p>
+        ) : plugins.length === 0 ? (
+          <p className="empty-hint">尚未安装任何插件——把 npm 包插进来，扩展 Agent 的能力。</p>
+        ) : (
+          plugins.map((plugin) => (
+            <Card
+              key={plugin.name}
+              title={plugin.name}
+              meta={
+                <>
+                  {plugin.version ? <code>v{plugin.version}</code> : '未安装到本地'}
+                  <PluginBadges plugin={plugin} />
+                </>
+              }
+              actions={
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled={!canRemovePlugin(plugin)}
+                  title={plugin.protected ? 'dsh 核心组件，不可卸载' : undefined}
+                  loading={busy === 'remove' && removingName === plugin.name}
+                  onClick={() => void remove(plugin.name)}
+                >
+                  卸载
+                </Button>
+              }
+            />
+          ))
+        )}
+      </section>
+
+      <section className="plugin-form">
+        <h3 className="panel-title">安装插件</h3>
+        <TextField
+          label="npm 包名（可含版本范围）"
+          value={spec}
+          onChange={(e) => setSpec(e.target.value)}
+          placeholder="@scope/dsh-plugin@^1.0.0"
+        />
+        <div className="form-actions">
+          <Button variant="primary" loading={busy === 'add'} onClick={() => void add()}>
+            安装
+          </Button>
+          <Button variant="secondary" onClick={() => void refresh()}>
+            刷新列表
+          </Button>
+        </div>
+        <p className="hint">安装/卸载通过官方 `dsh plugin` 命令执行，声明 dsh.bundle 的包会自动加入启动栈。</p>
+        {message && (
+          <p className={message.ok ? 'form-ok' : 'form-error'} role={message.ok ? 'status' : 'alert'}>
+            {message.text}
+          </p>
+        )}
       </section>
     </div>
   );

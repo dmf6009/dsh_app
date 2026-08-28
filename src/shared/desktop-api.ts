@@ -15,6 +15,10 @@ import type {
 } from './settings';
 import type { OpenProjectResult, PathCheckResult, RecentProject } from './workspace';
 import type {
+  PluginsSnapshot,
+  PluginMutationResult
+} from './plugins';
+import type {
   SessionLoadResult,
   SessionMutationResult,
   SessionRecord,
@@ -167,6 +171,11 @@ export interface DesktopApi {
   detectDsh(): Promise<DshDetection>;
   chooseDshPath(): Promise<{ ok: boolean; path?: string; error?: 'cancelled' | string }>;
   getStderrTail(): Promise<string>;
+
+  /* ---- Plugins (dsh「万物皆可插」— run profile 的插件管理) ---- */
+  listPlugins(): Promise<PluginsSnapshot>;
+  addPlugin(spec: string): Promise<PluginMutationResult>;
+  removePlugin(name: string): Promise<PluginMutationResult>;
 }
 
 export const DESKTOP_API_KEY = 'desktop';

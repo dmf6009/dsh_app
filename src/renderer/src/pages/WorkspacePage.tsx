@@ -32,6 +32,7 @@ import { useApp } from '../store/app-store';
 import { useChanges } from '../changes/changes-store';
 import { badgeTitle, changedFiles, showRunSummary, summaryLabel } from '../changes/model';
 import { useSessionStore } from '../session/session-store';
+import { useSessionHydration } from '../session/use-session-hydration';
 import { runSubmit } from '../session/submit-flow';
 import { HydrationGuard } from '../session/session-transition';
 import {
@@ -123,7 +124,29 @@ export default function WorkspacePage(): JSX.Element {
 
   // The active session id + flush fn come from the session hook (declared
   // here, before openDiff, so the navigation checkpoint can reference them).
-  const { loaded: sessionLoaded, activeId: sessionActiveId, hydrate: sessionHydrate, persist: sessionPersist, flush: sessionFlush } = sessions;
+  // noteDisplayedFor is destructured separately: it is a stable useCallback,
+  // so the hydrate effect below can depend on it WITHOUT re-running on every
+  // render (the hook's returned object is a fresh literal each render —
+  // depending on `sessions` itself would re-trigger hydration endlessly and
+  // wipe freshly dispatched messages with post-dispatch re-hydrations).
+  const {
+    activeId: sessionActiveId,
+    persist: sessionPersist,
+    flush: sessionFlush
+  } = sessions;
+
+  /* ---- Hydration transition state (UI/UE 验收) ---------------------- *
+   * busy 期间禁用新建/切换/删除/composer，阻止重复操作；initial 显示
+   * 「正在加载会话…」占位（不空白）；switching 保留旧 transcript 但明确
+   * 标示属于切换前会话。不削弱 HydrationGuard/checkpoint-first 语义。 */
+  const hydrating = sessions.hydration;
+  /** Session actions are locked while a hydration transition is in flight. */
+  const sessionTransitioning = hydrating.busy;
+  /** Title of the session the DISPLAYED (stale) model belongs to. */
+  const staleTitle =
+    hydrating.phase === 'switching'
+      ? sessions.summaries.find((s) => s.id === hydrating.displayedFor)?.title ?? '上一个会话'
+      : null;
 
   // Synchronous checkpoint of the active session (navigation / unload / quit).
   // Uses the main-process sendSync flush channel so the save completes before
@@ -134,24 +157,21 @@ export default function WorkspacePage(): JSX.Element {
   }, [sessionActiveId, appState.workspaceRoot, sessionFlush, persistMeta]);
 
   // Hydrate the active session once it's loaded (and when the active id
-  // changes due to a switch). Never auto-resume a running task.
+  // changes due to a switch). Never auto-resume a running task. The exact
+  // production wiring (epoch → hydrate → cancelled/guard decision → apply +
+  // attribution → settle AFTER the decision) lives in use-session-hydration.ts
+  // so it is testable against the real hook with deferred desktop promises.
+  useSessionHydration(sessions, setModel, hydrationGuardRef);
+
+  // The displayed-model reset on a workspace change lives INSIDE
+  // useSessionHydration (shared with the hook tests). The page additionally
+  // resets its run-phase bookkeeping so the next persist trigger starts clean.
+  const workspaceEpochRef = useRef(sessions.workspaceEpoch);
   useEffect(() => {
-    if (!sessionLoaded) return;
-    let cancelled = false;
-    // §15/AC-12 竞态防护（review round 4）：hydrate 结果仅在「请求发出后内存
-    // 模型未被任何非 hydrate 变更改动」时才可应用。判定基于请求代次而非
-    // 「内存是否为空」——删除活动会话后内存仍保留被删会话的非空模型，
-    // fallback 快照必须能够替换它；而请求期间新 dispatch 的消息又绝不能被
-    // 迟到的空快照抹掉。effect 的 cancelled 清理继续承担「active id 已变、
-    // 请求被取代」的第一道防线。时序见 tests/session-first-message.test.ts。
-    const epoch = hydrationGuardRef.current.request();
-    void sessionHydrate().then((restored) => {
-      if (cancelled || restored === null) return;
-      if (!hydrationGuardRef.current.canApply(epoch)) return;
-      setModel(restored);
-    });
-    return () => { cancelled = true; };
-  }, [sessionLoaded, sessionActiveId, sessionHydrate]);
+    if (workspaceEpochRef.current === sessions.workspaceEpoch) return;
+    workspaceEpochRef.current = sessions.workspaceEpoch;
+    lastPhaseRef.current = 'idle';
+  }, [sessions.workspaceEpoch]);
 
   // Persist on run termination (done / run_completed / run_cancelled / error).
   const lastPhaseRef = useRef<RunPhase>('idle');
@@ -252,7 +272,9 @@ export default function WorkspacePage(): JSX.Element {
   const running = model.phase !== 'idle';
   // 没有工作区上下文时 composer 禁用（§3.3/§7.1）——消息必须落在已打开的
   // workspace 里，不再退回 fallback root 静默发送。
-  const canSend = connection === 'ready' && !running && input.trim() !== '' && appState.workspaceRoot !== null;
+  const canSend =
+    connection === 'ready' && !running && input.trim() !== '' &&
+    appState.workspaceRoot !== null && !sessionTransitioning;
 
   const submit = useCallback(async (): Promise<void> => {
     const text = input.trim();
@@ -326,7 +348,7 @@ export default function WorkspacePage(): JSX.Element {
   /* ---- Session actions (DSHA-7 §15 多会话) --------------------------- */
 
   const newSession = useCallback(async (): Promise<void> => {
-    if (running) return; // lock during a run
+    if (running || sessionTransitioning) return; // lock during a run/transition
     // The outgoing session is checkpointed inside create(); on failure the
     // transition aborts (null) and the current model/active id stay on screen
     // so unsaved conversation state is never discarded (§15/AC-12).
@@ -335,25 +357,26 @@ export default function WorkspacePage(): JSX.Element {
     hydrationGuardRef.current.noteMutation();
     setModel(restored);
     lastPhaseRef.current = 'idle';
-  }, [running, sessions, persistMeta]);
+  }, [running, sessionTransitioning, sessions, persistMeta]);
 
   const switchSession = useCallback(async (id: string): Promise<void> => {
-    if (running) return;
+    if (running || sessionTransitioning) return;
     // Same abort semantics: a failed outgoing checkpoint keeps the user on the
     // current (unsaved) session instead of silently replacing the model.
     const restored = await sessions.switchTo(id, modelRef.current, persistMeta());
     if (restored === null) return;
     hydrationGuardRef.current.noteMutation();
+    sessions.noteDisplayedFor(id);
     setModel(restored);
     lastPhaseRef.current = 'idle';
-  }, [running, sessions, persistMeta]);
+  }, [running, sessionTransitioning, sessions, persistMeta]);
 
   const deleteSession = useCallback(async (id: string): Promise<void> => {
-    if (running) return;
+    if (running || sessionTransitioning) return;
     // The active session is saved by the user before this; deleting the
     // active one lets the hydrate effect load the fallback when activeId flips.
     await sessions.remove(id);
-  }, [running, sessions]);
+  }, [running, sessionTransitioning, sessions]);
 
   /* ---- responsive drawers (#5) ---------------------------------------
    * Below 960px the side columns become off-canvas drawers: the middle
@@ -464,14 +487,24 @@ export default function WorkspacePage(): JSX.Element {
             size="sm"
             variant="secondary"
             onClick={() => void newSession()}
-            disabled={running || !appState.workspaceRoot}
+            disabled={running || sessionTransitioning || !appState.workspaceRoot}
             aria-label="新建会话"
             title="新建会话"
           >
             + 新建
           </Button>
         </div>
-        <ul className="session-list" aria-label="会话列表">
+        {sessionTransitioning && (
+          <div className="sessions-hydrating" role="status">
+            <Spinner label="正在加载会话" />
+            <span>
+              {hydrating.phase === 'switching'
+                ? '正在切换会话…列表操作暂不可用。'
+                : '正在加载会话…'}
+            </span>
+          </div>
+        )}
+        <ul className="session-list" aria-label="会话列表" aria-busy={sessionTransitioning}>
           {sessions.summaries.length === 0 && (
             <li className="session session-empty">
               <span className="session-title">暂无会话——点击「+ 新建」开始一段对话（本地持久化）。</span>
@@ -486,7 +519,7 @@ export default function WorkspacePage(): JSX.Element {
                 type="button"
                 className="session-switch"
                 onClick={() => void switchSession(s.id)}
-                disabled={running || s.active}
+                disabled={running || sessionTransitioning || s.active}
                 aria-current={s.active ? 'true' : undefined}
                 title={`${s.title}（点击切换）`}
               >
@@ -498,7 +531,7 @@ export default function WorkspacePage(): JSX.Element {
                 type="button"
                 className="btn btn-ghost session-delete"
                 onClick={() => void deleteSession(s.id)}
-                disabled={running}
+                disabled={running || sessionTransitioning}
                 aria-label={`删除会话 ${s.title}`}
                 title="删除会话"
               >
@@ -511,7 +544,7 @@ export default function WorkspacePage(): JSX.Element {
       </aside>
 
       {/* ---------------- Middle: conversation ---------------- */}
-      <section className="col col-chat" aria-label="Conversation">
+      <section className="col col-chat" aria-label="Conversation" aria-busy={sessionTransitioning}>
         <header className="chat-header">
           {narrow && (
             <div className="drawer-toggles">
@@ -620,7 +653,19 @@ export default function WorkspacePage(): JSX.Element {
           );
         })()}
 
-        <ChatList items={model.items} scrollRef={scrollRef} />
+        {sessionTransitioning && (
+          <div className="chat-hydrating" role="status">
+            <Spinner label="正在加载会话" />
+            {hydrating.phase === 'switching' ? (
+              <span>
+                正在加载会话…当前显示的仍是切换前会话「{staleTitle ?? '上一个会话'}」的内容，加载完成后自动切换，期间操作已锁定。
+              </span>
+            ) : (
+              <span>正在加载会话…</span>
+            )}
+          </div>
+        )}
+        <ChatList items={model.items} scrollRef={scrollRef} stale={sessions.hydration.phase === 'switching'} />
 
         <footer className="composer">
           <textarea
@@ -629,13 +674,20 @@ export default function WorkspacePage(): JSX.Element {
             placeholder={
               appState.workspaceRoot === null
                 ? '未打开工作区——请回首页打开项目后再发送…'
-                : connection === 'ready'
-                  ? running
-                    ? '任务运行中，请等待完成或点击停止…'
-                    : '描述你要完成的任务…'
-                  : '先在首页启动 Runtime…'
+                : sessionTransitioning
+                  ? '正在加载会话…'
+                  : connection === 'ready'
+                    ? running
+                      ? '任务运行中，请等待完成或点击停止…'
+                      : '描述你要完成的任务…'
+                    : '先在首页启动 Runtime…'
             }
-            disabled={appState.workspaceRoot === null || connection !== 'ready' || running}
+            disabled={
+              appState.workspaceRoot === null ||
+              connection !== 'ready' ||
+              running ||
+              sessionTransitioning
+            }
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -781,13 +833,17 @@ export default function WorkspacePage(): JSX.Element {
 
 function ChatList({
   items,
-  scrollRef
+  scrollRef,
+  stale
 }: {
   items: ChatItem[];
   scrollRef: React.RefObject<HTMLDivElement>;
+  /** True while the displayed transcript belongs to a PREVIOUS session
+   *  (switch/fallback in flight) — visually de-emphasized + labelled above. */
+  stale?: boolean;
 }): JSX.Element {
   return (
-    <div className="chat" ref={scrollRef}>
+    <div className={stale ? 'chat chat-stale' : 'chat'} ref={scrollRef}>
       {items.length === 0 && (
         <div className="empty">
           <p>开始一段对话。Runtime 会以流式返回结果，工具调用、计划、文件读写和子任务都会在这里展示。</p>

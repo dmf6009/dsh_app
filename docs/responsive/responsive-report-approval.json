@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-08-28T08:50:38.685Z",
+  "generatedAt": "2026-08-28T11:11:13.063Z",
   "approvalFlow": true,
   "sizes": [
     "500x400",
@@ -79,6 +79,15 @@
         "visible": true,
         "withinViewport": true,
         "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "500x400",
+      "scenario": "drawer-sessions/hydration-indicator",
+      "ok": true,
+      "detail": {
+        "observed": false,
+        "notStuck": true
       }
     },
     {
@@ -284,6 +293,15 @@
         "visible": true,
         "withinViewport": true,
         "focusInsidePanel": true
+      }
+    },
+    {
+      "size": "700x500",
+      "scenario": "drawer-sessions/hydration-indicator",
+      "ok": true,
+      "detail": {
+        "observed": false,
+        "notStuck": true
       }
     },
     {

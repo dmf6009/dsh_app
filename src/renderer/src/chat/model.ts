@@ -20,6 +20,8 @@ import type { ApprovalRequestPayload } from '../../../shared/approval-protocol';
 import type { ActionCategory } from '../../../shared/approval-protocol';
 import type { RuntimeEventFrame } from '../../../shared/protocol/types';
 import type { RiskLevel } from '../../../shared/protocol/types';
+import type { SessionItem } from '../../../shared/session';
+import { modelApiErrorCopy } from '../../../shared/error-copy';
 import { classifyOperation } from '../../../shared/approval-rules';
 
 export type ToolStatus = 'running' | 'ok' | 'failed' | 'cancelled';
@@ -139,19 +141,19 @@ function normalizeChange(value: unknown): ChangeKind {
   return value === 'added' || value === 'deleted' ? value : 'modified';
 }
 
-/** Error cards map well-known provider codes to actionable copy (§31). */
+/**
+ * Error cards map well-known provider codes to actionable copy (§32 三段式:
+ * 发生了什么 / 为什么 / 建议动作), preserving the raw diagnostic message so
+ * support can diagnose. The §32 model-API scenario (401/404/429) lands here as
+ * an inline notice card inside the message stream.
+ */
 export function describeError(message: string, code?: string | number): string {
-  const raw = message.trim();
-  switch (String(code ?? '')) {
-    case '401':
-      return `API Key 无效或未配置（401）：${raw}`;
-    case '404':
-      return `模型或接口不存在（404）：${raw}`;
-    case '429':
-      return `请求过于频繁，请稍后重试（429）：${raw}`;
-    default:
-      return code === undefined || code === null || code === '' ? raw : `${raw} [${code}]`;
-  }
+  const copy = modelApiErrorCopy(message, code);
+  // Single-string projection for the persisted notice card; the raw diagnostic
+  // is kept on its own line so it survives a copy/paste into a bug report.
+  return [copy.what, `原因：${copy.why}`, `建议：${copy.action}`, copy.detail ? `原始信息：${copy.detail}` : null]
+    .filter((line): line is string => line !== null && line !== '')
+    .join('\n');
 }
 
 function lastStreamingAssistantIndex(items: ChatItem[]): number {
@@ -455,4 +457,123 @@ export function reduceChat(model: ChatModel, action: ChatAction): ChatModel {
     default:
       return 'frame' in action ? reduceEvent(model, action.frame) : model;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Session persistence projection (§15, F10/AC-12)                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Project the live ChatModel transcript into the persisted SessionItem form.
+ * Streaming cursors and transient derived fields are dropped: a saved session
+ * is a rest state, never mid-stream. Each kind contributes only the fields
+ * worth回看 across a restart.
+ */
+export function toSessionItems(items: ChatItem[]): SessionItem[] {
+  return items
+    // Drop empty streaming-placeholder assistant bubbles: they carry no
+    // content worth persisting across a restart and only clutter the record.
+    .filter((item) => !(item.kind === 'assistant' && item.text.trim() === ''))
+    .map((item): SessionItem => {
+    const base: SessionItem = { kind: item.kind, id: item.id };
+    switch (item.kind) {
+      case 'user':
+        return { ...base, text: item.text };
+      case 'assistant':
+        return { ...base, text: item.text, status: item.streaming ? 'running' : 'ok' };
+      case 'plan':
+        return { ...base, steps: item.steps };
+      case 'tool':
+        return {
+          ...base,
+          toolCallId: item.toolCallId,
+          tool: item.tool,
+          command: item.command,
+          output: item.output,
+          status: item.status,
+          level: item.level,
+          category: item.category,
+          basis: item.basis,
+          form: item.form
+        };
+      case 'file_read':
+        return { ...base, path: item.path, sizeBytes: item.sizeBytes };
+      case 'file_changed':
+        return { ...base, path: item.path, change: item.change };
+      case 'subagent':
+        return {
+          ...base,
+          toolCallId: item.toolCallId,
+          label: item.label,
+          output: item.output,
+          status: item.status,
+          summary: item.summary
+        };
+      case 'summary':
+        return { ...base, text: item.text };
+      case 'notice':
+        return { ...base, text: item.text, tone: item.tone };
+    }
+  });
+}
+
+/**
+ * Inverse projection: rebuild a ChatModel from persisted SessionItems so a
+ * resumed session renders exactly what was on screen. Streaming flags are
+ * cleared — a loaded session is always at rest (no interrupted-task resume).
+ */
+export function fromSessionItems(items: SessionItem[]): ChatItem[] {
+  return items.map((item): ChatItem => {
+    const id = item.id || `restored-${Math.random().toString(36).slice(2, 8)}`;
+    switch (item.kind) {
+      case 'user':
+        return { kind: 'user', id, text: item.text ?? '' };
+      case 'assistant':
+        return { kind: 'assistant', id, text: item.text ?? '', streaming: false };
+      case 'plan':
+        return { kind: 'plan', id, steps: Array.isArray(item.steps) ? item.steps : [] };
+      case 'tool':
+        return {
+          kind: 'tool',
+          id,
+          toolCallId: item.toolCallId,
+          tool: item.tool ?? 'tool',
+          command: item.command,
+          output: item.output ?? '',
+          status: (item.status as ToolStatus) ?? 'ok',
+          level: (item.level as RiskLevel) ?? 'L1',
+          category: (item.category as ActionCategory) ?? 'shell',
+          basis: item.basis ?? '',
+          form: item.form === 'terminal' ? 'terminal' : 'card'
+        };
+      case 'file_read':
+        return { kind: 'file_read', id, path: item.path ?? '', sizeBytes: item.sizeBytes };
+      case 'file_changed':
+        return {
+          kind: 'file_changed',
+          id,
+          path: item.path ?? '',
+          change: (item.change as ChangeKind) ?? 'modified'
+        };
+      case 'subagent':
+        return {
+          kind: 'subagent',
+          id,
+          toolCallId: item.toolCallId,
+          label: item.label ?? '子任务',
+          output: item.output ?? '',
+          status: (item.status as ToolStatus) ?? 'ok',
+          summary: item.summary
+        };
+      case 'summary':
+        return { kind: 'summary', id, text: item.text ?? '' };
+      case 'notice':
+        return {
+          kind: 'notice',
+          id,
+          tone: (item.tone as Tone) ?? 'info',
+          text: item.text ?? ''
+        };
+    }
+  });
 }

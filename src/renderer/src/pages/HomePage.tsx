@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 import type { PathCheckResult } from '../../../shared/workspace';
+import { dshNotFoundCopy } from '../../../shared/error-copy';
 import { Badge, Banner, Button, Card } from '../components/ui';
 import { useApp } from '../store/app-store';
 
@@ -44,6 +45,8 @@ export default function HomePage(): JSX.Element {
   let bannerTone: 'info' | 'success' | 'error';
   let bannerTitle: string;
   let bannerText: string;
+  /** §32 three-part copy for the not-found scenario; built when applicable. */
+  let bannerCopy: { why: string; action: string } | null = null;
 
   if (state.connection === 'starting') {
     bannerTone = 'info';
@@ -60,10 +63,10 @@ export default function HomePage(): JSX.Element {
       .join('　·　');
   } else {
     bannerTone = 'error';
-    bannerTitle = '未找到 DeepSeek Harness';
-    bannerText =
-      detection?.reason ??
-      '未检测到可用的 dsh 运行时。请先安装 dsh CLI，或手动指定已安装的可执行文件路径。';
+    const copy = dshNotFoundCopy(detection?.reason);
+    bannerTitle = copy.what;
+    bannerText = `${copy.why}`;
+    bannerCopy = { why: copy.why, action: copy.action };
   }
 
   /* ---- actions ---------------------------------------------------- */
@@ -144,7 +147,8 @@ export default function HomePage(): JSX.Element {
           ) : undefined
         }
       >
-        {bannerText}
+        <p className="banner-why">{bannerText}</p>
+        {bannerCopy && <p className="banner-action">{bannerCopy.action}</p>}
       </Banner>
 
       <section className="home-actions">

@@ -10,6 +10,8 @@
  */
 
 import path from 'node:path';
+import fs from 'node:fs';
+import os from 'node:os';
 
 import { BrowserWindow, app, dialog, ipcMain } from 'electron';
 
@@ -25,6 +27,7 @@ import { SettingsStore, redactSecrets } from './settings/settings-store';
 import { locateDsh } from './settings/dsh-locator';
 import { refreshModels } from './settings/model-refresh';
 import { WorkspaceManager } from './workspace';
+import { idForPath } from './workspace/recent-projects';
 import type { OpenProjectResult } from '../shared/workspace';
 import { DshProcessManager } from './runtime/dsh-process-manager';
 import { RuntimeClient } from './runtime/runtime-client';
@@ -43,8 +46,16 @@ import type { BusMessage } from './runtime/event-bus';
 import type { ApprovalResolution, RuntimeCrashSnapshot } from '../shared/desktop-api';
 import type { ApprovalReply } from '../shared/approval-protocol';
 import type { ChangesSnapshot } from '../shared/changes';
+import type {
+  SessionLoadResult,
+  SessionMutationResult,
+  SessionRecord,
+  SessionSummary
+} from '../shared/session';
+import { isValidSessionId, validateSessionRecord } from '../shared/session';
 import { ChangeRecordService } from './changes/change-record-service';
 import { buildFileDiff } from './changes/file-diff';
+import { SessionStore } from './session/session-store';
 
 const isSmokeMode = process.env.DSH_SMOKE === '1';
 /** #5 responsive regression: DSH_RESPONSIVE_MEASURE=1 drives the UI probe. */
@@ -142,6 +153,7 @@ function registerIpcHandlers(context: {
   getWindow: () => BrowserWindow | null;
   changeRecords: ChangeRecordService;
   broadcastChanges: (snapshot: ChangesSnapshot) => void;
+  sessions: SessionStore;
 }): void {
   const {
     client,
@@ -152,7 +164,8 @@ function registerIpcHandlers(context: {
     getLogTail,
     getWindow,
     changeRecords,
-    broadcastChanges
+    broadcastChanges,
+    sessions
   } = context;
 
   ipcMain.handle('runtime:get-status', () => status());
@@ -274,6 +287,99 @@ function registerIpcHandlers(context: {
     return workspaces.checkPath(target);
   });
   ipcMain.handle('workspace:get-current', () => ({ path: workspaces.currentRoot }));
+  // 工作区上下文一致性（DSHA-7 QA 回归修复）：renderer 端 workspaceRoot 可由
+  // Recent Projects 头部自动激活/顶部导航带入，而主进程 currentRoot 可能尚未
+  // 同步。发送前 renderer 通过此通道让主进程激活同一 workspace；激活成功才
+  // 允许 session:create 与 runtime:send（§15 local-first：会话必须落在真正的
+  // workspace 目录下，不得退回 fallback root 静默发送）。
+  ipcMain.handle('workspace:ensure-active', (_event, target: unknown): OpenProjectResult => {
+    if (typeof target !== 'string' || target.trim() === '') {
+      return { ok: false, error: '路径无效' };
+    }
+    // Reuse the same validated activation path as openAt (existence/type/
+    // accessibility checks + recent touch) so main and renderer agree on ONE
+    // canonical workspace activation entry point.
+    return workspaces.openAt(target);
+  });
+
+  /* ---- Sessions (§15/§16, F10/AC-12) — local-first persistence ---- */
+
+  ipcMain.handle('session:list', (): Promise<SessionSummary[]> => {
+    const root = workspaces.currentRoot;
+    if (!root) return Promise.resolve([]);
+    return Promise.resolve(sessions.listSummaries(root));
+  });
+  ipcMain.handle('session:get-active-id', (): Promise<{ id: string | null }> => {
+    const root = workspaces.currentRoot;
+    if (!root) return Promise.resolve({ id: null });
+    return Promise.resolve({ id: sessions.getActiveId(root) });
+  });
+  ipcMain.handle(
+    'session:create',
+    (_event, title: unknown): Promise<{ result: SessionMutationResult; record?: SessionRecord }> => {
+      const root = workspaces.currentRoot;
+      if (!root) {
+        return Promise.resolve({ result: { ok: false, error: '未打开工作区' } });
+      }
+      const record = sessions.create(root, typeof title === 'string' ? title : undefined);
+      return Promise.resolve({ result: { ok: true, id: record.id }, record });
+    }
+  );
+  ipcMain.handle('session:load', (_event, id: unknown): Promise<SessionLoadResult> => {
+    const root = workspaces.currentRoot;
+    if (!root || !isValidSessionId(id)) {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 非法' });
+    }
+    return Promise.resolve(sessions.load(root, id));
+  });
+  ipcMain.handle('session:save', (_event, record: unknown): Promise<SessionMutationResult> => {
+    const root = workspaces.currentRoot;
+    if (!root || typeof record !== 'object' || record === null) {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话记录无效' });
+    }
+    // Validate the untrusted renderer payload centrally before handing it to
+    // the store; the store re-validates on the disk side too (defence in depth).
+    const validated = validateSessionRecord(record, {
+      expectedWorkspaceRoot: workspaces.currentRoot ?? undefined
+    });
+    if (!validated.ok) {
+      return Promise.resolve({ ok: false, error: validated.error });
+    }
+    return Promise.resolve(sessions.save(root, validated.record));
+  });
+  ipcMain.handle('session:switch', (_event, id: unknown): Promise<SessionMutationResult> => {
+    const root = workspaces.currentRoot;
+    if (!root || !isValidSessionId(id)) {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 非法' });
+    }
+    return Promise.resolve(sessions.switchTo(root, id));
+  });
+  ipcMain.handle('session:delete', (_event, id: unknown): Promise<SessionMutationResult> => {
+    const root = workspaces.currentRoot;
+    if (!root || !isValidSessionId(id)) {
+      return Promise.resolve({ ok: false, error: '未打开工作区或会话 id 非法' });
+    }
+    return Promise.resolve(sessions.delete(root, id));
+  });
+  // §34/§15 持久化生命周期：app 关闭/导航前的同步 checkpoint。Renderer
+  // 用 sendSync 发送当前 SessionRecord，主进程同步落盘后返回结果——
+  // 这样 beforeunload/pagehide 与 before-quit 都能在进程退出前完成保存。
+  // 输入按 save() 口径做不可信校验（id 格式、schema、跨工作区一致性）。
+  ipcMain.on('session:flush-before-quit', (event, record: unknown): void => {
+    const root = workspaces.currentRoot;
+    if (!root || typeof record !== 'object' || record === null) {
+      event.returnValue = { ok: false, error: '未打开工作区或会话记录无效' };
+      return;
+    }
+    const validated = validateSessionRecord(record, {
+      expectedWorkspaceRoot: workspaces.currentRoot ?? undefined
+    });
+    if (!validated.ok) {
+      event.returnValue = { ok: false, error: validated.error };
+      return;
+    }
+    event.returnValue = sessions.save(root, validated.record);
+  });
 
   /* ---- Settings ---- */
 
@@ -440,6 +546,8 @@ async function main(): Promise<void> {
     mainWindow?.webContents.send('runtime:connection-state', state);
     // §32 crash recovery: record the pid claim lifecycle alongside state.
     if (state === 'ready') {
+      // §34 performance probe: the runtime-ready timestamp signal.
+      console.log('[runtime] ready');
       const pid = manager.pid;
       if (pid !== undefined) {
         void claimRuntimePidFile(pidFile, {
@@ -463,6 +571,11 @@ async function main(): Promise<void> {
   const broadcastChanges = (snapshot: ChangesSnapshot): void => {
     mainWindow?.webContents.send('changes:snapshot', snapshot);
   };
+
+  /* ---- Session store (DSHA-7 §15/§16, F10/AC-12) ---- */
+  // Desktop-owned conversation state lives under ~/.dsh/desktop so all product
+  // state stays together; scoped per workspace root.
+  const sessions = new SessionStore();
 
   bus.subscribe((message: BusMessage) => {
     if (message.kind === 'violation') {
@@ -577,7 +690,8 @@ async function main(): Promise<void> {
       logStore.tail({ category, maxChars: 32 * 1024 }),
     getWindow: () => mainWindow,
     changeRecords,
-    broadcastChanges
+    broadcastChanges,
+    sessions
   });
 
   mainWindow = new BrowserWindow({
@@ -590,6 +704,27 @@ async function main(): Promise<void> {
       nodeIntegration: false,
       sandbox: true
     }
+  });
+
+  // The responsive probes drive the real Workspace page. Since the DSHA-7
+  // workspace-consistency fix the composer requires an ACTIVE workspace (no
+  // more silent fallback-root sends), so open a throwaway probe workspace
+  // BEFORE the renderer loads — its Recent-Projects bootstrap then sees a
+  // valid head and the full user flow (activate → session:create → send) is
+  // exercised. Dropped again after the probes (record + directory).
+  const responsiveProbeWorkspace = isResponsiveMeasureMode
+    ? fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-responsive-probe-'))
+    : null;
+  if (responsiveProbeWorkspace !== null) {
+    workspaces.openAt(responsiveProbeWorkspace);
+  }
+
+  // §34 cold-start probe: first-paint timestamp = the first navigation the
+  // renderer finished loading (did-finish-load). Attached BEFORE loadFile so
+  // the initial load's event is captured; one-shot, logged to stdout so the
+  // startup measurement can time the首屏.
+  mainWindow.webContents.once('did-finish-load', () => {
+    console.log('[first-paint]');
   });
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
@@ -623,8 +758,21 @@ async function main(): Promise<void> {
       );
     }
     // Deterministic teardown: stop the resident stub so no child survives,
-    // then exit with the probe verdict.
+    // drop the probe workspace (recent record + directory), then exit with
+    // the probe verdict.
     await client.stop().catch(() => undefined);
+    if (responsiveProbeWorkspace !== null) {
+      try {
+        workspaces.removeRecent(idForPath(responsiveProbeWorkspace));
+      } catch {
+        /* best-effort */
+      }
+      try {
+        fs.rmSync(responsiveProbeWorkspace, { recursive: true, force: true });
+      } catch {
+        /* best-effort */
+      }
+    }
     console.log(JSON.stringify({ responsive: failed ? 'fail' : 'ok' }));
     setTimeout(() => app.exit(failed ? 1 : 0), 100).unref();
     return;

@@ -14,6 +14,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import type { ConnectionState, RuntimeStatus } from '../../../shared/desktop-api';
+import {
+  agentCrashCopy,
+  describeSessionError,
+  runtimeStartupFailedCopy,
+  workspaceActivationFailedCopy,
+  workspaceNotOpenCopy
+} from '../../../shared/error-copy';
 import type {
   ApprovalRequestPayload,
 } from '../../../shared/approval-protocol';
@@ -24,6 +31,9 @@ import { Button, Spinner } from '../components/ui';
 import { useApp } from '../store/app-store';
 import { useChanges } from '../changes/changes-store';
 import { badgeTitle, changedFiles, showRunSummary, summaryLabel } from '../changes/model';
+import { useSessionStore } from '../session/session-store';
+import { runSubmit } from '../session/submit-flow';
+import { HydrationGuard } from '../session/session-transition';
 import {
   INITIAL_MODEL,
   reduceChat,
@@ -33,6 +43,7 @@ import {
   type FileChangedItem,
   type FileReadItem,
   type PlanItem,
+  type RunPhase,
   type SubagentItem,
   type SummaryItem,
   type ToolCardItem,
@@ -54,13 +65,9 @@ const STATE_LABEL: Record<ConnectionState, string> = {
   crashed: '已崩溃'
 };
 
-interface SessionEntry {
-  id: string;
-  title: string;
-  active: boolean;
-}
-
 export default function WorkspacePage(): JSX.Element {
+  const { state: appState, dispatch: appDispatch } = useApp();
+  const sessions = useSessionStore(appState.workspaceRoot);
   const [model, setModel] = useState<ChatModel>(INITIAL_MODEL);
   const [input, setInput] = useState('');
   const [connection, setConnection] = useState<ConnectionState>('stopped');
@@ -75,33 +82,118 @@ export default function WorkspacePage(): JSX.Element {
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null);
   const [modelChoice, setModelChoice] = useState<string>('');
   const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [sessions, setSessions] = useState<SessionEntry[]>([
-    { id: 'local', title: '本地会话', active: true }
-  ]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<ChatModel>(INITIAL_MODEL);
   modelRef.current = model;
+  /**
+   * Hydration race guard (§15/AC-12, review round 4): a hydration result may
+   * only replace the model if nothing mutated the model since the request was
+   * issued. Chat actions, create/switch model applications and send-failure
+   * notices each call noteMutation(); this is what stops a late empty snapshot
+   * from wiping a just-dispatched first message WITHOUT blocking legitimate
+   * replacements of a stale (deleted/previous) session's model.
+   */
+  const hydrationGuardRef = useRef<HydrationGuard>(new HydrationGuard());
 
   /* ---- aggregated Changes (DSHA-6) ------------------------------------ */
 
-  const { dispatch: appDispatch } = useApp();
   const changes = useChanges();
   const runActive = model.phase !== 'idle';
   const changedFileList = changedFiles(changes.snapshot);
   const branchLabel = changes.snapshot?.gitAvailable
     ? `⎇ ${changes.snapshot.branch ?? '未知分支'}${changes.snapshot.detached ? ' (detached)' : ''}`
     : null;
+
+  const dispatch = useCallback((action: Parameters<typeof reduceChat>[1]): void => {
+    // Every chat action mutates the live model → invalidates any in-flight
+    // hydration request (HydrationGuard, §15/AC-12 race protection).
+    hydrationGuardRef.current.noteMutation();
+    setModel((prev) => reduceChat(prev, action));
+  }, []);
+
+  /* ---- Session persistence (DSHA-7 §15/§16, F10/AC-12) ---------------- */
+
+  // Persist meta assembled from the live model + selection.
+  const persistMeta = useCallback(() => ({
+    model: modelChoice || null,
+    phase: modelRef.current.phase,
+    tokenUsage: null,
+    workspaceRoot: appState.workspaceRoot
+  }), [modelChoice, appState.workspaceRoot]);
+
+  // The active session id + flush fn come from the session hook (declared
+  // here, before openDiff, so the navigation checkpoint can reference them).
+  const { loaded: sessionLoaded, activeId: sessionActiveId, hydrate: sessionHydrate, persist: sessionPersist, flush: sessionFlush } = sessions;
+
+  // Synchronous checkpoint of the active session (navigation / unload / quit).
+  // Uses the main-process sendSync flush channel so the save completes before
+  // the renderer is torn down. No-op when there is no active session/workspace.
+  const flushNow = useCallback((): { ok: boolean; error?: string } => {
+    if (!sessionActiveId || !appState.workspaceRoot) return { ok: false };
+    return sessionFlush(modelRef.current, persistMeta());
+  }, [sessionActiveId, appState.workspaceRoot, sessionFlush, persistMeta]);
+
+  // Hydrate the active session once it's loaded (and when the active id
+  // changes due to a switch). Never auto-resume a running task.
+  useEffect(() => {
+    if (!sessionLoaded) return;
+    let cancelled = false;
+    // §15/AC-12 竞态防护（review round 4）：hydrate 结果仅在「请求发出后内存
+    // 模型未被任何非 hydrate 变更改动」时才可应用。判定基于请求代次而非
+    // 「内存是否为空」——删除活动会话后内存仍保留被删会话的非空模型，
+    // fallback 快照必须能够替换它；而请求期间新 dispatch 的消息又绝不能被
+    // 迟到的空快照抹掉。effect 的 cancelled 清理继续承担「active id 已变、
+    // 请求被取代」的第一道防线。时序见 tests/session-first-message.test.ts。
+    const epoch = hydrationGuardRef.current.request();
+    void sessionHydrate().then((restored) => {
+      if (cancelled || restored === null) return;
+      if (!hydrationGuardRef.current.canApply(epoch)) return;
+      setModel(restored);
+    });
+    return () => { cancelled = true; };
+  }, [sessionLoaded, sessionActiveId, sessionHydrate]);
+
+  // Persist on run termination (done / run_completed / run_cancelled / error).
+  const lastPhaseRef = useRef<RunPhase>('idle');
+  useEffect(() => {
+    const prev = lastPhaseRef.current;
+    const next = model.phase;
+    lastPhaseRef.current = next;
+    // Just went idle from a non-idle state → the run ended, checkpoint.
+    if (prev !== 'idle' && next === 'idle' && sessionActiveId) {
+      void sessionPersist(modelRef.current, persistMeta());
+    }
+  }, [model.phase, sessionActiveId, sessionPersist, persistMeta]);
+
+  // §15 持久化生命周期：组件卸载与 app 关闭前的同步 checkpoint。beforeunload
+  // 覆盖窗口关闭/刷新；pagehide 作为兜底。两者都通过 flushNow 走 sendSync，
+  // 保证在进程退出前完成落盘。
+  useEffect(() => {
+    const flushBeforeExit = (): void => {
+      flushNow();
+    };
+    window.addEventListener('beforeunload', flushBeforeExit);
+    window.addEventListener('pagehide', flushBeforeExit);
+    return () => {
+      // Unmount flush — e.g. when the page-host swaps Workspace out.
+      flushNow();
+      window.removeEventListener('beforeunload', flushBeforeExit);
+      window.removeEventListener('pagehide', flushBeforeExit);
+    };
+    // flushNow is stable across the workspace/session identity it depends on;
+    // re-subscribe when those change so the listener always captures the right id.
+  }, [flushNow]);
+
   const openDiff = useCallback(
     (path: string) => {
+      // §15/§34 持久化生命周期：离开 Workspace 进入 Diff 前，同步落盘当前会话，
+      // 避免尚未发生终止事件的消息/工具调用在导航时丢失。
+      flushNow();
       changes.select(path);
       appDispatch({ type: 'navigate', route: 'diff' });
     },
-    [changes, appDispatch]
+    [changes, appDispatch, flushNow]
   );
-
-  const dispatch = useCallback((action: Parameters<typeof reduceChat>[1]): void => {
-    setModel((prev) => reduceChat(prev, action));
-  }, []);
 
   /* ---- subscriptions ------------------------------------------------ */
 
@@ -130,17 +222,6 @@ export default function WorkspacePage(): JSX.Element {
     void window.desktop.getStatus().then((initial) => {
       setStatus(initial);
       setConnection(initial.state);
-      if (initial.sessionId !== null && initial.sessionId !== '') {
-        setSessions((prev) =>
-          prev.some((s) => s.id === initial.sessionId)
-            ? prev.map((s) => ({ ...s, active: s.id === initial.sessionId }))
-            : [...prev.map((s) => ({ ...s, active: false })), {
-                id: initial.sessionId!,
-                title: `会话 ${initial.sessionId!.slice(0, 8)}`,
-                active: true
-              }]
-        );
-      }
     });
     // Model choices come from configured providers; selection is cosmetic
     // until P1-C wires it into run requests.
@@ -169,31 +250,68 @@ export default function WorkspacePage(): JSX.Element {
   /* ---- actions ------------------------------------------------------ */
 
   const running = model.phase !== 'idle';
-  const canSend = connection === 'ready' && !running && input.trim() !== '';
+  // 没有工作区上下文时 composer 禁用（§3.3/§7.1）——消息必须落在已打开的
+  // workspace 里，不再退回 fallback root 静默发送。
+  const canSend = connection === 'ready' && !running && input.trim() !== '' && appState.workspaceRoot !== null;
 
   const submit = useCallback(async (): Promise<void> => {
     const text = input.trim();
     if (!canSend) return;
-    setInput('');
-    dispatch({ type: 'send', text });
-    const result = await window.desktop.sendMessage(text);
-    if (!result.ok) {
-      // No run actually started — release the lock and surface the error.
-      setModel((prev) => ({
-        ...prev,
-        phase: 'idle',
-        items: [
-          ...prev.items,
-          {
-            kind: 'notice',
-            id: `senderr-${Date.now()}`,
-            tone: 'error' as const,
-            text: `发送失败：${result.error ?? 'unknown error'}`
-          }
-        ]
-      }));
-    }
-  }, [input, canSend, dispatch]);
+    // 工作区上下文一致性 + 首条消息会话建立（§15/AC-02/AC-12）：先让主进程激活
+    // workspace，再创建 Session，最后发送。激活/创建失败则不发送并给出准确三段式
+    // 提示；绝不退回「无会话静默发送」的旧降级。时序编排见 session/submit-flow.ts。
+    // 输入框清空由编排内部的 clearInput 控制——仅在消息实际 dispatch 时清空，
+    // 被阻断（无工作区/激活失败/创建中止）时保留原输入，本函数不得另行改写 input。
+    await runSubmit(
+      {
+        workspaceRoot: () => appState.workspaceRoot,
+        hasActiveSession: () => sessions.activeId !== null,
+        activateWorkspace: (path) => window.desktop.ensureWorkspaceActive(path),
+        createSession: (title) => sessions.create(modelRef.current, persistMeta(), title),
+        clearInput: () => setInput(''),
+        sendMessage: (message) => {
+          // The user message goes on screen optimistically, then the run starts.
+          dispatch({ type: 'send', text: message });
+          return window.desktop.sendMessage(message);
+        },
+        onWorkspaceActivated: (path) => appDispatch({ type: 'workspace', path }),
+        onSessionCreated: (model) => {
+          hydrationGuardRef.current.noteMutation();
+          setModel(model);
+          lastPhaseRef.current = 'idle';
+        },
+        onBlocked: (notice) => {
+          // No workspace context (or activation failed) — accurate §32 copy,
+          // never a bare store error string. The input is NOT touched here:
+          // preservation is the flow's default (no clearInput call).
+          sessions.surfaceError(
+            notice === '未打开工作区'
+              ? describeSessionError(workspaceNotOpenCopy())
+              : describeSessionError(workspaceActivationFailedCopy(notice))
+          );
+        },
+        onSendFailed: (error) => {
+          // No run actually started — release the lock and surface the error
+          // (pre-existing behavior, unchanged). A model mutation all the same.
+          hydrationGuardRef.current.noteMutation();
+          setModel((prev) => ({
+            ...prev,
+            phase: 'idle',
+            items: [
+              ...prev.items,
+              {
+                kind: 'notice',
+                id: `senderr-${Date.now()}`,
+                tone: 'error' as const,
+                text: `发送失败：${error ?? 'unknown error'}`
+              }
+            ]
+          }));
+        }
+      },
+      text
+    );
+  }, [input, canSend, dispatch, sessions, persistMeta, appState.workspaceRoot, appDispatch]);
 
   const stop = useCallback(async (): Promise<void> => {
     if (modelRef.current.phase === 'idle') return;
@@ -204,6 +322,38 @@ export default function WorkspacePage(): JSX.Element {
     }
     // Unlock happens only when run_cancelled arrives (AC-11).
   }, [dispatch]);
+
+  /* ---- Session actions (DSHA-7 §15 多会话) --------------------------- */
+
+  const newSession = useCallback(async (): Promise<void> => {
+    if (running) return; // lock during a run
+    // The outgoing session is checkpointed inside create(); on failure the
+    // transition aborts (null) and the current model/active id stay on screen
+    // so unsaved conversation state is never discarded (§15/AC-12).
+    const restored = await sessions.create(modelRef.current, persistMeta());
+    if (restored === null) return;
+    hydrationGuardRef.current.noteMutation();
+    setModel(restored);
+    lastPhaseRef.current = 'idle';
+  }, [running, sessions, persistMeta]);
+
+  const switchSession = useCallback(async (id: string): Promise<void> => {
+    if (running) return;
+    // Same abort semantics: a failed outgoing checkpoint keeps the user on the
+    // current (unsaved) session instead of silently replacing the model.
+    const restored = await sessions.switchTo(id, modelRef.current, persistMeta());
+    if (restored === null) return;
+    hydrationGuardRef.current.noteMutation();
+    setModel(restored);
+    lastPhaseRef.current = 'idle';
+  }, [running, sessions, persistMeta]);
+
+  const deleteSession = useCallback(async (id: string): Promise<void> => {
+    if (running) return;
+    // The active session is saved by the user before this; deleting the
+    // active one lets the hydrate effect load the fallback when activeId flips.
+    await sessions.remove(id);
+  }, [running, sessions]);
 
   /* ---- responsive drawers (#5) ---------------------------------------
    * Below 960px the side columns become off-canvas drawers: the middle
@@ -308,17 +458,56 @@ export default function WorkspacePage(): JSX.Element {
         className={`col col-sessions${drawer === 'sessions' ? ' drawer-open' : ''}`}
         aria-label="Sessions"
       >
-        <h2 className="panel-title">Sessions</h2>
-        <ul className="session-list">
-          {sessions.map((s) => (
-            <li key={s.id} className={s.active ? 'session active' : 'session'}>
-              <span className="session-dot" aria-hidden="true" />
-              <span className="session-title">{s.title}</span>
-              {s.active && <span className="session-badge">当前</span>}
+        <div className="sessions-head">
+          <h2 className="panel-title">Sessions</h2>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => void newSession()}
+            disabled={running || !appState.workspaceRoot}
+            aria-label="新建会话"
+            title="新建会话"
+          >
+            + 新建
+          </Button>
+        </div>
+        <ul className="session-list" aria-label="会话列表">
+          {sessions.summaries.length === 0 && (
+            <li className="session session-empty">
+              <span className="session-title">暂无会话——点击「+ 新建」开始一段对话（本地持久化）。</span>
+            </li>
+          )}
+          {sessions.summaries.map((s) => (
+            <li
+              key={s.id}
+              className={s.active ? 'session active' : 'session'}
+            >
+              <button
+                type="button"
+                className="session-switch"
+                onClick={() => void switchSession(s.id)}
+                disabled={running || s.active}
+                aria-current={s.active ? 'true' : undefined}
+                title={`${s.title}（点击切换）`}
+              >
+                <span className="session-dot" aria-hidden="true" />
+                <span className="session-title">{s.title}</span>
+                {s.active && <span className="session-badge">当前</span>}
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost session-delete"
+                onClick={() => void deleteSession(s.id)}
+                disabled={running}
+                aria-label={`删除会话 ${s.title}`}
+                title="删除会话"
+              >
+                ✕
+              </button>
             </li>
           ))}
         </ul>
-        <p className="empty-hint">会话持久化将在后续阶段提供（当前为内存列表）。</p>
+        <p className="empty-hint">会话按工作区持久化在 ~/.dsh/desktop/sessions；完全关闭重开后可继续回看。</p>
       </aside>
 
       {/* ---------------- Middle: conversation ---------------- */}
@@ -390,37 +579,46 @@ export default function WorkspacePage(): JSX.Element {
           )}
         </header>
 
-        {connection === 'crashed' && (
-          <div className="recovery-banner recovery-crash" role="alert">
-            <div>
-              <strong>Runtime 已崩溃</strong>
-              {status?.crash != null && (
-                <code className="crash-detail">
-                  exit={String(status.crash.exitCode ?? '—')} signal={status.crash.signal ?? '—'}
-                </code>
-              )}
+        {connection === 'crashed' && (() => {
+          const crash = status?.crash;
+          const copy = agentCrashCopy(crash?.exitCode ?? null, crash?.signal ?? null);
+          return (
+            <div className="recovery-banner recovery-crash" role="alert">
+              <div className="recovery-copy">
+                <strong>{copy.what}</strong>
+                <p className="recovery-why">{copy.why}</p>
+                <p className="recovery-action">{copy.action}</p>
+                {copy.detail && <code className="crash-detail">{copy.detail}</code>}
+              </div>
+              <div className="recovery-actions">
+                <Button size="sm" variant="primary" onClick={recoverRestart}>
+                  重启 Runtime
+                </Button>
+                <Button size="sm" variant="secondary" onClick={recoverResume}>
+                  恢复会话
+                </Button>
+              </div>
             </div>
-            <div className="recovery-actions">
-              <Button size="sm" variant="primary" onClick={recoverRestart}>
-                重启 Runtime
+          );
+        })()}
+        {connection === 'stopped' && status?.lastError != null && status.lastError !== '' && (() => {
+          const copy = runtimeStartupFailedCopy(status.lastError);
+          return (
+            <div className="recovery-banner recovery-startup" role="alert">
+              <div className="recovery-copy">
+                <strong>{copy.what}</strong>
+                <p className="recovery-why">{copy.why}</p>
+                <p className="recovery-action">{copy.action}</p>
+                {copy.detail && copy.detail.trim() !== '' && (
+                  <pre className="startup-stderr">{copy.detail}</pre>
+                )}
+              </div>
+              <Button size="sm" variant="primary" onClick={recoverResume}>
+                重试启动
               </Button>
-              <Button size="sm" variant="secondary" onClick={recoverResume}>
-                恢复会话
-              </Button>
             </div>
-          </div>
-        )}
-        {connection === 'stopped' && status?.lastError != null && status.lastError !== '' && (
-          <div className="recovery-banner recovery-startup" role="alert">
-            <div>
-              <strong>Runtime 启动失败</strong>
-              <pre className="startup-stderr">{status.lastError}</pre>
-            </div>
-            <Button size="sm" variant="primary" onClick={recoverResume}>
-              重试启动
-            </Button>
-          </div>
-        )}
+          );
+        })()}
 
         <ChatList items={model.items} scrollRef={scrollRef} />
 
@@ -429,13 +627,15 @@ export default function WorkspacePage(): JSX.Element {
             className="composer-input"
             value={input}
             placeholder={
-              connection === 'ready'
-                ? running
-                  ? '任务运行中，请等待完成或点击停止…'
-                  : '描述你要完成的任务…'
-                : '先在首页启动 Runtime…'
+              appState.workspaceRoot === null
+                ? '未打开工作区——请回首页打开项目后再发送…'
+                : connection === 'ready'
+                  ? running
+                    ? '任务运行中，请等待完成或点击停止…'
+                    : '描述你要完成的任务…'
+                  : '先在首页启动 Runtime…'
             }
-            disabled={connection !== 'ready' || running}
+            disabled={appState.workspaceRoot === null || connection !== 'ready' || running}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -517,7 +717,7 @@ export default function WorkspacePage(): JSX.Element {
         {showRunSummary(runActive, changes.snapshot) && (
           <div className="changes-summary-bar" role="status">
             <span className="changes-summary-text">{summaryLabel(changedFileList.length)}</span>
-            <Button variant="secondary" onClick={() => appDispatch({ type: 'navigate', route: 'diff' })}>
+            <Button variant="secondary" onClick={() => { flushNow(); appDispatch({ type: 'navigate', route: 'diff' }); }}>
               View Diff
             </Button>
           </div>
@@ -543,6 +743,24 @@ export default function WorkspacePage(): JSX.Element {
             type="button"
             className="btn btn-secondary"
             onClick={() => setApprovalNotice(null)}
+          >
+            知道了
+          </button>
+        </div>
+      )}
+      {appState.workspaceRoot === null && (
+        // 工作区上下文不存在：composer 禁用 + 三段式指引（§3.3/§7.1）。
+        <div className="oob-banner session-error-banner" role="alert">
+          <span>✕ {describeSessionError(workspaceNotOpenCopy())}</span>
+        </div>
+      )}
+      {sessions.lastError !== null && (
+        <div className="oob-banner session-error-banner" role="alert">
+          <span>✕ {sessions.lastError}</span>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => sessions.dismissError()}
           >
             知道了
           </button>

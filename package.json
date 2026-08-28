@@ -20,6 +20,7 @@
     "smoke:dsh": "node scripts/smoke-dsh-desktop.mjs",
     "smoke:app": "node scripts/smoke-electron.mjs",
     "test:responsive": "node scripts/measure-responsive.mjs",
+    "test:cold-start": "node scripts/measure-cold-start.mjs",
     "capture:diff": "node scripts/capture/run-capture.mjs"
   },
   "dependencies": {

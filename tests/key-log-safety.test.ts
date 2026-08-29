@@ -46,11 +46,11 @@ describe('API keys never reach logs or renderer-visible strings', () => {
   it('save/delete/setPermissions/setDshPath emit no secret to the log sink', () => {
     const { store, logs } = makeStore();
 
-    expect(store.saveProvider({ name: 'p1', apiType: 'openai_compatible', baseUrl: 'https://api.example.com/v1', models: ['m1'], apiKey: SECRET }).ok).toBe(true);
+    expect(store.saveProvider({ name: 'p1', apiType: 'openai_compatible', baseUrl: 'https://api.example.com/v1', models: [{ id: 'm1' }], apiKey: SECRET }).ok).toBe(true);
     expect(store.deleteProvider('p1').ok).toBe(true);
     expect(store.setPermissionsMode('auto_edit').ok).toBe(true);
     expect(store.setDshPath('/usr/bin/dsh').ok).toBe(true);
-    expect(store.saveProvider({ name: 'p2', apiType: 'openai_compatible', baseUrl: 'https://api.example.com/v2', models: ['m2'], apiKey: SECRET }).ok).toBe(true);
+    expect(store.saveProvider({ name: 'p2', apiType: 'openai_compatible', baseUrl: 'https://api.example.com/v2', models: [{ id: 'm2' }], apiKey: SECRET }).ok).toBe(true);
 
     for (const line of logs()) SECRET_IN_ANY_OUTPUT(line);
 
@@ -67,12 +67,12 @@ describe('API keys never reach logs or renderer-visible strings', () => {
 
   it('renderer-visible view/warnings/errors never contain the key', () => {
     const { store } = makeStore();
-    store.saveProvider({ name: 'p1', apiType: 'openai_compatible', baseUrl: 'https://api.example.com/v1', models: ['m1'], apiKey: SECRET });
+    store.saveProvider({ name: 'p1', apiType: 'openai_compatible', baseUrl: 'https://api.example.com/v1', models: [{ id: 'm1' }], apiKey: SECRET });
 
     SECRET_IN_ANY_OUTPUT(JSON.stringify(store.view()));
     for (const warning of store.takeWarnings()) SECRET_IN_ANY_OUTPUT(warning);
 
-    const failure = store.saveProvider({ name: 'bad!', apiType: 'openai_compatible', baseUrl: 'https://x/v1', models: ['m'], apiKey: SECRET });
+    const failure = store.saveProvider({ name: 'bad!', apiType: 'openai_compatible', baseUrl: 'https://x/v1', models: [{ id: 'm' }], apiKey: SECRET });
     SECRET_IN_ANY_OUTPUT(failure.error ?? '');
   });
 
@@ -84,7 +84,7 @@ describe('API keys never reach logs or renderer-visible strings', () => {
 
   it('the on-disk settings.yaml stays key-free across mutations', () => {
     const { store } = makeStore();
-    store.saveProvider({ name: 'p1', apiType: 'openai_compatible', baseUrl: 'https://x/v1', models: ['m'], apiKey: SECRET });
+    store.saveProvider({ name: 'p1', apiType: 'openai_compatible', baseUrl: 'https://x/v1', models: [{ id: 'm' }], apiKey: SECRET });
     store.setPermissionsMode('full_auto');
     store.setDshPath(null);
     const raw = fs.readFileSync(store.settingsPath, 'utf8');

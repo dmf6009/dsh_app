@@ -247,7 +247,7 @@ export default function WorkspacePage(): JSX.Element {
     // until P1-C wires it into run requests.
     void window.desktop.getSettings().then((view) => {
       const names = Array.from(
-        new Set(view.providers.flatMap((p) => p.models ?? []))
+        new Set(view.providers.flatMap((p) => p.models?.map((m) => m.id) ?? []))
       );
       setAvailableModels(names);
       setModelChoice((current) => current || names[0] || '');

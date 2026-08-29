@@ -20,6 +20,7 @@ import type { ConnectionState, DshDetection, RuntimeStatus } from '../shared/des
 import type { RuntimeEventFrame } from '../shared/protocol/types';
 import type {
   ModelsRefreshResult,
+  ModelInfo,
   OperationResult,
   PermissionMode,
   SaveProviderInput
@@ -434,7 +435,9 @@ function registerIpcHandlers(context: {
         name: candidate.name,
         apiType: candidate.apiType ?? 'openai_compatible',
         baseUrl: candidate.baseUrl,
-        models: candidate.models.filter((m): m is string => typeof m === 'string'),
+        models: candidate.models.filter(
+          (m): m is ModelInfo => typeof m === 'object' && m !== null && typeof m.id === 'string'
+        ),
         apiKey: typeof candidate.apiKey === 'string' ? candidate.apiKey : undefined
       });
     }
@@ -454,6 +457,13 @@ function registerIpcHandlers(context: {
     'settings:set-dsh-path',
     (_event, value: unknown): Promise<OperationResult> | OperationResult =>
       settings.setDshPath(typeof value === 'string' ? value : null)
+  );
+  ipcMain.handle(
+    'settings:set-default-model',
+    (_event, provider: unknown, model: unknown): OperationResult =>
+      typeof provider === 'string' && typeof model === 'string'
+        ? settings.setDefaultModel(provider, model)
+        : { ok: false, error: '参数无效' }
   );
   ipcMain.handle(
     'settings:refresh-models',

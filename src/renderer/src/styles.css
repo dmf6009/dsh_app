@@ -607,6 +607,21 @@ code {
   resize: vertical;
 }
 
+/* Models → rich model rows editor (id / name / context window / max output) */
+.model-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1.4fr) minmax(100px, 1fr) 130px 110px auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+@media (max-width: 900px) {
+  .model-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
 .field-input:hover:not(:disabled),
 .field-select:hover:not(:disabled) {
   border-color: var(--accent);

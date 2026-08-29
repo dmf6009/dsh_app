@@ -161,6 +161,8 @@ export interface DesktopApi {
   deleteProvider(name: string): Promise<OperationResult>;
   setPermissionsMode(mode: PermissionMode): Promise<OperationResult>;
   setDshPath(path: string | null): Promise<OperationResult>;
+  /** Writes the dsh-native `agent-default-model` section. */
+  setDefaultModel(provider: string, model: string): Promise<OperationResult>;
   refreshModels(input: {
     providerName?: string;
     baseUrl: string;

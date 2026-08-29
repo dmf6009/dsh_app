@@ -3,7 +3,7 @@
 **关联 Issue：** DSHA-2（启动 dsh_app：完成 MVP 需求拆解、设计、开发与验收）
 **输入基准：** 《基于 DeepSeek Harness 的桌面 Coding Agent 需求文档》v0.1（本 Issue 附件，唯一输入基准）
 **作者：** UI-UE设计师
-**版本：** v1.1（MVP 前置设计基线；v1.1 增补 §11 Plugins 页签——dsh「万物皆可插」的桌面呈现）
+**版本：** v1.2（MVP 前置设计基线；v1.1 增补 §11 Plugins 页签；v1.2 Models 设置改为 dsh 原生 schema 读写）
 **范围约束：** 不超出需求文档范围，不新增功能设想；所有设计点均标注文档出处（§n）。§11 为产品负责人批准的范围增量，不受此约束。
 
 ---
@@ -259,7 +259,7 @@ UI 所有动态表现均由 Runtime Protocol 事件驱动（§20/§21），映�
 └───────────────────────────────────────────────┘
 ```
 
-- **Models**（§17）：Provider 配置表单字段与文档一致（Provider / API Type / Base URL / API Key / Models）；保存写入 `~/.dsh/settings.yaml`，凭据写入 `~/.dsh/.credentials.yaml`（作为说明文字呈现，UI 不暴露文件编辑器）。API Key 保存后一律掩码显示，不允许明文回看。
+- **Models**（§17；v1.2 按 dsh 原生 schema 重做）：Provider 列表从 `~/.dsh/settings.yaml` 的 dsh 原生插件段加载——`llm-pi-ai.providers.*`（多 Provider，含 openrouter/google 等无 baseURL 的内置端点 Provider）与 `llm-deepseek`（密钥 env 默认 `DEEPSEEK_API_KEY`）；模型为富对象条目（id / 显示名 / 上下文窗口 / 最大输出），可增删改参数，磁盘上已有而界面未列出的字段（多模态、图片预算等）写回时原样保留；API Key 按 dsh 原生约定写入 `~/.dsh/.credentials.yaml` 的 `refs.<apiKeyEnv>`（掩码显示，不明文回看，文件保持 0600）；支持设置默认模型（写入 `agent-default-model`）。写回使用 YAML CST（parseDocument）只改动自有段落——注释、格式与未知段落（ui-onboarding 等）原样保留；settings.yaml 解析失败时拒绝保存并提示修复，绝不覆盖。
 - **DSH**（§32）：路径检测与 Choose DSH Path、Install 引导、Runtime 状态与 stderr 查看。对应启动方式 `dsh --profile desktop --stdio/--socket` 仅作说明文字（技术细节归开发总监拆解）。
 - **Permissions**（§12）：Ask / Auto Edit / Full Auto 单选；下方只读展示当前 Workspace 根目录以明示隔离边界（§7.3）。Docker Sandbox 等选项不出现（§36、§28 P1）。
 

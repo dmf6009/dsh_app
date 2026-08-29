@@ -32,23 +32,43 @@ export function isApiType(value: unknown): value is ApiType {
   return typeof value === 'string' && (API_TYPES as readonly string[]).includes(value);
 }
 
+/**
+ * One model entry of a provider, mirroring the dsh-native settings schema
+ * (`models: [{ id, name, contextWindow, maxTokens, ... }]`). Unknown fields
+ * that exist on disk are preserved on write-back but not exposed here.
+ */
+export interface ModelInfo {
+  id: string;
+  /** Display name; defaults to the id when absent. */
+  name?: string;
+  contextWindow?: number;
+  maxTokens?: number;
+}
+
 /** Provider entry as persisted (without secrets) in `~/.dsh/settings.yaml`. */
 export interface ProviderConfig {
   name: string;
   api_type: ApiType;
+  /** Absent for providers using the plugin's built-in endpoint. */
   base_url: string;
-  models: string[];
+  models: ModelInfo[];
 }
 
 /**
  * Provider as exposed to the renderer: secret replaced by a boolean plus a
- * short, non-reversible mask for UX ("sk-…abcd").
+ * short, non-reversible mask for UX ("sk-…abcd"). `name` is the stable id
+ * (the dsh provider key); `displayName` is the human label when configured.
+ * `baseUrl` is absent for providers using the plugin's built-in endpoint
+ * (e.g. openrouter / google in the llm-pi-ai plugin).
  */
 export interface ProviderView {
   name: string;
+  displayName?: string;
   apiType: ApiType;
-  baseUrl: string;
-  models: string[];
+  baseUrl?: string;
+  models: ModelInfo[];
+  /** Env/credential-ref name this provider's key lives under (dsh schema). */
+  apiKeyEnv?: string;
   apiKeyConfigured: boolean;
   /** Non-reversible display mask; absent when no key is configured. */
   apiKeyMask?: string;
@@ -60,16 +80,20 @@ export interface SettingsView {
   permissionsMode: PermissionMode;
   /** Configured DSH binary path override; null = resolve from PATH. */
   dshPath: string | null;
+  /** `agent-default-model` from settings.yaml (dsh native). */
+  defaultModel?: { provider: string; model: string };
   /** Non-fatal problems found while loading (e.g. repaired credential perms). */
   warnings: string[];
 }
 
-/** Payload for saving one provider. `apiKey` empty/undefined keeps the stored key. */
+/** Payload for saving one provider. `apiKey` empty/undefined keeps the stored key.
+ *  `baseUrl` empty keeps/uses the plugin's built-in endpoint. */
 export interface SaveProviderInput {
   name: string;
+  displayName?: string;
   apiType: ApiType;
-  baseUrl: string;
-  models: string[];
+  baseUrl?: string;
+  models: ModelInfo[];
   apiKey?: string;
 }
 

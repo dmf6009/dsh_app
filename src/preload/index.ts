@@ -118,6 +118,8 @@ const api: DesktopApi = {
     ipcRenderer.invoke('settings:set-permissions-mode', mode),
   setDshPath: (path: string | null): Promise<OperationResult> =>
     ipcRenderer.invoke('settings:set-dsh-path', path),
+  setDefaultModel: (provider: string, model: string): Promise<OperationResult> =>
+    ipcRenderer.invoke('settings:set-default-model', provider, model),
   refreshModels: (input: {
     providerName?: string;
     baseUrl: string;

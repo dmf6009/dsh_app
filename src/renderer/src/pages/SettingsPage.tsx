@@ -23,6 +23,7 @@ import {
   PERMISSION_MODE_LABELS,
   providerSaveOutcome,
   type ApiType,
+  type ModelInfo,
   type OperationResult,
   type PermissionMode,
   type ProviderView,
@@ -45,31 +46,64 @@ const TAB_ITEMS = [
   { id: 'plugins', label: '插件' }
 ] as const;
 
+/** Editable form row for one model entry (dsh-native rich model object). */
+interface ModelRow {
+  id: string;
+  name: string;
+  contextWindow: string;
+  maxTokens: string;
+}
+
 interface FormState {
   name: string;
+  displayName: string;
   apiType: ApiType;
   baseUrl: string;
   apiKey: string;
-  modelsText: string;
+  models: ModelRow[];
 }
+
+const EMPTY_MODEL_ROW: ModelRow = { id: '', name: '', contextWindow: '', maxTokens: '' };
 
 const EMPTY_FORM: FormState = {
   name: '',
+  displayName: '',
   apiType: API_TYPES[0]!,
   baseUrl: '',
   apiKey: '',
-  modelsText: ''
+  models: [{ ...EMPTY_MODEL_ROW }]
 };
 
-function parseModels(text: string): string[] {
-  return Array.from(
-    new Set(
-      text
-        .split(/[\n,]/u)
-        .map((s) => s.trim())
-        .filter((s) => s !== '')
-    )
-  );
+function parseOptionalInt(text: string): number | undefined {
+  const trimmed = text.trim();
+  if (trimmed === '') return undefined;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? Math.round(value) : undefined;
+}
+
+function rowsToModels(rows: ModelRow[]): ModelInfo[] {
+  const out: ModelInfo[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const id = row.id.trim();
+    if (id === '' || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      ...(row.name.trim() !== '' ? { name: row.name.trim() } : {}),
+      ...(parseOptionalInt(row.contextWindow) !== undefined
+        ? { contextWindow: parseOptionalInt(row.contextWindow) }
+        : {}),
+      ...(parseOptionalInt(row.maxTokens) !== undefined
+        ? { maxTokens: parseOptionalInt(row.maxTokens) }
+        : {})
+    });
+  }
+  return out;
+}
+
+function modelLabel(model: ModelInfo): string {
+  return model.name && model.name !== model.id ? `${model.name}（${model.id}）` : model.id;
 }
 
 export default function SettingsPage(): JSX.Element {
@@ -117,6 +151,10 @@ function ModelsTab(): JSX.Element {
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<'name' | 'baseUrl' | 'apiKey' | 'models', string>>>({});
   const [saveMessage, setSaveMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [defaultProvider, setDefaultProvider] = useState('');
+  const [defaultModelId, setDefaultModelId] = useState('');
+  const [defaultSaving, setDefaultSaving] = useState(false);
+  const [defaultMessage, setDefaultMessage] = useState<{ ok: boolean; text: string } | null>(null);
 
   // Sync the form once the settings view arrives.
   useEffect(() => {
@@ -125,18 +163,38 @@ function ModelsTab(): JSX.Element {
     setEditing(null);
   }, [settings, editing]);
 
+  // Keep the 默认模型 selectors in sync with the loaded dsh settings.
+  useEffect(() => {
+    if (!settings) return;
+    setDefaultProvider(settings.defaultModel?.provider ?? '');
+    setDefaultModelId(settings.defaultModel?.model ?? '');
+  }, [settings]);
+
+  const updateModelRow = (index: number, patch: Partial<ModelRow>): void => {
+    setForm((prev) => ({
+      ...prev,
+      models: prev.models.map((row, i) => (i === index ? { ...row, ...patch } : row))
+    }));
+  };
+
   const startEdit = (provider: ProviderView): void => {
     setEditing(provider.name);
     setSaveMessage(null);
     setFieldErrors({});
     setForm({
       name: provider.name,
+      displayName: provider.displayName ?? '',
       apiType: provider.apiType,
-      baseUrl: provider.baseUrl,
+      baseUrl: provider.baseUrl ?? '',
       // Write-only by design: the stored key is NEVER placed back into the
       // input; the user sees only the mask.
       apiKey: '',
-      modelsText: provider.models.join('\n')
+      models: provider.models.map((m) => ({
+        id: m.id,
+        name: m.name ?? '',
+        contextWindow: m.contextWindow !== undefined ? String(m.contextWindow) : '',
+        maxTokens: m.maxTokens !== undefined ? String(m.maxTokens) : ''
+      }))
     });
   };
 
@@ -145,10 +203,10 @@ function ModelsTab(): JSX.Element {
     if (form.name.trim() === '') errors.name = '请填写 Provider 名称';
     else if (!/^[\w.-]+$/u.test(form.name.trim())) errors.name = '仅允许字母、数字、点、下划线、连字符';
     else if (form.name.trim().length > 64) errors.name = '名称过长（≤64 字符）';
-    if (form.baseUrl.trim() === '') errors.baseUrl = '请填写 Base URL';
-    else if (!/^https?:\/\//iu.test(form.baseUrl.trim())) errors.baseUrl = '必须以 http(s):// 开头';
-    const models = parseModels(form.modelsText);
-    if (models.length === 0) errors.models = '至少需要一个模型';
+    if (form.baseUrl.trim() !== '' && !/^https?:\/\//iu.test(form.baseUrl.trim())) {
+      errors.baseUrl = '必须以 http(s):// 开头（留空则使用插件内置端点）';
+    }
+    if (rowsToModels(form.models).length === 0) errors.models = '至少需要一个有效的模型 id';
     if (!settings?.providers.some((p) => p.name === form.name.trim()) && form.apiKey.trim() === '') {
       errors.apiKey = '新 Provider 需要填写 API Key';
     }
@@ -161,9 +219,10 @@ function ModelsTab(): JSX.Element {
     if (!validate()) return;
     const input: SaveProviderInput = {
       name: form.name.trim(),
+      ...(form.displayName.trim() !== '' ? { displayName: form.displayName.trim() } : {}),
       apiType: form.apiType,
       baseUrl: form.baseUrl.trim(),
-      models: parseModels(form.modelsText),
+      models: rowsToModels(form.models),
       ...(form.apiKey.trim() !== '' ? { apiKey: form.apiKey.trim() } : {})
     };
     const result = await window.desktop.saveProvider(input);
@@ -207,8 +266,29 @@ function ModelsTab(): JSX.Element {
         ...(form.apiKey.trim() !== '' ? { apiKey: form.apiKey.trim() } : {})
       });
       if (result.ok && result.models) {
-        setForm((prev) => ({ ...prev, modelsText: result.models!.join('\n') }));
-        setSaveMessage({ ok: true, text: `已获取 ${result.models.length} 个模型` });
+        // Merge fetched ids into the rows editor: existing rows (with their
+        // parameters) stay, new ids are appended once.
+        const existingIds = new Set(
+          form.models.map((row) => row.id.trim()).filter((id) => id !== '')
+        );
+        const additions = result.models.filter((id) => !existingIds.has(id));
+        setForm((prev) => {
+          const known = new Set(prev.models.map((row) => row.id.trim()));
+          return {
+            ...prev,
+            models: [
+              ...prev.models.filter((row) => row.id.trim() !== ''),
+              ...result.models!.filter((id) => !known.has(id)).map((id) => ({ ...EMPTY_MODEL_ROW, id }))
+            ]
+          };
+        });
+        setSaveMessage({
+          ok: true,
+          text:
+            additions.length > 0
+              ? `已获取 ${result.models.length} 个模型，新增 ${additions.length} 个`
+              : `已获取 ${result.models.length} 个模型（均已存在）`
+        });
       } else {
         // Inline error next to the model list (§6.3 校验错误 row).
         setFieldErrors((prev) => ({ ...prev, models: result.error ?? '模型列表获取失败' }));
@@ -218,21 +298,69 @@ function ModelsTab(): JSX.Element {
     }
   };
 
+  const saveDefaultModel = async (): Promise<void> => {
+    if (defaultProvider.trim() === '' || defaultModelId.trim() === '') {
+      setDefaultMessage({ ok: false, text: '请先选择 Provider 和模型' });
+      return;
+    }
+    setDefaultSaving(true);
+    setDefaultMessage(null);
+    try {
+      const result = await window.desktop.setDefaultModel(defaultProvider.trim(), defaultModelId.trim());
+      if (result.ok) {
+        const view = await window.desktop.getSettings();
+        dispatch({ type: 'settings-view', view });
+        setDefaultMessage({ ok: true, text: '默认模型已写入 settings.yaml（agent-default-model）。' });
+      } else {
+        setDefaultMessage({ ok: false, text: result.error ?? '保存失败' });
+      }
+    } finally {
+      setDefaultSaving(false);
+    }
+  };
+
+  const defaultProviderOptions = (): Array<{ value: string; label: string }> => {
+    const options = (settings?.providers ?? []).map((p) => ({
+      value: p.name,
+      label: p.displayName && p.displayName !== p.name ? `${p.displayName}（${p.name}）` : p.name
+    }));
+    if (defaultProvider !== '' && !options.some((o) => o.value === defaultProvider)) {
+      options.unshift({ value: defaultProvider, label: `${defaultProvider}（当前配置）` });
+    }
+    return options;
+  };
+
+  const defaultModelOptions = (): Array<{ value: string; label: string }> => {
+    const provider = settings?.providers.find((p) => p.name === defaultProvider);
+    const options = (provider?.models ?? []).map((m) => ({ value: m.id, label: modelLabel(m) }));
+    if (defaultModelId !== '' && !options.some((o) => o.value === defaultModelId)) {
+      options.unshift({ value: defaultModelId, label: `${defaultModelId}（当前配置）` });
+    }
+    return options;
+  };
+
   return (
     <div className="tab-panel" role="tabpanel" id="panel-models" aria-labelledby="tab-models">
       <section className="provider-list">
         <h3 className="panel-title">已配置的 Provider</h3>
         {!settings || settings.providers.length === 0 ? (
-          <p className="empty-hint">尚未配置任何 Provider。</p>
+          <p className="empty-hint">
+            未读取到任何 Provider——配置会从 <code>~/.dsh/settings.yaml</code> 的 llm 插件段（llm-pi-ai /
+            llm-deepseek）自动加载，也可在下方新增。
+          </p>
         ) : (
           settings.providers.map((provider) => (
             <Card
               key={provider.name}
-              title={provider.name}
+              title={provider.displayName && provider.displayName !== provider.name ? `${provider.displayName}（${provider.name}）` : provider.name}
               meta={
                 <>
-                  {API_TYPE_LABELS[provider.apiType]} · <code>{provider.baseUrl}</code> ·{' '}
+                  {API_TYPE_LABELS[provider.apiType]} ·{' '}
+                  {provider.baseUrl ? <code>{provider.baseUrl}</code> : '插件内置端点'} ·{' '}
                   {provider.models.length} 个模型
+                  {provider.apiKeyEnv && (
+                    <span className="hint"> · Key 引用 <code>{provider.apiKeyEnv}</code></span>
+                  )}
                 </>
               }
               actions={
@@ -253,7 +381,9 @@ function ModelsTab(): JSX.Element {
                 </>
               }
             >
-              <span className="hint">模型：{provider.models.join('、')}</span>
+              <span className="hint">
+                模型：{provider.models.map(modelLabel).join('、') || '（无）'}
+              </span>
             </Card>
           ))
         )}
@@ -262,11 +392,17 @@ function ModelsTab(): JSX.Element {
       <section className="provider-form">
         <h3 className="panel-title">{editing ? `编辑 Provider：${editing}` : '新增 Provider'}</h3>
         <TextField
-          label="名称"
+          label="名称（dsh provider id）"
           value={form.name}
           onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
           error={fieldErrors.name}
-          placeholder="例如 deepseek"
+          placeholder="例如 st"
+        />
+        <TextField
+          label="显示名（可选）"
+          value={form.displayName}
+          onChange={(e) => setForm((p) => ({ ...p, displayName: e.target.value }))}
+          placeholder="例如 st"
         />
         <SelectField
           label="API Type"
@@ -276,7 +412,7 @@ function ModelsTab(): JSX.Element {
           hint="MVP 仅支持 OpenAI Compatible。"
         />
         <TextField
-          label="Base URL"
+          label="Base URL（留空使用插件内置端点）"
           value={form.baseUrl}
           onChange={(e) => setForm((p) => ({ ...p, baseUrl: e.target.value }))}
           error={fieldErrors.baseUrl}
@@ -288,25 +424,72 @@ function ModelsTab(): JSX.Element {
           onChange={(e) => setForm((p) => ({ ...p, apiKey: e.target.value }))}
           error={fieldErrors.apiKey}
           placeholder={editing ? '••••••••' : 'sk-…'}
-          hint="仅写入本地凭据文件（权限 600），不会出现在日志或界面中。"
+          hint="按 dsh 原生 schema 写入凭据 refs（对应 apiKeyEnv），权限 600；不出现在日志或界面中。"
         />
         <div className="field">
-          <label className="field-label" htmlFor="models-text">
-            模型列表
-          </label>
-          <textarea
-            id="models-text"
-            className={`field-input field-textarea${fieldErrors.models ? ' field-input-error' : ''}`}
-            value={form.modelsText}
-            onChange={(e) => setForm((p) => ({ ...p, modelsText: e.target.value }))}
-            placeholder={'deepseek-chat\ndeepseek-reasoner'}
-            rows={4}
-          />
+          <label className="field-label">模型列表（id / 显示名 / 上下文窗口 / 最大输出）</label>
+          {form.models.map((row, index) => (
+            <div key={index} className="model-row">
+              <input
+                className="field-input"
+                placeholder="模型 id，如 glm-5.2"
+                aria-label={`模型 ${index + 1} id`}
+                value={row.id}
+                onChange={(e) => updateModelRow(index, { id: e.target.value })}
+              />
+              <input
+                className="field-input"
+                placeholder="显示名"
+                aria-label={`模型 ${index + 1} 显示名`}
+                value={row.name}
+                onChange={(e) => updateModelRow(index, { name: e.target.value })}
+              />
+              <input
+                className="field-input"
+                type="number"
+                min={0}
+                placeholder="上下文窗口"
+                aria-label={`模型 ${index + 1} 上下文窗口`}
+                value={row.contextWindow}
+                onChange={(e) => updateModelRow(index, { contextWindow: e.target.value })}
+              />
+              <input
+                className="field-input"
+                type="number"
+                min={0}
+                placeholder="最大输出"
+                aria-label={`模型 ${index + 1} 最大输出`}
+                value={row.maxTokens}
+                onChange={(e) => updateModelRow(index, { maxTokens: e.target.value })}
+              />
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={form.models.length <= 1}
+                onClick={() =>
+                  setForm((prev) => ({ ...prev, models: prev.models.filter((_, i) => i !== index) }))
+                }
+              >
+                删除
+              </Button>
+            </div>
+          ))}
           {fieldErrors.models && (
             <p className="field-error" role="alert">
               {fieldErrors.models}
             </p>
           )}
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => setForm((prev) => ({ ...prev, models: [...prev.models, { ...EMPTY_MODEL_ROW }] }))}
+          >
+            添加模型
+          </Button>
+          <p className="hint">
+            模型参数（上下文窗口 / 最大输出）按 dsh 原生 schema 保存；磁盘上已有而界面未列出的字段
+            （如多模态配置）在保存时原样保留。
+          </p>
         </div>
         <div className="form-actions">
           <Button variant="primary" onClick={() => void save()}>
@@ -332,6 +515,35 @@ function ModelsTab(): JSX.Element {
         {saveMessage && (
           <p className={saveMessage.ok ? 'form-ok' : 'form-error'} role={saveMessage.ok ? 'status' : 'alert'}>
             {saveMessage.text}
+          </p>
+        )}
+      </section>
+
+      <section className="provider-form">
+        <h3 className="panel-title">默认模型（agent-default-model）</h3>
+        <SelectField
+          label="Provider"
+          value={defaultProvider}
+          onChange={(e) => {
+            setDefaultProvider(e.target.value);
+            setDefaultModelId('');
+          }}
+          options={defaultProviderOptions()}
+        />
+        <SelectField
+          label="模型"
+          value={defaultModelId}
+          onChange={(e) => setDefaultModelId(e.target.value)}
+          options={defaultModelOptions()}
+        />
+        <div className="form-actions">
+          <Button variant="primary" loading={defaultSaving} onClick={() => void saveDefaultModel()}>
+            保存默认模型
+          </Button>
+        </div>
+        {defaultMessage && (
+          <p className={defaultMessage.ok ? 'form-ok' : 'form-error'} role={defaultMessage.ok ? 'status' : 'alert'}>
+            {defaultMessage.text}
           </p>
         )}
       </section>

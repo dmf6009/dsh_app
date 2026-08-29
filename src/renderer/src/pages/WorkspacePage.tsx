@@ -283,7 +283,18 @@ export default function WorkspacePage(): JSX.Element {
         }));
       });
       setAvailableModels(options);
-      setModelChoice((current) => current || optionValue(options[0]) || '');
+      setModelChoice((current) => {
+        if (current !== '') return current;
+        // 初始显示 settings.yaml 里配置的真实默认（agent-default-model），
+        // 而不是列表第一项。
+        const dm = view.defaultModel;
+        if (dm) {
+          const match = options.find((o) => o.providerId === dm.provider && o.modelId === dm.model);
+          if (match) return optionValue(match);
+          return `${dm.provider}:${dm.model}`; // 未知组合走兜底选项渲染
+        }
+        return optionValue(options[0]) || '';
+      });
     }).catch(() => undefined);
 
     return () => {
@@ -637,7 +648,27 @@ export default function WorkspacePage(): JSX.Element {
               className="model-select"
               value={modelChoice}
               disabled={running}
-              onChange={(e) => setModelChoice(e.target.value)}
+              onChange={(e) => {
+                setModelChoice(e.target.value);
+                // 选择即写入 dsh 原生配置（settings.yaml 的 agent-default-model
+                // 段）：headless 每个 run 启动时读取该段，下一次运行即生效
+                // （web / CLI 亦同步生效）。run 请求仍附带 model 字段，供未来
+                // 支持 run 级选择的 runtime 使用。
+                const colon = e.target.value.indexOf(':');
+                if (colon <= 0) return;
+                const provider = e.target.value.slice(0, colon);
+                const model = e.target.value.slice(colon + 1);
+                if (provider === '' || model === '') return;
+                void window.desktop
+                  .setDefaultModel(provider, model)
+                  .then((result) => {
+                    if (!result.ok) return;
+                    return window.desktop
+                      .getSettings()
+                      .then((view) => appDispatch({ type: 'settings-view', view }));
+                  })
+                  .catch(() => undefined);
+              }}
               aria-label="模型选择器（运行中锁定）"
             >
               {availableModels.length === 0 && <option value="">默认模型</option>}

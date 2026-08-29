@@ -72,9 +72,14 @@ function isExecutable(p) {
 
 function bundledDshCandidates() {
   const binDir = path.join(SCRIPT_DIR, '..', 'node_modules', '.bin');
-  return process.platform === 'win32'
-    ? [path.join(binDir, 'dsh.cmd'), path.join(binDir, 'dsh')]
-    : [path.join(binDir, 'dsh')];
+  const candidates =
+    process.platform === 'win32'
+      ? [path.join(binDir, 'dsh.cmd'), path.join(binDir, 'dsh')]
+      : [path.join(binDir, 'dsh')];
+  // electron-builder packages production deps but NOT the .bin shims — keep
+  // the package's real JS entry as the packaged-app candidate.
+  candidates.push(path.join(SCRIPT_DIR, '..', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+  return candidates;
 }
 
 function locateDshBin() {

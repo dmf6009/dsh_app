@@ -78,9 +78,15 @@ export async function locateDsh(options: DshLocatorOptions = {}): Promise<DshLoc
 /** Where `npm install` puts the bundled @deepseek-ai/dsh CLI for this app. */
 export function bundledDshCandidates(appRoot: string): string[] {
   const binDir = join(appRoot, 'node_modules', '.bin');
-  return process.platform === 'win32'
-    ? [join(binDir, 'dsh.cmd'), join(binDir, 'dsh')]
-    : [join(binDir, 'dsh')];
+  const candidates =
+    process.platform === 'win32'
+      ? [join(binDir, 'dsh.cmd'), join(binDir, 'dsh')]
+      : [join(binDir, 'dsh')];
+  // electron-builder packages production deps but NOT the .bin shims, so the
+  // package's real JS entry is the candidate that survives in a packaged app
+  // (spawned via Electron's embedded node — see runtimeNodeSpawn / adapter).
+  candidates.push(join(appRoot, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+  return candidates;
 }
 
 function searchPaths(pathEnv: string): string[] {

@@ -1,0 +1,53 @@
+# Release pipeline — builds unsigned installers for macOS + Windows and
+# publishes them to a GitHub Release when a v* tag is pushed.
+#
+# Signing policy: UNSIGNED on purpose. CSC_IDENTITY_AUTO_DISCOVERY=false
+# keeps macOS from probing any keychain, no Windows certificate is
+# configured, and electron-builder.yml pins mac.identity: null — no machine
+# (or corporate) certificate can ever be picked up. Recipients of the macOS
+# build need right-click → 打开 on first launch (Gatekeeper).
+#
+# Tests are not re-run here (they are platform-sensitive and green in the
+# dev workflow); this pipeline pins typecheck + build + package.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            args: --mac --arm64 --x64
+          - os: windows-latest
+            args: --win --x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - name: Package + publish to GitHub Release
+        run: npx electron-builder ${{ matrix.args }} --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'

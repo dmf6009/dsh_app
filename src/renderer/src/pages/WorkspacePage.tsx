@@ -53,6 +53,30 @@ import {
 
 const LEVEL_CLASS: Record<string, string> = { L0: 'lvl-l0', L1: 'lvl-l1', L2: 'lvl-l2' };
 
+/** One selectable model in the top-bar selector, tagged with its provider. */
+interface ModelOption {
+  providerId: string;
+  providerLabel: string;
+  modelId: string;
+  modelLabel: string;
+}
+
+/** Option value encodes the provider so duplicate model ids stay distinct. */
+function optionValue(option: ModelOption | undefined): string {
+  return option ? `${option.providerId}:${option.modelId}` : '';
+}
+
+/** Group options by provider (insertion order preserved) for <optgroup>. */
+function groupModelsByProvider(options: ModelOption[]): Array<[string, ModelOption[]]> {
+  const groups = new Map<string, ModelOption[]>();
+  for (const option of options) {
+    const bucket = groups.get(option.providerLabel);
+    if (bucket) bucket.push(option);
+    else groups.set(option.providerLabel, [option]);
+  }
+  return [...groups.entries()];
+}
+
 const CHANGE_LABEL: Record<string, string> = {
   added: 'A',
   modified: 'M',
@@ -82,7 +106,7 @@ export default function WorkspacePage(): JSX.Element {
    */
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null);
   const [modelChoice, setModelChoice] = useState<string>('');
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [availableModels, setAvailableModels] = useState<ModelOption[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<ChatModel>(INITIAL_MODEL);
   modelRef.current = model;
@@ -243,14 +267,23 @@ export default function WorkspacePage(): JSX.Element {
       setStatus(initial);
       setConnection(initial.state);
     });
-    // Model choices come from configured providers; selection is cosmetic
-    // until P1-C wires it into run requests.
+    // Model choices come from configured providers, grouped per provider so
+    // the selector shows WHICH supplier offers each model. The option value
+    // encodes `provider:model`; older sessions may still carry a bare model
+    // id — kept selectable via the fallback option below.
     void window.desktop.getSettings().then((view) => {
-      const names = Array.from(
-        new Set(view.providers.flatMap((p) => p.models?.map((m) => m.id) ?? []))
-      );
-      setAvailableModels(names);
-      setModelChoice((current) => current || names[0] || '');
+      const options = view.providers.flatMap((p) => {
+        const providerLabel =
+          p.displayName && p.displayName !== p.name ? `${p.displayName}（${p.name}）` : p.name;
+        return (p.models ?? []).map((m) => ({
+          providerId: p.name,
+          providerLabel,
+          modelId: m.id,
+          modelLabel: m.name && m.name !== m.id ? `${m.name}（${m.id}）` : m.id
+        }));
+      });
+      setAvailableModels(options);
+      setModelChoice((current) => current || optionValue(options[0]) || '');
     }).catch(() => undefined);
 
     return () => {
@@ -598,11 +631,19 @@ export default function WorkspacePage(): JSX.Element {
               aria-label="模型选择器（运行中锁定）"
             >
               {availableModels.length === 0 && <option value="">默认模型</option>}
-              {availableModels.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
+              {groupModelsByProvider(availableModels).map(([providerLabel, models]) => (
+                <optgroup key={providerLabel} label={providerLabel}>
+                  {models.map((m) => (
+                    <option key={`${m.providerId}:${m.modelId}`} value={optionValue(m)}>
+                      {m.modelLabel}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
+              {modelChoice !== '' &&
+                !availableModels.some((m) => optionValue(m) === modelChoice) && (
+                  <option value={modelChoice}>{modelChoice}（当前会话配置）</option>
+                )}
             </select>
           </label>
           {running && (

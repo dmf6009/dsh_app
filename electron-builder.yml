@@ -39,3 +39,5 @@ publish:
   provider: github
   owner: dmf6009
   repo: dsh_app
+  # Publish immediately (not a draft) so tagged builds are downloadable right away.
+  releaseType: release

@@ -58,14 +58,14 @@ export default function App(): ReactElement {
           type="button"
           className={`gear-btn${state.route === 'settings' ? ' nav-active' : ''}`}
           aria-label="打开 Settings"
-          title="Settings"
+          title="Settings（模型 / DSH / 权限 / 插件）"
           onClick={() =>
             state.route === 'settings'
               ? dispatch({ type: 'close-settings' })
               : dispatch({ type: 'open-settings' })
           }
         >
-          ⚙
+          <span aria-hidden="true">⚙</span> 设置
         </button>
       </header>
 

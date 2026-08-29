@@ -64,6 +64,12 @@ export interface RunCommandFrame {
   session_id: string;
   workspace: string;
   message: string;
+  /**
+   * Optional model selection for this run (`agent-default-model` shape). The
+   * runtime applies it for THIS run only; absent = keep the configured
+   * default. Additive in v1 — runtimes without model support ignore it.
+   */
+  model?: { provider: string; model: string };
 }
 
 export interface CancelCommandFrame {

@@ -215,13 +215,14 @@ export class RuntimeClient extends EventEmitter {
   }
 
   /** Send a `run` command; resolves with the generated run id. */
-  run(message: string, workspace: string): string {
+  run(message: string, workspace: string, model?: { provider: string; model: string }): string {
     const runId = randomUUID();
     const command: RunCommandFrame = makeRunCommand({
       run_id: runId,
       session_id: this.sessionId,
       workspace,
-      message
+      message,
+      ...(model ? { model } : {})
     });
     if (!this.manager.send(command)) {
       throw new Error(`cannot send run: runtime is ${this.manager.currentState}`);

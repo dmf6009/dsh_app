@@ -77,6 +77,29 @@ interface RuntimeCommandSpec {
   command: string;
   args: string[];
   label: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Node binary used to run the adapter/stub JS entries. Packaged installs
+ * cannot rely on a system `node`, so the app runs them through Electron's
+ * embedded node (ELECTRON_RUN_AS_NODE) and hands the same trick down to the
+ * adapter via DSH_DESKTOP_NODE_BIN so the dsh CLI boots the same way.
+ */
+function runtimeNodeSpawn(): { command: string; env?: NodeJS.ProcessEnv } {
+  const override = process.env.DSH_NODE_BIN?.trim();
+  if (override) return { command: override };
+  if (app.isPackaged) {
+    return {
+      command: process.execPath,
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: '1',
+        DSH_DESKTOP_NODE_BIN: process.execPath
+      }
+    };
+  }
+  return { command: 'node' };
 }
 
 function splitArgs(raw: string | undefined): string[] {
@@ -109,17 +132,21 @@ function resolveRuntimeCommand(appRoot: string): RuntimeCommandSpec {
   if (!isSmokeMode && !isResponsiveMeasureMode) {
     const bundledDsh = bundledDshCandidates(appRoot).find((candidate) => isExecutableFile(candidate));
     if (bundledDsh) {
+      const node = runtimeNodeSpawn();
       return {
-        command: process.env.DSH_NODE_BIN || 'node',
+        command: node.command,
         args: [path.join(appRoot, 'scripts', 'dsh-desktop-profile.mjs')],
-        label: 'dsh desktop profile (bundled @deepseek-ai/dsh headless)'
+        label: 'dsh desktop profile (bundled @deepseek-ai/dsh headless)',
+        env: node.env
       };
     }
   }
+  const node = runtimeNodeSpawn();
   return {
-    command: process.env.DSH_NODE_BIN || 'node',
+    command: node.command,
     args: [path.join(appRoot, 'scripts', 'stub-runtime.mjs')],
-    label: 'stub runtime (fallback)'
+    label: 'stub runtime (fallback)',
+    env: node.env
   };
 }
 
@@ -137,6 +164,7 @@ function createManager(appRoot: string): { manager: DshProcessManager; spec: Run
   const manager = new DshProcessManager({
     command: spec.command,
     args: spec.args,
+    env: spec.env,
     cwd: appRoot,
     maxLineBytes: process.env.DSH_MAX_LINE_BYTES ? Number(process.env.DSH_MAX_LINE_BYTES) : undefined
   });
@@ -214,12 +242,19 @@ function registerIpcHandlers(context: {
     await client.restart();
     return status();
   });
-  ipcMain.handle('runtime:send', (_event, message: unknown) => {
+  ipcMain.handle('runtime:send', (_event, message: unknown, model: unknown) => {
     try {
       if (typeof message !== 'string' || message.trim() === '') {
         return { ok: false, error: 'empty message' };
       }
-      client.run(message, workspaces.fallbackRoot());
+      let selection: { provider: string; model: string } | undefined;
+      if (typeof model === 'object' && model !== null) {
+        const candidate = model as { provider?: unknown; model?: unknown };
+        if (typeof candidate.provider === 'string' && typeof candidate.model === 'string') {
+          selection = { provider: candidate.provider, model: candidate.model };
+        }
+      }
+      client.run(message, workspaces.fallbackRoot(), selection);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };

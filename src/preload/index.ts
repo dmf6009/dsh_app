@@ -45,8 +45,8 @@ const api: DesktopApi = {
   startRuntime: (): Promise<RuntimeStatus> => ipcRenderer.invoke('runtime:start'),
   stopRuntime: (): Promise<RuntimeStatus> => ipcRenderer.invoke('runtime:stop'),
   restartRuntime: (): Promise<RuntimeStatus> => ipcRenderer.invoke('runtime:restart'),
-  sendMessage: (message: string): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke('runtime:send', message),
+  sendMessage: (message: string, model?: { provider: string; model: string }): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('runtime:send', message, model ?? null),
   cancelRun: (): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('runtime:cancel'),
   onEvent: (listener: (frame: RuntimeEventFrame) => void): (() => void) =>
     subscribe<RuntimeEventFrame>('runtime:event', listener),

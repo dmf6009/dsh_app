@@ -5,3 +5,4 @@ dist/
 install.log
 *.tsbuildinfo
 .cache/
+release/

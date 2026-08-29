@@ -29,11 +29,13 @@
  * - DSH_DESKTOP_MAX_LINE_BYTES  inbound line cap (default 1 MiB)
  */
 
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, existsSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
 import process from 'node:process';
+import YAML from 'yaml';
 
 const PROTOCOL_VERSION = 1;
 const MAX_LINE_BYTES = positiveIntEnv('DSH_DESKTOP_MAX_LINE_BYTES', 1024 * 1024);
@@ -92,11 +94,33 @@ function locateDshBin() {
   return null;
 }
 
-function probeVersion(bin) {
+/**
+ * Packaged-app mode: the desktop hands down its own binary as node
+ * (ELECTRON_RUN_AS_NODE), because end-user machines have no system `node` and
+ * the bundled dsh CLI is a node script. In this mode the CLI is spawned as
+ * [nodeBin, dshEntry, ...args] using the package's real JS entry instead of
+ * the .bin shim.
+ */
+const nodeBin = process.env.DSH_DESKTOP_NODE_BIN?.trim() || null;
+const dshEntry = nodeBin
+  ? path.join(SCRIPT_DIR, '..', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+  : null;
+
+/** Command pair that runs the dsh CLI. */
+function dshInvocation() {
+  if (nodeBin && dshEntry && existsSync(dshEntry)) {
+    return { command: nodeBin, prefixArgs: [dshEntry] };
+  }
+  return { command: dshBin, prefixArgs: [] };
+}
+
+function probeDshVersion() {
+  const { command, prefixArgs } = dshInvocation();
+  if (!command) return Promise.resolve(null);
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), VERSION_PROBE_TIMEOUT_MS);
     try {
-      execFile(bin, ['--version'], { timeout: VERSION_PROBE_TIMEOUT_MS }, (err, stdout) => {
+      execFile(command, [...prefixArgs, '--version'], { timeout: VERSION_PROBE_TIMEOUT_MS }, (err, stdout) => {
         clearTimeout(timer);
         resolve(err && !stdout ? null : String(stdout ?? '').trim() || null);
       });
@@ -177,7 +201,31 @@ function resetPending() {
 /* Run execution — one dsh headless child per run                       */
 /* ------------------------------------------------------------------ */
 
-let activeRun = null; // { id, sessionId, child, stdoutText, stderrText, cancelling }
+/** Validate + normalize the run command's optional model selection. */
+function asModelSelection(value) {
+  if (typeof value !== 'object' || value === null) return null;
+  const provider = typeof value.provider === 'string' ? value.provider.trim() : '';
+  const model = typeof value.model === 'string' ? value.model.trim() : '';
+  if (!/^[\w./:@-]+$/u.test(provider) || !/^[\w./:@-]+$/u.test(model)) return null;
+  return { provider, model };
+}
+
+let activeRun = null; // { id, sessionId, child, stdoutText, stderrText, patchPath }
+
+/**
+ * Materialize the run-level model selection as a dsh `--patch` overlay: a
+ * one-entry patch overriding the composed profile's `agent-default-model`
+ * for THIS invocation only (the user's settings.yaml is never touched).
+ */
+function writeModelPatch(model) {
+  const patchPath = path.join(os.tmpdir(), `dsh-desktop-patch-${process.pid}-${Date.now()}.yml`);
+  writeFileSync(
+    patchPath,
+    YAML.stringify([{ id: 'agent-default-model', config: { provider: model.provider, model: model.model } }]),
+    { mode: 0o600 }
+  );
+  return patchPath;
+}
 
 function startRun(frame) {
   if (activeRun) {
@@ -210,12 +258,31 @@ function startRun(frame) {
   }
 
   let child;
+  const { command, prefixArgs } = dshInvocation();
+  const model = asModelSelection(frame.model);
+  let patchPath = null;
+  if (model) {
+    try {
+      patchPath = writeModelPatch(model);
+    } catch (err) {
+      finishRun(runId, base, {
+        code: 'model_patch_failed',
+        message: `无法写入模型覆盖补丁：${err?.message ?? err}`
+      });
+      return;
+    }
+  }
   try {
-    child = spawn(dshBin, ['--profile', 'headless', message], {
-      cwd: workspace,
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
+    child = spawn(
+      command,
+      [...prefixArgs, '--profile', 'headless', ...(patchPath ? ['--patch', patchPath] : []), message],
+      {
+        cwd: workspace,
+        stdio: ['ignore', 'pipe', 'pipe']
+      }
+    );
   } catch (err) {
+    if (patchPath) rmSync(patchPath, { force: true });
     finishRun(runId, base, {
       code: 'dsh_spawn_failed',
       message: `无法启动 dsh CLI：${err?.message ?? err}`
@@ -223,7 +290,7 @@ function startRun(frame) {
     return;
   }
 
-  activeRun = { id: runId, sessionId, child, stdoutText: '', stderrText: '', cancelling: false };
+  activeRun = { id: runId, sessionId, child, stdoutText: '', stderrText: '', patchPath };
 
   child.stdout.setEncoding('utf8');
   child.stdout.on('data', (chunk) => {
@@ -247,7 +314,8 @@ function startRun(frame) {
 
   child.on('close', (code) => {
     if (!activeRun || activeRun.id !== runId) return;
-    const { stdoutText, stderrText } = activeRun;
+    const { stdoutText, stderrText, patchPath } = activeRun;
+    if (patchPath) rmSync(patchPath, { force: true });
     activeRun = null;
     if (code === 0) {
       const summary = summarize(stdoutText);
@@ -282,6 +350,7 @@ function finishRun(runId, base, error) {
     } catch {
       /* already gone */
     }
+    if (activeRun.patchPath) rmSync(activeRun.patchPath, { force: true });
     activeRun = null;
   }
   emit({ type: 'error', run_id: runId, recoverable: true, ...error, ...base });
@@ -291,8 +360,10 @@ function finishRun(runId, base, error) {
 function cancelActiveRun(runIdFilter) {
   if (!activeRun) return false;
   if (runIdFilter && activeRun.id !== runIdFilter) return false;
-  const { id, sessionId, child } = activeRun;
+  const { id, sessionId, child, patchPath } = activeRun;
   const base = sessionId ? { session_id: sessionId } : {};
+  // The close handler bails on an unknown run, so clean the patch here.
+  if (patchPath) rmSync(patchPath, { force: true });
   try {
     child.kill('SIGTERM');
   } catch {
@@ -345,6 +416,7 @@ function shutdown(code) {
     } catch {
       /* already gone */
     }
+    if (activeRun.patchPath) rmSync(activeRun.patchPath, { force: true });
     activeRun = null;
   }
   process.exit(code);
@@ -369,7 +441,7 @@ if (!dshBin) {
   // state instead of a bare crash; every run will report dsh_cli_not_found.
   emit({ type: 'ready', profile: 'desktop', pid: process.pid });
 } else {
-  const version = await probeVersion(dshBin);
+  const version = await probeDshVersion();
   emit({ type: 'ready', profile: 'desktop', pid: process.pid, dsh_version: version ?? undefined });
 }
 startListening();

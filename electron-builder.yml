@@ -1,0 +1,41 @@
+# electron-builder packaging config — release engineering for DSH Desktop.
+#
+# Signing policy: UNSIGNED on purpose. No certificate is configured anywhere
+# (no CSC_LINK, no identity); macOS builds set identity: null so no local
+# keychain (e.g. a corporate certificate) can ever be picked up. Unsigned
+# builds: macOS users need right-click → 打开 on first launch (Gatekeeper).
+#
+# asar is disabled on purpose: the main process spawns `node scripts/*.mjs`
+# and the bundled dsh CLI from the app root, and plain node child processes
+# cannot read files inside an asar archive.
+appId: com.dmf6009.dsh-desktop
+productName: DSH Desktop
+asar: false
+directories:
+  output: release
+files:
+  - dist/**
+  - scripts/*.mjs
+  - package.json
+mac:
+  identity: null
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: ${productName}-Setup-${version}.${ext}
+publish:
+  provider: github
+  owner: dmf6009
+  repo: dsh_app

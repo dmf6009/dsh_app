@@ -10,10 +10,21 @@
  *                                       MOCK_DSH_DELAY_MS is set)
  */
 
+import fs from 'node:fs';
+
 const args = process.argv.slice(2);
 
 if (args.includes('--version')) {
   console.log('mock-dsh 0.0.1');
+  process.exit(0);
+}
+
+if (process.env.MOCK_DSH_MODE === 'echo-args') {
+  // Diagnostic mode: print argv + the --patch overlay content so adapter
+  // tests can pin exactly what the runtime was invoked with.
+  const patchIndex = args.indexOf('--patch');
+  const patch = patchIndex >= 0 ? fs.readFileSync(args[patchIndex + 1], 'utf8') : null;
+  console.log(JSON.stringify({ args, patch }));
   process.exit(0);
 }
 

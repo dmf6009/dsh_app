@@ -203,6 +203,47 @@ describe('desktop profile adapter — protocol contract', () => {
     expect(h.frames.at(-1)).toMatchObject({ run_id: 'run-m' });
   });
 
+  it('passes a run-level model selection as an agent-default-model --patch overlay', async () => {
+    const h = launch({ MOCK_DSH_MODE: 'echo-args' });
+    await h.waitUntil((frames) => frames.some((f) => f.type === 'ready'));
+    h.send({
+      v: 1,
+      type: 'run',
+      run_id: 'run-model',
+      session_id: 'sess-1',
+      workspace: process.cwd(),
+      message: 'x',
+      model: { provider: 'st', model: 'glm-5.2' }
+    });
+    await h.waitUntil((frames) => frames.some((f) => isTerminalEventType(f.type)));
+    const text = h.frames
+      .filter((f) => f.type === 'message_delta')
+      .map((f) => (f as { content: string }).content)
+      .join('');
+    const echoed = JSON.parse(text) as { args: string[]; patch: string | null };
+    const patchIndex = echoed.args.indexOf('--patch');
+    expect(patchIndex).toBeGreaterThan(-1);
+    expect(echoed.args).toContain('headless');
+    expect(echoed.args[echoed.args.length - 1]).toBe('x'); // task text stays positional
+    expect(echoed.patch).toContain('id: agent-default-model');
+    expect(echoed.patch).toContain('provider: st');
+    expect(echoed.patch).toContain('model: glm-5.2');
+  });
+
+  it('omits --patch when the run carries no model selection', async () => {
+    const h = launch({ MOCK_DSH_MODE: 'echo-args' });
+    await h.waitUntil((frames) => frames.some((f) => f.type === 'ready'));
+    h.send({ v: 1, type: 'run', run_id: 'run-nomodel', session_id: 'sess-1', workspace: process.cwd(), message: 'x' });
+    await h.waitUntil((frames) => frames.some((f) => isTerminalEventType(f.type)));
+    const text = h.frames
+      .filter((f) => f.type === 'message_delta')
+      .map((f) => (f as { content: string }).content)
+      .join('');
+    const echoed = JSON.parse(text) as { args: string[]; patch: string | null };
+    expect(echoed.args).not.toContain('--patch');
+    expect(echoed.patch).toBeNull();
+  });
+
   it('supports sequential runs over one process', async () => {
     const h = launch();
     await h.waitUntil((frames) => frames.some((f) => f.type === 'ready'));

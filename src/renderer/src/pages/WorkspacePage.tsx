@@ -312,6 +312,15 @@ export default function WorkspacePage(): JSX.Element {
   const submit = useCallback(async (): Promise<void> => {
     const text = input.trim();
     if (!canSend) return;
+    // 解析顶栏模型选择（provider:model → agent-default-model 形状），让选择
+    // 真正作用于本次运行；未选择时使用 runtime 的默认模型。
+    const selectedModel = (): { provider: string; model: string } | null => {
+      const colon = modelChoice.indexOf(':');
+      if (colon <= 0) return null;
+      const provider = modelChoice.slice(0, colon);
+      const model = modelChoice.slice(colon + 1);
+      return provider !== '' && model !== '' ? { provider, model } : null;
+    };
     // 工作区上下文一致性 + 首条消息会话建立（§15/AC-02/AC-12）：先让主进程激活
     // workspace，再创建 Session，最后发送。激活/创建失败则不发送并给出准确三段式
     // 提示；绝不退回「无会话静默发送」的旧降级。时序编排见 session/submit-flow.ts。
@@ -327,8 +336,9 @@ export default function WorkspacePage(): JSX.Element {
         sendMessage: (message) => {
           // The user message goes on screen optimistically, then the run starts.
           dispatch({ type: 'send', text: message });
-          return window.desktop.sendMessage(message);
+          return window.desktop.sendMessage(message, selectedModel() ?? undefined);
         },
+        selectedModel: () => selectedModel(),
         onWorkspaceActivated: (path) => appDispatch({ type: 'workspace', path }),
         onSessionCreated: (model) => {
           hydrationGuardRef.current.noteMutation();

@@ -30,8 +30,14 @@ must be preserved, never rejected.
 
 | type     | fields                                             | meaning |
 | -------- | -------------------------------------------------- | ------- |
-| `run`    | `run_id`, `session_id`, `workspace`, `message`     | start one agent run |
+| `run`    | `run_id`, `session_id`, `workspace`, `message`, `model?` | start one agent run |
 | `cancel` | `run_id?`                                          | cancel the active run |
+
+`run.model` (additive, optional) is the desktop's top-bar model selection in
+the `agent-default-model` shape `{ provider, model }`. The reference desktop
+profile applies it for THIS run only (a temporary `--patch` overlay overriding
+the composed `agent-default-model` entry); absent = the runtime's configured
+default. Runtimes without model support may ignore it.
 
 ## Events — DSH → Desktop (§21 full set)
 

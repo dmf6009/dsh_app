@@ -78,7 +78,10 @@ export interface DesktopApi {
   startRuntime(): Promise<RuntimeStatus>;
   stopRuntime(): Promise<RuntimeStatus>;
   restartRuntime(): Promise<RuntimeStatus>;
-  sendMessage(message: string): Promise<{ ok: boolean; error?: string }>;
+  sendMessage(
+    message: string,
+    model?: { provider: string; model: string }
+  ): Promise<{ ok: boolean; error?: string }>;
   cancelRun(): Promise<{ ok: boolean; error?: string }>;
   onEvent(listener: (frame: RuntimeEventFrame) => void): () => void;
   onConnectionState(listener: (state: ConnectionState) => void): () => void;

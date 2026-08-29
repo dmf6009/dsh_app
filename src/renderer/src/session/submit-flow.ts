@@ -47,8 +47,14 @@ export interface SubmitFlowIo {
   activateWorkspace(path: string): Promise<ActivateOutcome>;
   /** Create the first session (hook create: checkpoint-first, null = aborted). */
   createSession(title: string): Promise<ChatModel | null>;
-  /** Dispatch the message to the chat + start the run; {ok:false} = run failed. */
-  sendMessage(text: string): Promise<{ ok: boolean; error?: string }>;
+  /** Dispatch the message to the chat + start the run; {ok:false} = run failed.
+   *  `model` (agent-default-model shape) selects the run's model when set. */
+  sendMessage(
+    text: string,
+    model?: { provider: string; model: string }
+  ): Promise<{ ok: boolean; error?: string }>;
+  /** Current model selection (agent-default-model shape); null = 默认模型. */
+  selectedModel?(): { provider: string; model: string } | null;
   /**
    * Clear the composer input. Called by the flow itself, exactly once, only
    * when the message is actually dispatched — NEVER on blocked paths, so the
@@ -91,7 +97,7 @@ export async function runSubmit(io: SubmitFlowIo, text: string): Promise<SubmitO
   // (3) The message goes out only after the session exists — and only now is
   // the input cleared, because only now has the message actually dispatched.
   io.clearInput();
-  const result = await io.sendMessage(text);
+  const result = await io.sendMessage(text, io.selectedModel?.() ?? undefined);
   if (!result.ok) {
     io.onSendFailed(result.error);
     return { status: 'dispatched', delivered: false };
